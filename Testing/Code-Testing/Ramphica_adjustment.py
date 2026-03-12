@@ -203,6 +203,10 @@ def correct_rigid_body(
 	tie_tol: float,
 	out_file_name: Path,
 ) -> tuple[Path, Path, int, int]:
+	# Normalize input paths early so downstream joins/comparisons are stable.
+	key_rigid_body = key_rigid_body.resolve(strict=False)
+	to_correct_rigid_body = to_correct_rigid_body.resolve(strict=False)
+
 	if not key_rigid_body.exists() or not key_rigid_body.is_file():
 		raise FileNotFoundError(f"Key_Rigid_body not found: {key_rigid_body}")
 	if not to_correct_rigid_body.exists() or not to_correct_rigid_body.is_file():
@@ -261,8 +265,14 @@ def correct_rigid_body(
 	corrected_path = _append_mode_suffix(corrected_base, stable_frame_mode)
 
 	error_path = out_file_name
-	if not error_path.is_absolute():
+	if error_path.is_absolute():
+		pass
+	elif error_path.parent == Path("."):
+		# Bare filename: place next to ToCorrect_Rigid_Body.
 		error_path = to_correct_rigid_body.parent / error_path
+	else:
+		# Relative path with directories: respect caller-provided location.
+		error_path = error_path.resolve(strict=False)
 	error_path = _append_mode_suffix(error_path, stable_frame_mode)
 
 	if _same_path(corrected_path, key_rigid_body) or _same_path(corrected_path, to_correct_rigid_body):
