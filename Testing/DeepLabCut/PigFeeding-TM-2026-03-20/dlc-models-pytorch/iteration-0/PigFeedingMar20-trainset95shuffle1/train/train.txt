@@ -1,0 +1,110 @@
+2026-03-20 16:54:44 Training with configuration:
+2026-03-20 16:54:44 data:
+2026-03-20 16:54:44   bbox_margin: 20
+2026-03-20 16:54:44   colormode: RGB
+2026-03-20 16:54:44   inference:
+2026-03-20 16:54:44     normalize_images: True
+2026-03-20 16:54:44   train:
+2026-03-20 16:54:44     affine:
+2026-03-20 16:54:44       p: 0.5
+2026-03-20 16:54:44       rotation: 30
+2026-03-20 16:54:44       scaling: [0.5, 1.25]
+2026-03-20 16:54:44       translation: 0
+2026-03-20 16:54:44     crop_sampling:
+2026-03-20 16:54:44       width: 448
+2026-03-20 16:54:44       height: 448
+2026-03-20 16:54:44       max_shift: 0.1
+2026-03-20 16:54:44       method: hybrid
+2026-03-20 16:54:44     gaussian_noise: 12.75
+2026-03-20 16:54:44     motion_blur: True
+2026-03-20 16:54:44     normalize_images: True
+2026-03-20 16:54:44 device: auto
+2026-03-20 16:54:44 inference:
+2026-03-20 16:54:44   multithreading:
+2026-03-20 16:54:44     enabled: True
+2026-03-20 16:54:44     queue_length: 4
+2026-03-20 16:54:44     timeout: 30.0
+2026-03-20 16:54:44   compile:
+2026-03-20 16:54:44     enabled: False
+2026-03-20 16:54:44     backend: inductor
+2026-03-20 16:54:44   autocast:
+2026-03-20 16:54:44     enabled: False
+2026-03-20 16:54:44 metadata:
+2026-03-20 16:54:44   project_path: C:\Users\Tyler Marino\OneDrive\Desktop\BirdSongsMHN\Testing\DeepLabCut\PigFeeding-TM-2026-03-20
+2026-03-20 16:54:44   pose_config_path: C:\Users\Tyler Marino\OneDrive\Desktop\BirdSongsMHN\Testing\DeepLabCut\PigFeeding-TM-2026-03-20\dlc-models-pytorch\iteration-0\PigFeedingMar20-trainset95shuffle1\train\pytorch_config.yaml
+2026-03-20 16:54:44   bodyparts: ['lowerIncisor', 'lowerJawAnt', 'LowerRtCanine']
+2026-03-20 16:54:44   unique_bodyparts: []
+2026-03-20 16:54:44   individuals: ['animal']
+2026-03-20 16:54:44   with_identity: None
+2026-03-20 16:54:44 method: bu
+2026-03-20 16:54:44 model:
+2026-03-20 16:54:44   backbone:
+2026-03-20 16:54:44     type: ResNet
+2026-03-20 16:54:44     model_name: resnet50_gn
+2026-03-20 16:54:44     output_stride: 16
+2026-03-20 16:54:44     freeze_bn_stats: False
+2026-03-20 16:54:44     freeze_bn_weights: False
+2026-03-20 16:54:44   backbone_output_channels: 2048
+2026-03-20 16:54:44   heads:
+2026-03-20 16:54:44     bodypart:
+2026-03-20 16:54:44       type: HeatmapHead
+2026-03-20 16:54:44       weight_init: normal
+2026-03-20 16:54:44       predictor:
+2026-03-20 16:54:44         type: HeatmapPredictor
+2026-03-20 16:54:44         apply_sigmoid: False
+2026-03-20 16:54:44         clip_scores: True
+2026-03-20 16:54:44         location_refinement: True
+2026-03-20 16:54:44         locref_std: 7.2801
+2026-03-20 16:54:44       target_generator:
+2026-03-20 16:54:44         type: HeatmapGaussianGenerator
+2026-03-20 16:54:44         num_heatmaps: 3
+2026-03-20 16:54:44         pos_dist_thresh: 17
+2026-03-20 16:54:44         heatmap_mode: KEYPOINT
+2026-03-20 16:54:44         gradient_masking: False
+2026-03-20 16:54:44         generate_locref: True
+2026-03-20 16:54:44         locref_std: 7.2801
+2026-03-20 16:54:44       criterion:
+2026-03-20 16:54:44         heatmap:
+2026-03-20 16:54:44           type: WeightedMSECriterion
+2026-03-20 16:54:44           weight: 1.0
+2026-03-20 16:54:44         locref:
+2026-03-20 16:54:44           type: WeightedHuberCriterion
+2026-03-20 16:54:44           weight: 0.05
+2026-03-20 16:54:44       heatmap_config:
+2026-03-20 16:54:44         channels: [2048, 3]
+2026-03-20 16:54:44         kernel_size: [3]
+2026-03-20 16:54:44         strides: [2]
+2026-03-20 16:54:44       locref_config:
+2026-03-20 16:54:44         channels: [2048, 6]
+2026-03-20 16:54:44         kernel_size: [3]
+2026-03-20 16:54:44         strides: [2]
+2026-03-20 16:54:44 net_type: resnet_50
+2026-03-20 16:54:44 runner:
+2026-03-20 16:54:44   type: PoseTrainingRunner
+2026-03-20 16:54:44   gpus: None
+2026-03-20 16:54:44   key_metric: test.mAP
+2026-03-20 16:54:44   key_metric_asc: True
+2026-03-20 16:54:44   eval_interval: 10
+2026-03-20 16:54:44   optimizer:
+2026-03-20 16:54:44     type: AdamW
+2026-03-20 16:54:44     params:
+2026-03-20 16:54:44       lr: 0.0005
+2026-03-20 16:54:44   scheduler:
+2026-03-20 16:54:44     type: LRListScheduler
+2026-03-20 16:54:44     params:
+2026-03-20 16:54:44       lr_list: [[0.0001], [1e-05]]
+2026-03-20 16:54:44       milestones: [90, 120]
+2026-03-20 16:54:44   snapshots:
+2026-03-20 16:54:44     max_snapshots: 5
+2026-03-20 16:54:44     save_epochs: 25
+2026-03-20 16:54:44     save_optimizer_state: False
+2026-03-20 16:54:44 train_settings:
+2026-03-20 16:54:44   batch_size: 8
+2026-03-20 16:54:44   dataloader_workers: 0
+2026-03-20 16:54:44   dataloader_pin_memory: False
+2026-03-20 16:54:44   display_iters: 500
+2026-03-20 16:54:44   epochs: 200
+2026-03-20 16:54:44   seed: 42
+2026-03-20 16:54:45 Loading pretrained weights from Hugging Face hub (timm/resnet50_gn.a1h_in1k)
+2026-03-20 16:54:45 HTTP Request: HEAD https://huggingface.co/timm/resnet50_gn.a1h_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+2026-03-20 16:54:45 HTTP Request: GET https://huggingface.co/api/models/timm/resnet50_gn.a1h_in1k/xet-read-token/b5b1dcfc1a526af275ec440b8d697c66c90a98b1 "HTTP/1.1 200 OK"

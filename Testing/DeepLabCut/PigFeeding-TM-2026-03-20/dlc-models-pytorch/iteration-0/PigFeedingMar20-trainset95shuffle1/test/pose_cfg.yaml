@@ -1,0 +1,15 @@
+dataset: C:\Users\Tyler 
+  Marino\OneDrive\Desktop\BirdSongsMHN\Testing\DeepLabCut\PigFeeding-TM-2026-03-20
+dataset_type: multi-animal-imgaug
+num_joints: 3
+all_joints:
+- - 0
+- - 1
+- - 2
+all_joints_names:
+- lowerIncisor
+- lowerJawAnt
+- LowerRtCanine
+net_type: resnet_50
+global_scale: 1
+scoremap_dir: test
