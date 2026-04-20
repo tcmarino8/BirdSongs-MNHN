@@ -388,11 +388,11 @@ class ProjectSetupUI:
         controls.grid(row=1, column=0, columnspan=2, sticky="we")
         controls.columnconfigure(1, weight=1)
 
-        ttk.Label(controls, text="Data Path").grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="Data Path (/trainingdata)").grid(row=0, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.dataset_data_path_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
         ttk.Button(controls, text="Browse...", command=self._pick_dataset_data_path).grid(row=0, column=2, sticky="e", pady=3)
 
-        ttk.Label(controls, text="Dataset Name").grid(row=1, column=0, sticky="w")
+        ttk.Label(controls, text="Dataset Name (Typically Canari)").grid(row=1, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.dataset_name_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=3)
 
         ttk.Label(controls, text="Frame Counts").grid(row=2, column=0, sticky="w")
