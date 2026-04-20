@@ -110,6 +110,151 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
+# Bird-specific bodypart configuration
+# ===========================================================================
+
+
+# Add or update per-bird bodypart lists here. Keys are normalized internally,
+# so "DavidBowie" and "davidbowie" resolve to the same entry.
+BIRD_BODYPARTS: dict[str, list[str]] = {
+    "Endive": [
+        "Tongue_Marker",
+         "Glottis_Marker",
+        "Cranium_Marker_Anterior", 
+        "Cranium_Marker_Middle_Left", 
+        "Cranium_Marker_Posterior", 
+        "Cranium_Marker_Middle_Right", 
+        "Maxilla_Marker_Left_Posterior", 
+        "Maxilla_Marker_Left_Anterior", 
+        "Maxilla_Marker_Right_Posterior", 
+        "Mandible_Marker_Right", 
+        "Mandible_Marker_Left_Anterior", 
+        "Mandible_Marker_Left_Posterior", 
+        "Neck_Marker_Right_Superior", 
+        "Neck_Marker_Left_Superior", 
+        "Neck_Marker_Left_Inferior", 
+        "Neck_Marker_Right_Inferior", 
+        "Keel_Marker_Left_Superior", 
+        "Keel_Marker_Left_Inferior", 
+        "Keel_Marker_Right_Superior", 
+        "Keel_Marker_Right_Inferior", 
+        "Pelvis_Marker_Left", 
+        "Pelvis_Marker_Right_Superior", 
+        "Pelvis_Marker_Right_Inferior", 
+        "Maxilla_Marker_Right_Anterior"
+    ],
+    "DavidBowie": [
+        "Cranium_Left_Anterior", 
+        "Cranium_Left_Middle", 
+        "Cranium_Right_Middle", 
+        "Cranium_Right_Posterior", 
+        "Beak_Mandible_Left_Posterior", 
+        "Beak_Mandibile_Left_Anterior", 
+        "Beak_Mandible_Right_Anterior", 
+        "Beak_Maxilla_Right_Anterior", 
+        "Beak_Maxilla_Right_Posterior", 
+        "Beak_Maxilla_Left_Anterior", 
+        "Beak_Maxilla_Left_Posterior", 
+        "Tongue_Lower_Palette", 
+        "Glottis", 
+        "Superior_Trachea", 
+        "Keel_Dorsal_Anterior", 
+        "Keel_Dorsal_Posterior", 
+        "Keel_Inferior", 
+        "Pelvis_Right_Inferior", 
+        "Pelvis_Right_Superior", 
+        "Pelvis_Left_Superior", 
+        "Pelvis_Left_Inferior"
+    ]
+
+}
+
+
+def normalize_bird_key(bird_name: str) -> str:
+    """Normalize a bird name to a compact case-insensitive lookup key."""
+    return re.sub(r"[^a-z0-9]", "", str(bird_name).lower())
+
+
+def get_bird_bodyparts(
+    bird_name: str,
+    *,
+    strict: bool = True,
+) -> list[str]:
+    """Return configured bodyparts for a bird from :data:`BIRD_BODYPARTS`."""
+    lookup = {normalize_bird_key(k): list(v) for k, v in BIRD_BODYPARTS.items()}
+    key = normalize_bird_key(bird_name)
+    if key not in lookup:
+        if strict:
+            raise KeyError(
+                f"No bodyparts configured for bird '{bird_name}'. "
+                "Add this bird to BIRD_BODYPARTS in DLCsupport.py."
+            )
+        return []
+    return lookup[key]
+
+
+def edit_bodyparts_in_config(
+    config_path: Path | str,
+    bodyparts: list[str],
+) -> None:
+    """Update ``bodyparts`` in a DLC config using ``edit_config`` when available."""
+    config_path = Path(config_path)
+    if not bodyparts:
+        raise ValueError(f"Refusing to write empty bodyparts list to {config_path}")
+
+    try:
+        from deeplabcut.utils.auxiliaryfunctions import edit_config  # noqa: PLC0415
+
+        edit_config(as_posix_str(config_path), {"bodyparts": bodyparts})
+    except Exception:
+        # Fallback for environments where auxiliary edit_config import path differs.
+        with open(config_path, "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+        cfg["bodyparts"] = list(bodyparts)
+        with open(config_path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(cfg, fh, sort_keys=False)
+
+
+def apply_bird_bodyparts_to_configs(
+    configs_by_bird: dict[str, list[Path | str]],
+    *,
+    strict: bool = True,
+) -> pd.DataFrame:
+    """Apply configured bird bodyparts to each config and return a summary table."""
+    rows: list[dict[str, str | int]] = []
+
+    for bird_name, config_paths in configs_by_bird.items():
+        parts = get_bird_bodyparts(bird_name, strict=strict)
+        if not parts:
+            rows.append(
+                {
+                    "bird": bird_name,
+                    "config": "(none)",
+                    "status": "skipped-no-bodyparts",
+                    "n_bodyparts": 0,
+                }
+            )
+            continue
+
+        for cfg in config_paths:
+            cfg = Path(cfg)
+            validate_path_exists(cfg, f"config for bird {bird_name}")
+            edit_bodyparts_in_config(cfg, parts)
+            applied = load_bodyparts(cfg)
+            status = "ok" if applied == parts else "mismatch-after-write"
+            rows.append(
+                {
+                    "bird": bird_name,
+                    "config": str(cfg),
+                    "status": status,
+                    "n_bodyparts": len(applied),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
 # Data containers
 # ===========================================================================
 
@@ -402,7 +547,14 @@ def assert_bodyparts_match(
 # ===========================================================================
 # Project and dataset management
 # ===========================================================================
-
+def set_net_type(config_path: Path, net_type: str) -> None:
+    """Patch the net_type field in a DLC config.yaml in-place."""
+    config_path = Path(config_path)
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+    cfg["default_net_type"] = net_type
+    with open(config_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
 
 def create_combined_project_if_missing(
     task: str,
@@ -555,7 +707,8 @@ def build_combined_dataset(
 
 def require_bodyparts_review_before_training(
     run_training: bool,
-    config_paths: list[Path | str],
+    config_paths: list[Path | str] | None = None,
+    configs_by_bird: dict[str, list[Path | str]] | None = None,
 ) -> None:
     """Gate training on explicit confirmation that bodyparts have been reviewed.
 
@@ -568,9 +721,11 @@ def require_bodyparts_review_before_training(
     ----------
     run_training : bool
         When ``False`` the gate is skipped entirely (useful for dry-run mode).
-    config_paths : list[Path | str]
-        All project configs whose bodyparts should be reviewed before training
-        starts (e.g. cam1 config, cam2 config, and the combined config).
+    config_paths : list[Path | str] | None, optional
+        Legacy input: flat list of configs to review in one group.
+    configs_by_bird : dict[str, list[Path | str]] | None, optional
+        Preferred input: mapping of bird name to config list. Each bird is
+        reviewed and confirmed exactly once.
 
     Raises
     ------
@@ -581,29 +736,62 @@ def require_bodyparts_review_before_training(
         print("Bodyparts checkpoint skipped (RUN_TRAINING is False).")
         return
 
-    print("\nReview the bodyparts in the following configs before training:")
-    for cfg in config_paths:
-        cfg = Path(cfg)
-        validate_path_exists(cfg, f"config {cfg.name}")
-        parts = load_bodyparts(cfg)
-        print(f"  {cfg}")
-        print(f"    bodyparts count : {len(parts)}")
-        print(f"    first five      : {parts[:5]}")
+    if configs_by_bird is None:
+        if not config_paths:
+            raise ValueError(
+                "Provide either config_paths or configs_by_bird for bodyparts review."
+            )
+        configs_by_bird = {"all": list(config_paths)}
 
-    print("\nEdit the configs if needed, then re-run this cell and confirm.")
-    ack = input("Type exactly 'CONFIRMED BODYPARTS' to proceed: ").strip()
-    if ack != "CONFIRMED BODYPARTS":
-        raise RuntimeError(
-            "Training stopped.  Update bodyparts in the config files and "
-            "confirm with the exact phrase 'CONFIRMED BODYPARTS'."
-        )
-    print("Confirmation accepted.  Training can proceed.")
+    print("\nReview bodyparts per bird before training:")
+    for bird_name, cfg_list in configs_by_bird.items():
+        print(f"\nBird: {bird_name}")
+        expected_parts = get_bird_bodyparts(bird_name, strict=False)
+        if expected_parts:
+            print(f"  configured bodyparts ({len(expected_parts)}): {expected_parts}")
+        else:
+            print("  configured bodyparts: (none configured in BIRD_BODYPARTS)")
+
+        for cfg in cfg_list:
+            cfg = Path(cfg)
+            validate_path_exists(cfg, f"config {cfg.name}")
+            parts = load_bodyparts(cfg)
+            print(f"  {cfg}")
+            print(f"    bodyparts ({len(parts)}): {parts}")
+
+        phrase = f"CONFIRMED {bird_name}"
+        ack = input(f"Type exactly '{phrase}' to proceed with {bird_name}: ").strip()
+        if ack != phrase:
+            raise RuntimeError(
+                "Training stopped. Update bodyparts in the config files and "
+                f"confirm with the exact phrase '{phrase}'."
+            )
+
+    print("All bird confirmations accepted. Training can proceed.")
+
+
+def apply_and_review_bird_bodyparts(
+    run_training: bool,
+    configs_by_bird: dict[str, list[Path | str]],
+    *,
+    strict: bool = True,
+) -> pd.DataFrame:
+    """Apply bodyparts from :data:`BIRD_BODYPARTS`, then require per-bird review."""
+    summary_df = apply_bird_bodyparts_to_configs(configs_by_bird, strict=strict)
+    require_bodyparts_review_before_training(
+        run_training=run_training,
+        configs_by_bird=configs_by_bird,
+    )
+    return summary_df
 
 
 def create_and_train(
     config_path: Path | str,
     epochs: int,
     snapshot_path: str | None = None,
+    modelprefix: str | None = None,
+    post_dataset_callback=None,
+    train_network_kwargs: dict | None = None,
 ) -> str:
     """Create a DLC training dataset and run model training.
 
@@ -622,6 +810,16 @@ def create_and_train(
         Absolute path to a ``.pt`` snapshot to use as the starting weights.
         When ``None`` training begins from the backbone's pretrained
         ImageNet weights (no transfer).
+    modelprefix : str | None, optional
+        Optional DLC model prefix label, useful for tagging augmentation
+        variants in one experiment matrix.
+    post_dataset_callback : callable | None, optional
+        Optional callback invoked as ``post_dataset_callback(config_path)``
+        immediately after ``create_training_dataset`` and before
+        ``train_network``. Use this to patch generated training configs
+        (for example, augmentation options in ``pose_cfg.yaml``).
+    train_network_kwargs : dict | None, optional
+        Extra keyword arguments forwarded to ``deeplabcut.train_network``.
 
     Returns
     -------
@@ -633,16 +831,18 @@ def create_and_train(
     config_path = Path(config_path)
     ensure_config_scorer_matches_data(config_path)
     deeplabcut.create_training_dataset(as_posix_str(config_path))  
+    if post_dataset_callback is not None:
+        post_dataset_callback(config_path)
 
-    if snapshot_path is None:
-        
-        deeplabcut.train_network(as_posix_str(config_path), epochs=epochs) # FIXME: modelprefix...
-    else:
-        deeplabcut.train_network(
-            as_posix_str(config_path),
-            epochs=epochs,
-            snapshot_path=snapshot_path,
-        )
+    train_kwargs = {"epochs": epochs}
+    if snapshot_path is not None:
+        train_kwargs["snapshot_path"] = snapshot_path
+    if modelprefix:
+        train_kwargs["modelprefix"] = modelprefix
+    if train_network_kwargs:
+        train_kwargs.update(train_network_kwargs)
+
+    deeplabcut.train_network(as_posix_str(config_path), **train_kwargs)
 
     return find_latest_snapshot(config_path)
 

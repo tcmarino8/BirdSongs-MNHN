@@ -1,0 +1,53 @@
+project:
+  task: Canari
+  experimenter: Tyler
+  report_dir: pipeline_reports
+
+defaults:
+  frame_counts: [200, 400, 800, 1400]
+  architectures: [resnet_50]
+  train_seed: 42
+  holdout_seed: 999
+  epochs_smoke: 2
+  epochs_full: 200
+
+runtime:
+  run_training: false
+  use_full_epochs: false
+
+birds:
+  DavidBowie:
+    bird_root_dir: ../DeepLabCut/DavidBowie
+    combined_base: ../DeepLabCut/DavidBowie/TestData
+    cam1_config: ../DeepLabCut/DavidBowie/TestData/Canari_cam1_training/Canari-Tyler-2026-03-31/config.yaml
+    cam2_config: ../DeepLabCut/DavidBowie/TestData/Canari_cam2_training/Canari-Tyler-2026-03-31/config.yaml
+    data_path: ../DeepLabCut/DavidBowie/trainingdata
+    dataset_name: Canari
+    dummy_video: ../DeepLabCut/DavidBowie/trainingdata/DavidBowie_20250828_F17/DB17_Cam1.avi
+    test_videos:
+      - ../DeepLabCut/DavidBowie/newdata/DavidBowie_20250828_F17/DB17_Cam1.avi
+      - ../DeepLabCut/DavidBowie/newdata/DavidBowie_20250828_F17/DB17_Cam2.avi
+    bodyparts:
+      - Cranium_Left_Anterior
+      - Keel_Dorsal_Anterior
+      - Pelvis_Left_Superior
+      - Beak_Maxilla_Left_Anterior
+      - Glottis
+
+  Endive:
+    bird_root_dir: ../DeepLabCut/Endive
+    combined_base: ../DeepLabCut/Endive/TestData
+    cam1_config: ../DeepLabCut/Endive/TestData/Canari_cam1_training/Canari-Tyler-2026-03-31/config.yaml
+    cam2_config: ../DeepLabCut/Endive/TestData/Canari_cam2_training/Canari-Tyler-2026-03-31/config.yaml
+    data_path: ../DeepLabCut/Endive/trainingdata
+    dataset_name: Canari
+    dummy_video: ../DeepLabCut/Endive/trainingdata/Endive_20251606_F32/EndiveF42_20251606_Cam1_short.avi
+    test_videos:
+      - ../DeepLabCut/Endive/newdata/Endive_20251606_F32/EndiveF42_20251606_Cam1_short.avi
+      - ../DeepLabCut/Endive/newdata/Endive_20251606_F32/EndiveF42_20251606_Cam2_short.avi
+    bodyparts:
+      - Cranium_Left_Anterior
+      - Keel_Dorsal_Anterior
+      - Pelvis_Left_Superior
+      - Beak_Maxilla_Left_Anterior
+      - Glottis
