@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 import traceback
 from pathlib import Path
 import tkinter as tk
@@ -25,7 +27,14 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 import yaml
 
-from DLCsupport import build_combined_dataset, create_combined_project_if_missing
+from DLCsupport import (
+    BIRD_BODYPARTS,
+    build_combined_dataset,
+    create_combined_project_if_missing,
+    ensure_config_scorer_matches_data,
+    find_latest_snapshot,
+    set_net_type,
+)
 
 try:
     from PIL import Image, ImageTk
@@ -47,11 +56,13 @@ class ProjectSetupUI:
         self.experimenter_var = tk.StringVar(value="Tyler")
         self.project_root_name_var = tk.StringVar(value="Canari_combined_training")
         self.selected_dummy_video_var = tk.StringVar()
+        self.existing_config_var = tk.StringVar()
 
         self.current_project_dict: dict | None = None
         self.current_config_path: Path | None = None
 
         self.step2_frame: ttk.LabelFrame | None = None
+        self.bird_suggestion_var = tk.StringVar()
         self.bodyparts_text: tk.Text | None = None
         self.config_preview_text: tk.Text | None = None
 
@@ -65,6 +76,15 @@ class ProjectSetupUI:
         self.image_preview_label: ttk.Label | None = None
         self.image_info_label: ttk.Label | None = None
         self._preview_photo = None
+
+        self.step4_frame: ttk.LabelFrame | None = None
+        self.train_mode_var = tk.StringVar(value="testtrain")
+        self.log_interval_var = tk.StringVar(value="10")
+        self.train_status_var = tk.StringVar(value="Idle")
+        self.train_progress: ttk.Progressbar | None = None
+        self.train_logs_text: tk.Text | None = None
+        self._training_in_progress = False
+        self._training_start_time = 0.0
 
         self._build_layout()
 
@@ -128,27 +148,137 @@ class ProjectSetupUI:
         self.video_combo = ttk.Combobox(step1, textvariable=self.selected_dummy_video_var, state="readonly", width=90)
         self.video_combo.grid(row=4, column=1, columnspan=3, sticky="we", padx=(8, 0), pady=4)
 
+        ttk.Separator(step1, orient="horizontal").grid(row=5, column=0, columnspan=4, sticky="we", pady=(10, 8))
+        ttk.Label(step1, text="Already created project? (config.yaml)").grid(row=6, column=0, sticky="w")
+        ttk.Entry(step1, textvariable=self.existing_config_var, width=70).grid(
+            row=6, column=1, columnspan=2, sticky="we", padx=(8, 8), pady=4
+        )
+        existing_row = ttk.Frame(step1)
+        existing_row.grid(row=6, column=3, sticky="e")
+        ttk.Button(existing_row, text="Browse...", command=self._pick_existing_config).pack(side="left")
+        ttk.Button(existing_row, text="Load", command=self._load_existing_project).pack(side="left", padx=(8, 0))
+
         action_row = ttk.Frame(step1)
-        action_row.grid(row=5, column=0, columnspan=4, sticky="we", pady=(10, 8))
+        action_row.grid(row=7, column=0, columnspan=4, sticky="we", pady=(10, 8))
 
         ttk.Button(action_row, text="Create Project + Build Dictionary", command=self._create_project_and_build_dict).pack(side="left")
         ttk.Button(action_row, text="Save Dictionary As JSON", command=self._save_dict_json).pack(side="left", padx=10)
         ttk.Button(action_row, text="Clear Output", command=self._clear_output).pack(side="left")
 
         ttk.Label(step1, text="Dictionary Output", font=("Segoe UI", 11, "bold")).grid(
-            row=6, column=0, columnspan=4, sticky="w", pady=(8, 4)
+            row=8, column=0, columnspan=4, sticky="w", pady=(8, 4)
         )
 
         self.output = tk.Text(step1, wrap="word", height=16)
-        self.output.grid(row=7, column=0, columnspan=4, sticky="nsew")
+        self.output.grid(row=9, column=0, columnspan=4, sticky="nsew")
         self.output.tag_configure("dict_key", font=("Segoe UI", 9, "bold"))
 
         out_scroll = ttk.Scrollbar(step1, orient="vertical", command=self.output.yview)
-        out_scroll.grid(row=7, column=4, sticky="ns")
+        out_scroll.grid(row=9, column=4, sticky="ns")
         self.output.configure(yscrollcommand=out_scroll.set)
 
-        step1.rowconfigure(7, weight=1)
+        step1.rowconfigure(9, weight=1)
         self.page.columnconfigure(0, weight=1)
+
+    def _pick_existing_config(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select existing DLC config.yaml",
+            filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if selected:
+            self.existing_config_var.set(selected)
+
+    def _build_starter_from_config(
+        self,
+        config_path: Path,
+        *,
+        task: str,
+        experimenter: str,
+        combined_project_root: Path,
+        dummy_video: str,
+    ) -> dict:
+        project_dir = config_path.parent
+        return {
+            "project": {
+                "task": task,
+                "experimenter": experimenter,
+                "combined_project_root": str(combined_project_root),
+                "config_path": str(config_path),
+                "project_dir": str(project_dir),
+                "dummy_video": str(dummy_video),
+                "dummy_video_folder": str(Path(dummy_video).parent) if dummy_video else "",
+            },
+            "paths": {
+                "videos_path": str(project_dir / "videos"),
+                "labeled_data_path": str(project_dir / "labeled-data"),
+                "training_datasets_path": str(project_dir / "training-datasets"),
+                "dlc_models_path": str(project_dir / "dlc-models-pytorch"),
+            },
+            "next_fields_to_fill": {
+                "bird_name": "",
+                "bodyparts": [],
+                "data_path": "",
+                "test_videos": [],
+                "cam1_config": "",
+                "cam2_config": "",
+            },
+        }
+
+    def _load_existing_project(self) -> None:
+        config_path = Path(self.existing_config_var.get().strip())
+        if not config_path.exists() or config_path.name.lower() not in {"config.yaml", "config.yml"}:
+            messagebox.showerror("Invalid config", "Please choose an existing project config.yaml file.")
+            return
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+
+            project_dir = config_path.parent
+            combined_root = project_dir.parent
+
+            task = str(cfg.get("Task", self.task_var.get())).strip()
+            dummy_video = ""
+            video_sets = cfg.get("video_sets", {})
+            if isinstance(video_sets, dict) and video_sets:
+                dummy_video = str(next(iter(video_sets.keys())))
+
+            # Try parsing experimenter from DLC project folder name: Task-Experimenter-date
+            experimenter = self.experimenter_var.get().strip()
+            parts = project_dir.name.split("-")
+            if len(parts) >= 2:
+                task = parts[0] or task
+                experimenter = parts[1] or experimenter
+
+            self.task_var.set(task)
+            self.experimenter_var.set(experimenter)
+            self.project_root_name_var.set(combined_root.name)
+            self.project_parent_dir.set(str(combined_root.parent))
+            if dummy_video:
+                self.selected_dummy_video_var.set(dummy_video)
+
+            self.current_config_path = config_path
+            starter = self._build_starter_from_config(
+                config_path,
+                task=task,
+                experimenter=experimenter,
+                combined_project_root=combined_root,
+                dummy_video=dummy_video,
+            )
+            self.current_project_dict = starter
+            self._write_output_with_bold_keys(starter)
+
+            self._ensure_step2_section()
+            self._load_step2_from_config()
+            self._ensure_step3_section()
+            self._ensure_step4_section()
+
+            messagebox.showinfo("Loaded", "Existing project loaded. You can continue from Step 2.")
+        except Exception as exc:
+            details = traceback.format_exc()
+            messagebox.showerror("Load failed", f"Could not load existing project:\n{exc}")
+            self.output.delete("1.0", tk.END)
+            self.output.insert(tk.END, details)
 
     def _pick_project_parent(self) -> None:
         selected = filedialog.askdirectory(title="Select parent folder for combined project root")
@@ -223,40 +353,21 @@ class ProjectSetupUI:
                 combined_project_root=combined_project_root,
                 dummy_video=dummy_video
             )
-            project_dir = Path(config_path).parent
             self.current_config_path = Path(config_path)
-
-            starter = {
-                "project": {
-                    "task": task,
-                    "experimenter": experimenter,
-                    "combined_project_root": str(combined_project_root),
-                    "config_path": str(config_path),
-                    "project_dir": str(project_dir),
-                    "dummy_video": str(dummy_video),
-                    "dummy_video_folder": str(dummy_video.parent),
-                },
-                "paths": {
-                    "videos_path": str(project_dir / "videos"),
-                    "labeled_data_path": str(project_dir / "labeled-data"),
-                    "training_datasets_path": str(project_dir / "training-datasets"),
-                    "dlc_models_path": str(project_dir / "dlc-models-pytorch"),
-                },
-                "next_fields_to_fill": {
-                    "bird_name": "",
-                    "bodyparts": [],
-                    "data_path": "",
-                    "test_videos": [],
-                    "cam1_config": "",
-                    "cam2_config": "",
-                },
-            }
+            starter = self._build_starter_from_config(
+                Path(config_path),
+                task=task,
+                experimenter=experimenter,
+                combined_project_root=combined_project_root,
+                dummy_video=str(dummy_video),
+            )
 
             self.current_project_dict = starter
             self._write_output_with_bold_keys(starter)
             self._ensure_step2_section()
             self._load_step2_from_config()
             self._ensure_step3_section()
+            self._ensure_step4_section()
             messagebox.showinfo("Success", "Project initialized and starter dictionary created.")
 
         except Exception as exc:
@@ -333,18 +444,38 @@ class ProjectSetupUI:
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         left.columnconfigure(0, weight=1)
 
+        suggestion_row = ttk.Frame(left)
+        suggestion_row.grid(row=0, column=0, sticky="we", pady=(0, 6))
+        suggestion_row.columnconfigure(1, weight=1)
+
+        ttk.Label(suggestion_row, text="Suggested Bird").grid(row=0, column=0, sticky="w")
+        bird_options = sorted(BIRD_BODYPARTS.keys())
+        bird_combo = ttk.Combobox(
+            suggestion_row,
+            textvariable=self.bird_suggestion_var,
+            values=bird_options,
+            state="readonly",
+            width=24,
+        )
+        bird_combo.grid(row=0, column=1, sticky="we", padx=(8, 0))
+        bird_combo.bind("<<ComboboxSelected>>", self._on_bird_suggestion_selected)
+
         ttk.Label(left, text="Editable Bodyparts (one per line)", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w"
+            row=1, column=0, sticky="w"
         )
 
         self.bodyparts_text = tk.Text(left, wrap="none", height=16)
-        self.bodyparts_text.grid(row=1, column=0, sticky="nsew", pady=(4, 6))
-        left.rowconfigure(1, weight=1)
+        self.bodyparts_text.grid(row=2, column=0, sticky="nsew", pady=(4, 6))
+        left.rowconfigure(2, weight=1)
 
         btn_row = ttk.Frame(left)
-        btn_row.grid(row=2, column=0, sticky="w")
+        btn_row.grid(row=3, column=0, sticky="w")
         ttk.Button(btn_row, text="Reload Bodyparts From Config", command=self._load_step2_from_config).pack(side="left")
         ttk.Button(btn_row, text="Save Bodyparts To Config", command=self._save_bodyparts_to_config).pack(side="left", padx=8)
+
+        if bird_options:
+            self.bird_suggestion_var.set(bird_options[0])
+            self._apply_bird_bodypart_suggestion(bird_options[0])
 
         right = ttk.Frame(self.step2_frame)
         right.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
@@ -428,6 +559,215 @@ class ProjectSetupUI:
         self.image_preview_label.grid(row=1, column=0, sticky="nsew", pady=(4, 6))
         self.image_info_label = ttk.Label(right, text="", wraplength=360, justify="left")
         self.image_info_label.grid(row=2, column=0, sticky="w")
+
+    def _ensure_step4_section(self) -> None:
+        if self.step4_frame is not None:
+            return
+
+        self.step4_frame = ttk.LabelFrame(
+            self.page,
+            text="Step 4: Train model (ResNet50)",
+            padding=10,
+        )
+        self.step4_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        self.step4_frame.columnconfigure(0, weight=1)
+
+        helper = ttk.Label(
+            self.step4_frame,
+            text=(
+                "Follows notebook Cell 7 pattern: set net type to resnet_50 and train with mode "
+                "fulltrain|testtrain. Progress is logged at selected checkpoints."
+            ),
+        )
+        helper.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        controls = ttk.Frame(self.step4_frame)
+        controls.grid(row=1, column=0, sticky="we")
+        controls.columnconfigure(5, weight=1)
+
+        ttk.Label(controls, text="Train Mode").grid(row=0, column=0, sticky="w")
+        mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.train_mode_var,
+            values=["fulltrain", "testtrain"],
+            state="readonly",
+            width=12,
+        )
+        mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 16))
+
+        ttk.Label(controls, text="Log Interval (epochs)").grid(row=0, column=2, sticky="w")
+        interval_combo = ttk.Combobox(
+            controls,
+            textvariable=self.log_interval_var,
+            values=["10"],
+            state="readonly",
+            width=10,
+        )
+        interval_combo.grid(row=0, column=3, sticky="w", padx=(8, 16))
+
+        ttk.Button(controls, text="Train Model", command=self._start_training).grid(row=0, column=4, sticky="w")
+
+        status_row = ttk.Frame(self.step4_frame)
+        status_row.grid(row=2, column=0, sticky="we", pady=(8, 4))
+        status_row.columnconfigure(1, weight=1)
+        ttk.Label(status_row, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_row, textvariable=self.train_status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.train_progress = ttk.Progressbar(self.step4_frame, orient="horizontal", mode="determinate")
+        self.train_progress.grid(row=3, column=0, sticky="we", pady=(0, 8))
+
+        ttk.Label(self.step4_frame, text="Training Logs", font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w")
+        self.train_logs_text = tk.Text(self.step4_frame, wrap="word", height=12)
+        self.train_logs_text.grid(row=5, column=0, sticky="nsew", pady=(4, 0))
+
+    def _epochs_for_mode(self) -> int:
+        mode = self.train_mode_var.get().strip().lower()
+        if mode == "fulltrain":
+            return 200
+        return 2
+
+    def _interval_epochs(self, total_epochs: int) -> int:
+        try:
+            interval_choice = int(self.log_interval_var.get().strip())
+        except (TypeError, ValueError):
+            interval_choice = 10
+        return max(1, min(interval_choice, total_epochs))
+
+    def _build_epoch_checkpoints(self, total_epochs: int, interval_epochs: int) -> list[int]:
+        checkpoints = list(range(interval_epochs, total_epochs + 1, interval_epochs))
+        if not checkpoints or checkpoints[-1] != total_epochs:
+            checkpoints.append(total_epochs)
+        return checkpoints
+
+    def _append_train_log(self, message: str) -> None:
+        if self.train_logs_text is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.train_logs_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.train_logs_text.see(tk.END)
+
+    def _start_training(self) -> None:
+        if self.current_config_path is None:
+            messagebox.showwarning("Missing config", "Please complete Step 1 first.")
+            return
+        if self._training_in_progress:
+            messagebox.showwarning("Training running", "Training is already in progress.")
+            return
+
+        labeled_dir = self.current_config_path.parent / "labeled-data"
+        has_labels = bool(list(labeled_dir.rglob("CollectedData_*.h5")) or list(labeled_dir.rglob("CollectedData_*.csv")))
+        if not has_labels:
+            messagebox.showerror(
+                "Missing labeled data",
+                "No CollectedData files found under labeled-data. Run Step 3 first.",
+            )
+            return
+
+        total_epochs = self._epochs_for_mode()
+        interval_epochs = self._interval_epochs(total_epochs)
+        checkpoints = self._build_epoch_checkpoints(total_epochs, interval_epochs)
+
+        self._training_in_progress = True
+        self._training_start_time = time.perf_counter()
+
+        if self.train_logs_text is not None:
+            self.train_logs_text.delete("1.0", tk.END)
+
+        if self.train_progress is not None:
+            self.train_progress.configure(maximum=total_epochs, value=0)
+
+        self.train_status_var.set(
+            f"Training started ({self.train_mode_var.get()}, epochs={total_epochs}, interval={interval_epochs})"
+        )
+        self._append_train_log("Preparing ResNet50 training...")
+        self._append_train_log(f"Checkpoints: {checkpoints}")
+
+        thread = threading.Thread(
+            target=self._run_training_worker,
+            args=(self.current_config_path, checkpoints),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_training_worker(self, config_path: Path, checkpoints: list[int]) -> None:
+        try:
+            import deeplabcut  # noqa: PLC0415
+
+            set_net_type(config_path, "resnet_50")
+            self.root.after(0, lambda: self._append_train_log("Set net_type to resnet_50."))
+
+            ensure_config_scorer_matches_data(config_path)
+            self.root.after(0, lambda: self._append_train_log("Scorer synchronized with labeled-data."))
+
+            deeplabcut.create_training_dataset(str(config_path))
+            self.root.after(0, lambda: self._append_train_log("Created training dataset."))
+
+            snapshot_path: str | None = None
+            for target_epoch in checkpoints:
+                train_kwargs = {"epochs": target_epoch}
+                if snapshot_path is not None:
+                    train_kwargs["snapshot_path"] = snapshot_path
+
+                deeplabcut.train_network(str(config_path), **train_kwargs)
+                try:
+                    snapshot_path = find_latest_snapshot(config_path)
+                except FileNotFoundError:
+                    # In very short runs (e.g., 1-2 epochs), DLC may not emit a snapshot yet.
+                    snapshot_path = None
+
+                self.root.after(
+                    0,
+                    lambda e=target_epoch, s=snapshot_path: self._on_training_checkpoint(e, s),
+                )
+
+            elapsed = time.perf_counter() - self._training_start_time
+            self.root.after(0, lambda: self._on_training_finished(snapshot_path, elapsed))
+        except Exception:
+            details = traceback.format_exc()
+            self.root.after(0, lambda: self._on_training_failed(details))
+
+    def _on_training_checkpoint(self, epoch: int, snapshot_path: str | None) -> None:
+        if self.train_progress is not None:
+            self.train_progress.configure(value=epoch)
+        self.train_status_var.set(f"Checkpoint reached: epoch {epoch}")
+        if snapshot_path:
+            self._append_train_log(f"Reached epoch {epoch}. Latest snapshot: {snapshot_path}")
+        else:
+            self._append_train_log(
+                f"Reached epoch {epoch}. No snapshot file yet (normal for short/test runs)."
+            )
+
+    def _on_training_finished(self, snapshot_path: str | None, elapsed_s: float) -> None:
+        self._training_in_progress = False
+        total_epochs = self._epochs_for_mode()
+        if self.train_progress is not None:
+            self.train_progress.configure(value=total_epochs)
+        self.train_status_var.set(f"Training complete in {elapsed_s/60:.1f} min")
+        if snapshot_path:
+            self._append_train_log(f"Training complete. Latest snapshot: {snapshot_path}")
+            done_text = f"Model training finished.\n\nLatest snapshot:\n{snapshot_path}"
+        else:
+            self._append_train_log(
+                "Training complete. No snapshot file was created at this epoch count."
+            )
+            done_text = (
+                "Model training finished.\n\n"
+                "No snapshot file was created yet (common in very short test runs).\n"
+                "Try fulltrain or more epochs if you need a snapshot artifact."
+            )
+        messagebox.showinfo(
+            "Training complete",
+            done_text,
+        )
+
+    def _on_training_failed(self, details: str) -> None:
+        self._training_in_progress = False
+        self.train_status_var.set("Training failed")
+        self._append_train_log("Training failed. See traceback below.")
+        if self.train_logs_text is not None:
+            self.train_logs_text.insert(tk.END, "\n" + details)
+            self.train_logs_text.see(tk.END)
+        messagebox.showerror("Training failed", "Training failed. See logs in Step 4.")
 
     def _pick_dataset_data_path(self) -> None:
         selected = filedialog.askdirectory(title="Select source data path for dataset build")
@@ -685,6 +1025,26 @@ class ProjectSetupUI:
             self._refresh_config_preview()
         except Exception as exc:
             messagebox.showerror("Load failed", f"Could not load bodyparts from config:\n{exc}")
+
+    def _on_bird_suggestion_selected(self, _event: tk.Event) -> None:
+        selected = self.bird_suggestion_var.get().strip()
+        self._apply_bird_bodypart_suggestion(selected)
+
+    def _apply_bird_bodypart_suggestion(self, bird_name: str) -> None:
+        if self.bodyparts_text is None:
+            return
+
+        parts = BIRD_BODYPARTS.get(bird_name, [])
+        if not parts:
+            return
+
+        self.bodyparts_text.delete("1.0", tk.END)
+        self.bodyparts_text.insert(tk.END, "\n".join(str(p) for p in parts))
+
+        if self.current_project_dict is not None:
+            self.current_project_dict.setdefault("next_fields_to_fill", {})["bird_name"] = bird_name
+            self.current_project_dict.setdefault("next_fields_to_fill", {})["bodyparts"] = list(parts)
+            self._write_output_with_bold_keys(self.current_project_dict)
 
     def _save_bodyparts_to_config(self) -> None:
         if self.current_config_path is None or self.bodyparts_text is None:
