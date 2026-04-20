@@ -94,6 +94,7 @@ class ProjectSetupUI:
         self.eval_model_combo: ttk.Combobox | None = None
         self.eval_snapshot_text: tk.Text | None = None
         self.eval_config_text: tk.Text | None = None
+        self.eval_layers_text: tk.Text | None = None
         self._eval_snapshot_map: dict[str, Path] = {}
 
         self._build_start_page()
@@ -765,6 +766,15 @@ class ProjectSetupUI:
         self.eval_config_text = tk.Text(right, wrap="none", height=12)
         self.eval_config_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
 
+        layers = ttk.Frame(self.step5_frame)
+        layers.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        layers.columnconfigure(0, weight=1)
+        layers.rowconfigure(1, weight=1)
+
+        ttk.Label(layers, text="Checkpoint Layer Table", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.eval_layers_text = tk.Text(layers, wrap="none", height=16)
+        self.eval_layers_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
         if self.current_config_path is not None:
             self.eval_config_var.set(str(self.current_config_path))
             self._load_eval_models()
@@ -796,6 +806,7 @@ class ProjectSetupUI:
             self.eval_model_var.set("")
             self.eval_snapshot_path_var.set("No snapshots found under dlc-models-pytorch.")
             self._set_selected_snapshot_text(None)
+            self._set_checkpoint_layers_text(None)
 
         self._set_config_preview(config_path)
 
@@ -824,15 +835,210 @@ class ProjectSetupUI:
 
         if selected_label is None:
             self.eval_snapshot_text.insert(tk.END, "No snapshot selected.")
+            self._set_checkpoint_layers_text(None)
             return
 
         snapshot_path = self._eval_snapshot_map.get(selected_label)
         if snapshot_path is None:
             self.eval_snapshot_text.insert(tk.END, "No snapshot selected.")
+            self._set_checkpoint_layers_text(None)
             return
 
         self.eval_snapshot_path_var.set(str(snapshot_path))
         self.eval_snapshot_text.insert(tk.END, str(snapshot_path))
+        self._set_checkpoint_layers_text(snapshot_path)
+
+    def _set_checkpoint_layers_text(self, snapshot_path: Path | None) -> None:
+        if self.eval_layers_text is None:
+            return
+
+        self.eval_layers_text.delete("1.0", tk.END)
+        if snapshot_path is None:
+            self.eval_layers_text.insert(tk.END, "No checkpoint selected.")
+            return
+
+        if not snapshot_path.exists():
+            self.eval_layers_text.insert(tk.END, f"Checkpoint not found:\n{snapshot_path}")
+            return
+
+        try:
+            import torch  # noqa: PLC0415
+        except Exception as exc:
+            self.eval_layers_text.insert(
+                tk.END,
+                "PyTorch is required to inspect checkpoint tensors.\n"
+                f"Import error: {exc}",
+            )
+            return
+
+        try:
+            try:
+                checkpoint_obj = torch.load(str(snapshot_path), map_location="cpu", weights_only=False)
+            except TypeError:
+                checkpoint_obj = torch.load(str(snapshot_path), map_location="cpu")
+            state_dict = self._extract_state_dict(checkpoint_obj)
+
+            if not state_dict:
+                self.eval_layers_text.insert(
+                    tk.END,
+                    "No tensors were extracted from this checkpoint with current rules.\n\n"
+                    "Checkpoint structure preview:\n"
+                    f"{self._describe_checkpoint_structure(checkpoint_obj)}",
+                )
+                return
+
+            rows: list[tuple[int, str, str, int, str, str]] = []
+            total_tensors = 0
+            total_parameters = 0
+            total_elements = 0
+
+            for idx, (name, tensor) in enumerate(state_dict.items(), start=1):
+                if not hasattr(tensor, "shape"):
+                    continue
+
+                shape = self._format_shape(getattr(tensor, "shape", ()))
+                numel = int(getattr(tensor, "numel", lambda: 0)())
+                dtype = str(getattr(tensor, "dtype", "unknown"))
+                kind = self._tensor_kind_from_name(name)
+
+                rows.append((idx, name, shape, numel, dtype, kind))
+                total_tensors += 1
+                total_elements += numel
+                if kind == "param":
+                    total_parameters += numel
+
+            header = (
+                f"Checkpoint: {snapshot_path}\n"
+                f"Tensor entries: {total_tensors} | Parameter elements: {total_parameters:,} | Total elements: {total_elements:,}\n\n"
+            )
+
+            col_header = "#   key                                             shape                 numel        dtype           kind"
+            self.eval_layers_text.insert(tk.END, header)
+            self.eval_layers_text.insert(tk.END, col_header + "\n")
+            self.eval_layers_text.insert(tk.END, "-" * len(col_header) + "\n")
+
+            for idx, name, shape, numel, dtype, kind in rows:
+                line = (
+                    f"{idx:>3} "
+                    f"{name[:46]:<46} "
+                    f"{shape:<20} "
+                    f"{numel:>10,} "
+                    f"{dtype[:14]:<14} "
+                    f"{kind}"
+                )
+                self.eval_layers_text.insert(tk.END, line + "\n")
+        except Exception:
+            self.eval_layers_text.insert(tk.END, traceback.format_exc())
+
+    def _extract_state_dict(self, checkpoint_obj: object) -> dict[str, object]:
+        preferred_keys = (
+            "state_dict",
+            "model_state_dict",
+            "model",
+            "net",
+            "weights",
+            "ema_state_dict",
+        )
+
+        if isinstance(checkpoint_obj, dict):
+            for key in preferred_keys:
+                candidate = checkpoint_obj.get(key)
+                if candidate is None:
+                    continue
+                extracted = self._collect_tensor_entries(candidate, prefix=str(key))
+                if extracted:
+                    return extracted
+
+        # Fallback: deep recursive extraction across the full object.
+        return self._collect_tensor_entries(checkpoint_obj, prefix="")
+
+    def _collect_tensor_entries(self, obj: object, prefix: str) -> dict[str, object]:
+        entries: dict[str, object] = {}
+        seen_ids: set[int] = set()
+
+        def _is_tensor_like(value: object) -> bool:
+            return hasattr(value, "shape") and callable(getattr(value, "numel", None))
+
+        def _walk(value: object, key_prefix: str, depth: int) -> None:
+            if value is None:
+                return
+            if depth > 8:
+                return
+
+            obj_id = id(value)
+            if obj_id in seen_ids:
+                return
+            seen_ids.add(obj_id)
+
+            if _is_tensor_like(value):
+                key = key_prefix or "<root>"
+                entries[key] = value
+                return
+
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    child_key = str(key)
+                    next_prefix = f"{key_prefix}.{child_key}" if key_prefix else child_key
+                    _walk(child, next_prefix, depth + 1)
+                return
+
+            if isinstance(value, (list, tuple)):
+                for idx, child in enumerate(value):
+                    next_prefix = f"{key_prefix}[{idx}]" if key_prefix else f"[{idx}]"
+                    _walk(child, next_prefix, depth + 1)
+                return
+
+            # Some checkpoints may store an nn.Module-like object directly.
+            if hasattr(value, "state_dict") and callable(getattr(value, "state_dict", None)):
+                try:
+                    sd = value.state_dict()
+                except Exception:
+                    sd = None
+                if sd is not None:
+                    next_prefix = f"{key_prefix}.state_dict" if key_prefix else "state_dict"
+                    _walk(sd, next_prefix, depth + 1)
+
+        _walk(obj, prefix, 0)
+        return entries
+
+    def _describe_checkpoint_structure(self, checkpoint_obj: object) -> str:
+        lines: list[str] = []
+
+        def _typename(value: object) -> str:
+            return type(value).__name__
+
+        if isinstance(checkpoint_obj, dict):
+            lines.append(f"Top-level type: dict ({len(checkpoint_obj)} keys)")
+            for key in sorted(checkpoint_obj.keys(), key=lambda x: str(x))[:60]:
+                value = checkpoint_obj[key]
+                if isinstance(value, dict):
+                    lines.append(f"- {key}: dict ({len(value)} keys)")
+                elif isinstance(value, (list, tuple)):
+                    lines.append(f"- {key}: {_typename(value)} (len={len(value)})")
+                else:
+                    lines.append(f"- {key}: {_typename(value)}")
+            if len(checkpoint_obj) > 60:
+                lines.append("- ...")
+        else:
+            lines.append(f"Top-level type: {_typename(checkpoint_obj)}")
+            attrs = [name for name in ("state_dict", "model", "net", "module") if hasattr(checkpoint_obj, name)]
+            if attrs:
+                lines.append("Attributes present: " + ", ".join(attrs))
+
+        return "\n".join(lines)
+
+    def _format_shape(self, shape_obj: object) -> str:
+        try:
+            dims = [int(v) for v in shape_obj]
+            return "[" + ", ".join(str(v) for v in dims) + "]"
+        except Exception:
+            return "[]"
+
+    def _tensor_kind_from_name(self, tensor_name: str) -> str:
+        lower = tensor_name.lower()
+        if lower.endswith("running_mean") or lower.endswith("running_var") or lower.endswith("num_batches_tracked"):
+            return "buffer"
+        return "param"
 
     def _set_config_preview(self, config_path: Path) -> None:
         if self.eval_config_text is None:
