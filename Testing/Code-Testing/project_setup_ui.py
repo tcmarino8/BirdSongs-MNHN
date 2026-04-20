@@ -24,8 +24,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import yaml
+
+try:
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+except Exception:  # pragma: no cover - optional dependency
+    FigureCanvasTkAgg = None
 
 from DLCsupport import (
     BIRD_BODYPARTS,
@@ -96,6 +102,24 @@ class ProjectSetupUI:
         self.eval_config_text: tk.Text | None = None
         self.eval_layers_text: tk.Text | None = None
         self._eval_snapshot_map: dict[str, Path] = {}
+
+        self.step6_frame: ttk.LabelFrame | None = None
+        self.eval_video_folder_var = tk.StringVar()
+        self.eval_existing_data_folder_var = tk.StringVar()
+        self.eval_truth_csv_var = tk.StringVar()
+        self.eval_status_var = tk.StringVar(value="Idle")
+        self.eval_plot_type_var = tk.StringVar(value="likelihood_over_time")
+        self.eval_color_mode_var = tk.StringVar(value="likelihood")
+        self.eval_bodypart_filter_var = tk.StringVar(value="all")
+        self.eval_camera_filter_var = tk.StringVar(value="all")
+        self.eval_min_likelihood_var = tk.StringVar(value="0.6")
+        self.eval_bodypart_combo: ttk.Combobox | None = None
+        self.eval_camera_combo: ttk.Combobox | None = None
+        self.eval_logs_text: tk.Text | None = None
+        self.eval_plot_host: ttk.Frame | None = None
+        self._eval_canvas = None
+        self._eval_loaded_data: pd.DataFrame | None = None
+        self._eval_inference_in_progress = False
 
         self._build_start_page()
 
@@ -170,6 +194,7 @@ class ProjectSetupUI:
 
         self.page.columnconfigure(0, weight=1)
         self._ensure_step5_section()
+        self._ensure_step6_section()
 
     def _build_layout(self) -> None:
         self._clear_root_children()
@@ -1051,6 +1076,597 @@ class ProjectSetupUI:
         except Exception as exc:
             self.eval_config_text.delete("1.0", tk.END)
             self.eval_config_text.insert(tk.END, f"Failed to read config:\n{exc}")
+
+    def _ensure_step6_section(self) -> None:
+        if self.step6_frame is not None:
+            return
+
+        self.step6_frame = ttk.LabelFrame(
+            self.page,
+            text="Step 6: Run inference + interactive diagnostics",
+            padding=10,
+        )
+        self.step6_frame.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
+        self.step6_frame.columnconfigure(0, weight=1)
+        self.step6_frame.columnconfigure(1, weight=1)
+
+        helper = ttk.Label(
+            self.step6_frame,
+            text=(
+                "Run inference on a folder of videos using the selected model/snapshot, or load an existing output folder. "
+                "Then filter plots by bodypart and minimum likelihood, and color by likelihood/bodypart/truth-distance."
+            ),
+        )
+        helper.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        controls = ttk.Frame(self.step6_frame)
+        controls.grid(row=1, column=0, columnspan=2, sticky="we")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Videos Folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_video_folder_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_eval_video_folder).grid(row=0, column=2, sticky="e", pady=3)
+
+        ttk.Label(controls, text="Existing Data Folder").grid(row=1, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_existing_data_folder_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_eval_existing_data_folder).grid(row=1, column=2, sticky="e", pady=3)
+
+        ttk.Label(controls, text="Truth CSV (optional)").grid(row=2, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_truth_csv_var).grid(row=2, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_eval_truth_csv).grid(row=2, column=2, sticky="e", pady=3)
+
+        action_row = ttk.Frame(self.step6_frame)
+        action_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 6))
+        ttk.Button(action_row, text="Run Inference", command=self._start_step6_inference).pack(side="left")
+        ttk.Button(action_row, text="Load Existing Data", command=self._load_step6_existing_data).pack(side="left", padx=(8, 0))
+
+        status_row = ttk.Frame(self.step6_frame)
+        status_row.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        status_row.columnconfigure(1, weight=1)
+        ttk.Label(status_row, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_row, textvariable=self.eval_status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        plot_controls = ttk.Frame(self.step6_frame)
+        plot_controls.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        plot_controls.columnconfigure(7, weight=1)
+
+        ttk.Label(plot_controls, text="Plot").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            plot_controls,
+            textvariable=self.eval_plot_type_var,
+            values=["likelihood_over_time", "xy_over_time", "distance_over_time", "displacement_over_time"],
+            state="readonly",
+            width=24,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(plot_controls, text="Bodypart").grid(row=0, column=2, sticky="w")
+        self.eval_bodypart_combo = ttk.Combobox(
+            plot_controls,
+            textvariable=self.eval_bodypart_filter_var,
+            values=["all"],
+            state="readonly",
+            width=20,
+        )
+        self.eval_bodypart_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(plot_controls, text="Camera").grid(row=0, column=4, sticky="w")
+        self.eval_camera_combo = ttk.Combobox(
+            plot_controls,
+            textvariable=self.eval_camera_filter_var,
+            values=["all"],
+            state="readonly",
+            width=12,
+        )
+        self.eval_camera_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+
+        ttk.Label(plot_controls, text="Min likelihood").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(plot_controls, textvariable=self.eval_min_likelihood_var, width=10).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        ttk.Label(plot_controls, text="Color by").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            plot_controls,
+            textvariable=self.eval_color_mode_var,
+            values=["likelihood", "bodypart", "distance_from_truth"],
+            state="readonly",
+            width=20,
+        ).grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        ttk.Button(plot_controls, text="Refresh Plot", command=self._refresh_step6_plot).grid(row=1, column=4, sticky="w", pady=(6, 0))
+
+        self.eval_plot_host = ttk.Frame(self.step6_frame)
+        self.eval_plot_host.grid(row=5, column=0, sticky="nsew", padx=(0, 8))
+        self.eval_plot_host.columnconfigure(0, weight=1)
+        self.eval_plot_host.rowconfigure(0, weight=1)
+        placeholder = ttk.Label(self.eval_plot_host, text="No plot yet. Run inference or load existing data, then click Refresh Plot.")
+        placeholder.grid(row=0, column=0, sticky="nsew")
+
+        logs = ttk.Frame(self.step6_frame)
+        logs.grid(row=5, column=1, sticky="nsew", padx=(8, 0))
+        logs.columnconfigure(0, weight=1)
+        logs.rowconfigure(1, weight=1)
+
+        ttk.Label(logs, text="Step 6 Logs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.eval_logs_text = tk.Text(logs, wrap="word", height=20)
+        self.eval_logs_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+    def _pick_eval_video_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select folder containing videos for inference")
+        if selected:
+            self.eval_video_folder_var.set(selected)
+
+    def _pick_eval_existing_data_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select existing post-processed data folder")
+        if selected:
+            self.eval_existing_data_folder_var.set(selected)
+
+    def _pick_eval_truth_csv(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select truth CSV (optional)",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if selected:
+            self.eval_truth_csv_var.set(selected)
+
+    def _append_eval_log(self, message: str) -> None:
+        if self.eval_logs_text is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.eval_logs_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.eval_logs_text.see(tk.END)
+
+    def _start_step6_inference(self) -> None:
+        if self._eval_inference_in_progress:
+            messagebox.showwarning("Inference running", "Inference is already in progress.")
+            return
+
+        config_path = Path(self.eval_config_var.get().strip())
+        if not config_path.exists():
+            messagebox.showerror("Missing config", "Select a valid config.yaml in Step 5 first.")
+            return
+
+        selected_label = self.eval_model_var.get().strip()
+        snapshot_path = self._eval_snapshot_map.get(selected_label)
+        if snapshot_path is None:
+            messagebox.showerror("Missing snapshot", "Select a model snapshot in Step 5 first.")
+            return
+
+        video_folder = Path(self.eval_video_folder_var.get().strip())
+        if not video_folder.exists():
+            messagebox.showerror("Missing videos folder", "Select a valid folder containing videos.")
+            return
+
+        video_exts = {".avi", ".mp4", ".mov", ".mkv", ".mpeg", ".mpg"}
+        videos = sorted([p for p in video_folder.iterdir() if p.is_file() and p.suffix.lower() in video_exts])
+        if not videos:
+            messagebox.showerror("No videos", "No supported video files were found in the selected folder.")
+            return
+
+        model_slug = self._safe_name_for_folder(selected_label.split("|")[0].strip() or "model")
+        snap_num = self._extract_snapshot_num(snapshot_path.name)
+        out_folder = video_folder / f"post_processed_data_{model_slug}_{snap_num}"
+        out_folder.mkdir(parents=True, exist_ok=True)
+        self.eval_existing_data_folder_var.set(str(out_folder))
+
+        self._eval_inference_in_progress = True
+        self.eval_status_var.set("Running inference...")
+        self._append_eval_log(f"Output folder: {out_folder}")
+        self._append_eval_log(f"Videos found: {len(videos)}")
+        self._append_eval_log(
+            "Using selected snapshot metadata for output naming. "
+            "Actual checkpoint routing depends on installed DeepLabCut API behavior."
+        )
+
+        thread = threading.Thread(
+            target=self._run_step6_inference_worker,
+            args=(config_path, videos, out_folder),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_step6_inference_worker(self, config_path: Path, videos: list[Path], out_folder: Path) -> None:
+        try:
+            import deeplabcut  # noqa: PLC0415
+
+            config_str = str(config_path)
+            video_strs = [str(v) for v in videos]
+
+            self.root.after(0, lambda: self._append_eval_log("Running analyze_videos..."))
+            deeplabcut.analyze_videos(
+                config=config_str,
+                videos=video_strs,
+                destfolder=str(out_folder),
+                videotype="",
+                save_as_csv=True,
+            )
+
+            self.root.after(0, lambda: self._append_eval_log("Running filterpredictions..."))
+            try:
+                deeplabcut.filterpredictions(
+                    config=config_str,
+                    videos=video_strs,
+                    destfolder=str(out_folder),
+                    videotype="",
+                    save_as_csv=True,
+                )
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._append_eval_log(f"filterpredictions skipped: {e}"))
+
+            self.root.after(0, lambda: self._append_eval_log("Creating labeled videos..."))
+            deeplabcut.create_labeled_video(
+                config=config_str,
+                videos=video_strs,
+                destfolder=str(out_folder),
+                videotype="",
+            )
+
+            self.root.after(0, lambda: self._append_eval_log("Creating trajectory plots..."))
+            deeplabcut.plot_trajectories(
+                config=config_str,
+                videos=video_strs,
+                destfolder=str(out_folder),
+                videotype="",
+            )
+
+            self.root.after(0, lambda: self._on_step6_inference_complete(out_folder))
+        except Exception:
+            details = traceback.format_exc()
+            self.root.after(0, lambda d=details: self._on_step6_inference_failed(d))
+
+    def _on_step6_inference_complete(self, out_folder: Path) -> None:
+        self._eval_inference_in_progress = False
+        self.eval_status_var.set("Inference complete")
+        self._append_eval_log("Inference complete.")
+        self._append_eval_log(f"Saved outputs in: {out_folder}")
+        self._load_step6_data_from_folder(out_folder)
+        messagebox.showinfo("Step 6", f"Inference complete.\n\nOutputs saved in:\n{out_folder}")
+
+    def _on_step6_inference_failed(self, details: str) -> None:
+        self._eval_inference_in_progress = False
+        self.eval_status_var.set("Inference failed")
+        self._append_eval_log("Inference failed. See traceback below.")
+        self._append_eval_log(details)
+        messagebox.showerror("Step 6", "Inference failed. Check Step 6 logs.")
+
+    def _load_step6_existing_data(self) -> None:
+        folder = Path(self.eval_existing_data_folder_var.get().strip())
+        if not folder.exists():
+            messagebox.showerror("Missing folder", "Select a valid existing data folder first.")
+            return
+        self._load_step6_data_from_folder(folder)
+
+    def _load_step6_data_from_folder(self, folder: Path) -> None:
+        try:
+            df = self._build_step6_long_dataframe(folder)
+            if df.empty:
+                messagebox.showwarning("No data", "No prediction data was found in this folder.")
+                return
+
+            self._eval_loaded_data = df
+            self._update_step6_filter_options(df)
+            self.eval_status_var.set(f"Loaded {len(df):,} points from {folder.name}")
+            self._append_eval_log(f"Loaded prediction rows: {len(df):,}")
+
+            labeled_outputs = sorted(folder.rglob("*labeled*.*"))
+            traj_dirs = sorted([p for p in folder.rglob("*plot-poses*") if p.is_dir()])
+            self._append_eval_log(f"Labeled video/image outputs found: {len(labeled_outputs)}")
+            if labeled_outputs:
+                self._append_eval_log(f"Example labeled output: {labeled_outputs[0]}")
+            self._append_eval_log(f"Trajectory plot directories found: {len(traj_dirs)}")
+
+            saved = self._save_step6_dataframe(df, folder)
+            self._append_eval_log(f"Saved long-format data: {saved}")
+            self._refresh_step6_plot()
+        except Exception as exc:
+            self._append_eval_log(traceback.format_exc())
+            messagebox.showerror("Load failed", f"Could not load existing analysis data:\n{exc}")
+
+    def _build_step6_long_dataframe(self, folder: Path) -> pd.DataFrame:
+        pred_csvs = sorted(folder.glob("*DLC*.csv"))
+        if not pred_csvs:
+            pred_csvs = sorted(folder.rglob("*DLC*.csv"))
+        if not pred_csvs:
+            return pd.DataFrame()
+
+        long_parts = [self._prediction_csv_to_long_for_step6(p) for p in pred_csvs]
+        df = pd.concat(long_parts, ignore_index=True)
+
+        truth_path = Path(self.eval_truth_csv_var.get().strip()) if self.eval_truth_csv_var.get().strip() else None
+        if truth_path is not None and truth_path.exists():
+            truth_long = self._truth_csv_to_long_for_step6(truth_path)
+            if not truth_long.empty:
+                df = df.merge(truth_long, on=["frame_id", "bodypart", "camera"], how="left")
+                if {"x_true", "y_true"}.issubset(df.columns):
+                    df["distance_px"] = ((df["x_pred"] - df["x_true"]) ** 2 + (df["y_pred"] - df["y_true"]) ** 2) ** 0.5
+
+        df = df.sort_values(["camera", "bodypart", "frame_id"]).reset_index(drop=True)
+        df["dx"] = df.groupby(["camera", "bodypart"])["x_pred"].diff()
+        df["dy"] = df.groupby(["camera", "bodypart"])["y_pred"].diff()
+        df["euclidean_displacement_t-1_to_t"] = (df["dx"] ** 2 + df["dy"] ** 2) ** 0.5
+        return df
+
+    def _prediction_csv_to_long_for_step6(self, pred_csv_path: Path) -> pd.DataFrame:
+        wide, bp_level, coord_level = self._read_prediction_wide_for_step6(pred_csv_path)
+        camera = self._infer_camera_from_name(pred_csv_path.name)
+        bodyparts = pd.Index(wide.columns.get_level_values(bp_level)).unique()
+
+        frame_ids = [self._normalize_frame_id(v) for v in wide.index]
+        rows: list[pd.DataFrame] = []
+
+        for bp in bodyparts:
+            bp_cols = wide.xs(bp, axis=1, level=bp_level, drop_level=False)
+            coords = bp_cols.columns.get_level_values(coord_level).astype(str).str.lower().tolist()
+            if "x" not in coords or "y" not in coords:
+                continue
+
+            xcol = bp_cols.columns[coords.index("x")]
+            ycol = bp_cols.columns[coords.index("y")]
+            if "likelihood" in coords:
+                lcol = bp_cols.columns[coords.index("likelihood")]
+                like = pd.to_numeric(bp_cols[lcol], errors="coerce").to_numpy(dtype=float)
+            else:
+                like = pd.Series([float("nan")] * bp_cols.shape[0]).to_numpy(dtype=float)
+
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "frame_id": frame_ids,
+                        "bodypart": str(bp),
+                        "camera": camera,
+                        "x_pred": pd.to_numeric(bp_cols[xcol], errors="coerce").to_numpy(dtype=float),
+                        "y_pred": pd.to_numeric(bp_cols[ycol], errors="coerce").to_numpy(dtype=float),
+                        "likelihood": like,
+                        "source_csv": pred_csv_path.name,
+                    }
+                )
+            )
+
+        if not rows:
+            raise ValueError(f"No usable x/y columns in prediction file: {pred_csv_path}")
+        return pd.concat(rows, ignore_index=True)
+
+    def _read_prediction_wide_for_step6(self, pred_csv_path: Path) -> tuple[pd.DataFrame, int, int]:
+        for header_rows in ([0, 1, 2], [0, 1, 2, 3], [0, 1]):
+            try:
+                wide = pd.read_csv(pred_csv_path, header=header_rows, index_col=0)
+            except Exception:
+                continue
+
+            levels = self._detect_bodypart_coord_levels(wide)
+            if levels is not None:
+                bp_level, coord_level = levels
+                return wide, bp_level, coord_level
+
+        # Fallback: try paired H5 file when CSV formatting is unusual.
+        h5_path = pred_csv_path.with_suffix(".h5")
+        if h5_path.exists():
+            try:
+                wide_h5 = pd.read_hdf(h5_path)
+                levels = self._detect_bodypart_coord_levels(wide_h5)
+                if levels is not None:
+                    bp_level, coord_level = levels
+                    return wide_h5, bp_level, coord_level
+            except Exception:
+                pass
+
+        raise ValueError(f"Could not detect bodypart/x/y columns in: {pred_csv_path}")
+
+    def _detect_bodypart_coord_levels(self, wide: pd.DataFrame) -> tuple[int, int] | None:
+        if not isinstance(wide.columns, pd.MultiIndex):
+            return None
+
+        nlevels = wide.columns.nlevels
+        coord_candidates = {"x", "y", "likelihood"}
+
+        for coord_level in range(nlevels):
+            values = {
+                str(v).strip().lower()
+                for v in wide.columns.get_level_values(coord_level)
+            }
+            if "x" in values and "y" in values and len(values.intersection(coord_candidates)) >= 2:
+                bp_level = max(0, coord_level - 1)
+                return bp_level, coord_level
+
+        return None
+
+    def _truth_csv_to_long_for_step6(self, truth_csv_path: Path) -> pd.DataFrame:
+        truth_df = pd.read_csv(truth_csv_path)
+        parsed: list[tuple[str, str, str, str]] = []
+        for col in truth_df.columns:
+            match = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
+            if match is None:
+                continue
+            parsed.append((match.group("bodypart"), f"cam{match.group('cam')}", match.group("coord").lower(), str(col)))
+
+        if not parsed:
+            return pd.DataFrame()
+
+        meta = pd.DataFrame(parsed, columns=["bodypart", "camera", "coord", "column"])
+        xmeta = meta[meta["coord"] == "x"].rename(columns={"column": "xcol"})
+        ymeta = meta[meta["coord"] == "y"].rename(columns={"column": "ycol"})
+        pairs = xmeta.merge(ymeta[["bodypart", "camera", "ycol"]], on=["bodypart", "camera"], how="inner")
+
+        frame_ids = [self._normalize_frame_id(v) for v in range(1, len(truth_df) + 1)]
+        out_parts: list[pd.DataFrame] = []
+        for _, row in pairs.iterrows():
+            out_parts.append(
+                pd.DataFrame(
+                    {
+                        "frame_id": frame_ids,
+                        "bodypart": row["bodypart"],
+                        "camera": row["camera"],
+                        "x_true": pd.to_numeric(truth_df[row["xcol"]], errors="coerce"),
+                        "y_true": pd.to_numeric(truth_df[row["ycol"]], errors="coerce"),
+                    }
+                )
+            )
+        return pd.concat(out_parts, ignore_index=True)
+
+    def _update_step6_filter_options(self, df: pd.DataFrame) -> None:
+        bodyparts = sorted({str(v) for v in df["bodypart"].dropna().unique()})
+        cameras = sorted({str(v) for v in df["camera"].dropna().unique()})
+
+        bp_values = ["all"] + bodyparts
+        cam_values = ["all"] + cameras
+
+        if self.eval_bodypart_combo is not None:
+            self.eval_bodypart_combo["values"] = bp_values
+        if self.eval_camera_combo is not None:
+            self.eval_camera_combo["values"] = cam_values
+
+        if self.eval_bodypart_filter_var.get() not in bp_values:
+            self.eval_bodypart_filter_var.set("all")
+        if self.eval_camera_filter_var.get() not in cam_values:
+            self.eval_camera_filter_var.set("all")
+
+    def _save_step6_dataframe(self, df: pd.DataFrame, folder: Path) -> Path:
+        target = folder / "analysis_long_format.csv"
+        df.to_csv(target, index=False)
+        return target
+
+    def _refresh_step6_plot(self) -> None:
+        if self._eval_loaded_data is None or self._eval_loaded_data.empty:
+            messagebox.showwarning("No data", "Load inference outputs first.")
+            return
+
+        try:
+            min_likelihood = float(self.eval_min_likelihood_var.get().strip())
+        except Exception:
+            messagebox.showerror("Invalid threshold", "Minimum likelihood must be a numeric value.")
+            return
+
+        df = self._eval_loaded_data.copy()
+        if "likelihood" in df.columns:
+            df = df[df["likelihood"].fillna(-1.0) >= min_likelihood]
+
+        bodypart = self.eval_bodypart_filter_var.get().strip()
+        if bodypart and bodypart != "all":
+            df = df[df["bodypart"] == bodypart]
+
+        camera = self.eval_camera_filter_var.get().strip()
+        if camera and camera != "all":
+            df = df[df["camera"] == camera]
+
+        if df.empty:
+            self._append_eval_log("Plot skipped: no rows after filters.")
+            messagebox.showwarning("No rows", "No data left after applying filters.")
+            return
+
+        fig = self._build_step6_figure(df)
+        self._show_step6_figure(fig)
+
+        data_folder = Path(self.eval_existing_data_folder_var.get().strip()) if self.eval_existing_data_folder_var.get().strip() else None
+        if data_folder is not None and data_folder.exists():
+            plot_name = f"plot_{self.eval_plot_type_var.get()}_{self.eval_color_mode_var.get()}_{bodypart}_{camera}.png"
+            plot_name = self._safe_name_for_folder(plot_name).replace(".png", "") + ".png"
+            plot_path = data_folder / plot_name
+            fig.savefig(plot_path, dpi=170, bbox_inches="tight")
+            self._append_eval_log(f"Saved plot: {plot_path}")
+
+    def _build_step6_figure(self, df: pd.DataFrame):
+        plot_type = self.eval_plot_type_var.get().strip()
+        color_mode = self.eval_color_mode_var.get().strip()
+
+        if plot_type == "xy_over_time":
+            fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+            self._scatter_time_series(axes[0], df, y_col="x_pred", ylabel="x (px)", color_mode=color_mode)
+            self._scatter_time_series(axes[1], df, y_col="y_pred", ylabel="y (px)", color_mode=color_mode)
+            axes[1].set_xlabel("frame_id")
+            fig.suptitle("X/Y marker positions over time")
+            fig.tight_layout()
+            return fig
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+        if plot_type == "likelihood_over_time":
+            self._scatter_time_series(ax, df, y_col="likelihood", ylabel="likelihood", color_mode=color_mode)
+            ax.set_title("Likelihood over time")
+        elif plot_type == "distance_over_time":
+            if "distance_px" not in df.columns:
+                raise ValueError("distance_from_truth plot requires truth CSV data.")
+            self._scatter_time_series(ax, df, y_col="distance_px", ylabel="distance to truth (px)", color_mode=color_mode)
+            ax.set_title("Distance-to-truth over time")
+        else:
+            self._scatter_time_series(
+                ax,
+                df.dropna(subset=["euclidean_displacement_t-1_to_t"]),
+                y_col="euclidean_displacement_t-1_to_t",
+                ylabel="euclidean displacement (t-1 to t) [px]",
+                color_mode=color_mode,
+            )
+            ax.set_title("Displacement over time")
+
+        ax.set_xlabel("frame_id")
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        return fig
+
+    def _scatter_time_series(self, ax, df: pd.DataFrame, y_col: str, ylabel: str, color_mode: str) -> None:
+        data = df.dropna(subset=["frame_id", y_col]).copy()
+        if data.empty:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        if color_mode == "likelihood" and "likelihood" in data.columns:
+            sc = ax.scatter(data["frame_id"], data[y_col], c=data["likelihood"], cmap="viridis", s=10, alpha=0.6)
+            cbar = plt.colorbar(sc, ax=ax)
+            cbar.set_label("likelihood")
+        elif color_mode == "distance_from_truth" and "distance_px" in data.columns:
+            sc = ax.scatter(data["frame_id"], data[y_col], c=data["distance_px"], cmap="magma", s=10, alpha=0.7)
+            cbar = plt.colorbar(sc, ax=ax)
+            cbar.set_label("distance to truth (px)")
+        else:
+            for bodypart, group in data.groupby("bodypart"):
+                ax.scatter(group["frame_id"], group[y_col], s=10, alpha=0.5, label=str(bodypart))
+            if data["bodypart"].nunique() <= 12:
+                ax.legend(fontsize=8, loc="best")
+
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+
+    def _show_step6_figure(self, fig) -> None:
+        if self.eval_plot_host is None:
+            return
+
+        for child in self.eval_plot_host.winfo_children():
+            child.destroy()
+
+        if FigureCanvasTkAgg is None:
+            plt.show(block=False)
+            fallback = ttk.Label(self.eval_plot_host, text="Plot opened in external matplotlib window.")
+            fallback.grid(row=0, column=0, sticky="nsew")
+            return
+
+        canvas = FigureCanvasTkAgg(fig, master=self.eval_plot_host)
+        widget = canvas.get_tk_widget()
+        widget.grid(row=0, column=0, sticky="nsew")
+        canvas.draw()
+        self._eval_canvas = canvas
+
+    def _infer_camera_from_name(self, name: str) -> str:
+        low = name.lower()
+        if "cam2" in low:
+            return "cam2"
+        return "cam1"
+
+    def _normalize_frame_id(self, raw_value: object) -> float:
+        try:
+            return float(int(raw_value))
+        except Exception:
+            pass
+        match = re.search(r"(\d+)(?!.*\d)", str(raw_value))
+        if match is None:
+            return float("nan")
+        return float(int(match.group(1)))
+
+    def _safe_name_for_folder(self, text: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text).strip())
+        safe = safe.strip("._")
+        return safe or "model"
+
+    def _extract_snapshot_num(self, snapshot_name: str) -> str:
+        match = re.search(r"snapshot-(\d+)", snapshot_name)
+        if match is None:
+            return "unknown"
+        return match.group(1)
 
     def _epochs_for_mode(self) -> int:
         mode = self.train_mode_var.get().strip().lower()
