@@ -48,6 +48,7 @@ class ProjectSetupUI:
         self.root = root
         self.root.title("DLC Project Setup (Starter)")
         self.root.geometry("980x700")
+        self.active_mode = "home"
 
         self.project_parent_dir = tk.StringVar()
         self.dummy_video_dir = tk.StringVar()
@@ -86,9 +87,56 @@ class ProjectSetupUI:
         self._training_in_progress = False
         self._training_start_time = 0.0
 
+        self.step5_frame: ttk.LabelFrame | None = None
+        self.eval_config_var = tk.StringVar()
+        self.eval_model_var = tk.StringVar()
+        self.eval_snapshot_path_var = tk.StringVar(value="No snapshot selected")
+        self.eval_model_combo: ttk.Combobox | None = None
+        self.eval_snapshot_text: tk.Text | None = None
+        self.eval_config_text: tk.Text | None = None
+        self._eval_snapshot_map: dict[str, Path] = {}
+
+        self._build_start_page()
+
+    def _clear_root_children(self) -> None:
+        for child in self.root.winfo_children():
+            child.destroy()
+
+    def _build_start_page(self) -> None:
+        self.active_mode = "home"
+        self._clear_root_children()
+
+        frame = ttk.Frame(self.root, padding=24)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="DLC Workflow Launcher",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="center", pady=(50, 10))
+
+        ttk.Label(
+            frame,
+            text="Choose a workflow to continue.",
+            font=("Segoe UI", 11),
+        ).pack(anchor="center", pady=(0, 24))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="center")
+        ttk.Button(buttons, text="Train model", command=self._open_train_mode).pack(side="left", padx=10)
+        ttk.Button(buttons, text="Test model", command=self._open_test_mode).pack(side="left", padx=10)
+
+    def _open_train_mode(self) -> None:
+        self.active_mode = "train"
         self._build_layout()
 
-    def _build_layout(self) -> None:
+    def _open_test_mode(self) -> None:
+        self.active_mode = "test"
+        self._build_test_layout()
+
+    def _build_test_layout(self) -> None:
+        self._clear_root_children()
+
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True)
 
@@ -113,10 +161,46 @@ class ProjectSetupUI:
 
         title = ttk.Label(
             self.page,
-            text="DLC Setup Wizard (Progressive Steps)",
+            text="DLC Setup Wizard (Testing)",
             font=("Segoe UI", 14, "bold"),
         )
         title.grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Button(self.page, text="Back", command=self._build_start_page).grid(row=0, column=1, sticky="e", pady=(0, 12))
+
+        self.page.columnconfigure(0, weight=1)
+        self._ensure_step5_section()
+
+    def _build_layout(self) -> None:
+        self._clear_root_children()
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self.page = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=self.page, anchor="nw")
+
+        def _on_page_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        self.page.bind("<Configure>", _on_page_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        title = ttk.Label(
+            self.page,
+            text="DLC Setup Wizard (Training)",
+            font=("Segoe UI", 14, "bold"),
+        )
+        title.grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Button(self.page, text="Back", command=self._build_start_page).grid(row=0, column=1, sticky="e", pady=(0, 12))
 
         step1 = ttk.LabelFrame(self.page, text="Step 1: Create project + starter dictionary", padding=10)
         step1.grid(row=1, column=0, sticky="nsew")
@@ -619,6 +703,148 @@ class ProjectSetupUI:
         ttk.Label(self.step4_frame, text="Training Logs", font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w")
         self.train_logs_text = tk.Text(self.step4_frame, wrap="word", height=12)
         self.train_logs_text.grid(row=5, column=0, sticky="nsew", pady=(4, 0))
+
+    def _ensure_step5_section(self) -> None:
+        if self.step5_frame is not None:
+            return
+
+        self.step5_frame = ttk.LabelFrame(
+            self.page,
+            text="Step 5: Model evaluation / inference (setup)",
+            padding=10,
+        )
+        self.step5_frame.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
+        self.step5_frame.columnconfigure(0, weight=1)
+        self.step5_frame.columnconfigure(1, weight=1)
+
+        helper = ttk.Label(
+            self.step5_frame,
+            text=(
+                "Iterative setup: choose a model config, select a discovered snapshot, "
+                "and review snapshot + config side-by-side before adding image/AVI inference."
+            ),
+        )
+        helper.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        controls = ttk.Frame(self.step5_frame)
+        controls.grid(row=1, column=0, columnspan=2, sticky="we")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Model Config (config.yaml)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_config_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
+        btns = ttk.Frame(controls)
+        btns.grid(row=0, column=2, sticky="e")
+        ttk.Button(btns, text="Browse...", command=self._pick_eval_config).pack(side="left")
+        ttk.Button(btns, text="Load Models", command=self._load_eval_models).pack(side="left", padx=(8, 0))
+
+        ttk.Label(controls, text="Model Snapshot").grid(row=1, column=0, sticky="w")
+        self.eval_model_combo = ttk.Combobox(
+            controls,
+            textvariable=self.eval_model_var,
+            state="readonly",
+            width=90,
+        )
+        self.eval_model_combo.grid(row=1, column=1, columnspan=2, sticky="we", padx=(8, 0), pady=3)
+        self.eval_model_combo.bind("<<ComboboxSelected>>", self._on_eval_model_selected)
+
+        left = ttk.Frame(self.step5_frame)
+        left.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(8, 0))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="Selected Snapshot Path", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.eval_snapshot_text = tk.Text(left, wrap="word", height=12)
+        self.eval_snapshot_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        right = ttk.Frame(self.step5_frame)
+        right.grid(row=2, column=1, sticky="nsew", padx=(8, 0), pady=(8, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        ttk.Label(right, text="Config Preview", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.eval_config_text = tk.Text(right, wrap="none", height=12)
+        self.eval_config_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        if self.current_config_path is not None:
+            self.eval_config_var.set(str(self.current_config_path))
+            self._load_eval_models()
+
+    def _pick_eval_config(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select model config.yaml for evaluation/inference",
+            filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if selected:
+            self.eval_config_var.set(selected)
+
+    def _load_eval_models(self) -> None:
+        config_path = Path(self.eval_config_var.get().strip())
+        if not config_path.exists() or config_path.name.lower() not in {"config.yaml", "config.yml"}:
+            messagebox.showerror("Invalid config", "Select a valid config.yaml file first.")
+            return
+
+        self._eval_snapshot_map = self._discover_snapshot_options(config_path)
+        labels = list(self._eval_snapshot_map.keys())
+
+        if self.eval_model_combo is not None:
+            self.eval_model_combo["values"] = labels
+
+        if labels:
+            self.eval_model_var.set(labels[-1])
+            self._set_selected_snapshot_text(labels[-1])
+        else:
+            self.eval_model_var.set("")
+            self.eval_snapshot_path_var.set("No snapshots found under dlc-models-pytorch.")
+            self._set_selected_snapshot_text(None)
+
+        self._set_config_preview(config_path)
+
+    def _discover_snapshot_options(self, config_path: Path) -> dict[str, Path]:
+        project_dir = config_path.parent
+        snapshot_paths = sorted(
+            project_dir.glob("dlc-models-pytorch/*/*/train/snapshot-*.pt")
+        )
+
+        options: dict[str, Path] = {}
+        for snap in snapshot_paths:
+            train_set_name = snap.parent.parent.name
+            label = f"{train_set_name} | {snap.name}"
+            options[label] = snap
+        return options
+
+    def _on_eval_model_selected(self, _event: tk.Event) -> None:
+        label = self.eval_model_var.get().strip()
+        self._set_selected_snapshot_text(label)
+
+    def _set_selected_snapshot_text(self, selected_label: str | None) -> None:
+        if self.eval_snapshot_text is None:
+            return
+
+        self.eval_snapshot_text.delete("1.0", tk.END)
+
+        if selected_label is None:
+            self.eval_snapshot_text.insert(tk.END, "No snapshot selected.")
+            return
+
+        snapshot_path = self._eval_snapshot_map.get(selected_label)
+        if snapshot_path is None:
+            self.eval_snapshot_text.insert(tk.END, "No snapshot selected.")
+            return
+
+        self.eval_snapshot_path_var.set(str(snapshot_path))
+        self.eval_snapshot_text.insert(tk.END, str(snapshot_path))
+
+    def _set_config_preview(self, config_path: Path) -> None:
+        if self.eval_config_text is None:
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            self.eval_config_text.delete("1.0", tk.END)
+            self.eval_config_text.insert(tk.END, text)
+        except Exception as exc:
+            self.eval_config_text.delete("1.0", tk.END)
+            self.eval_config_text.insert(tk.END, f"Failed to read config:\n{exc}")
 
     def _epochs_for_mode(self) -> int:
         mode = self.train_mode_var.get().strip().lower()
