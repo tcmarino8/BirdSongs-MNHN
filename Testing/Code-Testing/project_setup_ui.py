@@ -44,9 +44,10 @@ from DLCsupport import (
 )
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageTk
 except Exception:  # pragma: no cover - optional dependency
     Image = None
+    ImageDraw = None
     ImageTk = None
 
 
@@ -961,7 +962,26 @@ class ProjectSetupUI:
         layers.columnconfigure(0, weight=1)
         layers.rowconfigure(1, weight=1)
 
-        ttk.Label(layers, text="Checkpoint Layer Table", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        layers_label_row = ttk.Frame(layers)
+        layers_label_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(layers_label_row, text="Checkpoint Layer Table", font=("Segoe UI", 10, "bold")).pack(side="left")
+        layers_info_button = ttk.Button(layers_label_row, text="(i)")
+        layers_info_button.pack(side="left", padx=(6, 0))
+        layers_info_button.configure(
+            command=lambda w=layers_info_button: self._toggle_info_bubble(
+                key="step5_checkpoint_layer_table",
+                anchor_widget=w,
+                title="Checkpoint Layer Table",
+                message=(
+                    "parameter elements: the number of functions or neurons that transform and pass information from the data\n"
+                    "backbone: the model core holding most of the neurons and doing most of the data processing\n"
+                    "convl: convolution layer that processes image data efficiently and effectively\n"
+                    "bn: batch normalization of activations/neurons/functions on a subset of data\n"
+                    "heatmap_head: point identification layer as a heatmap\n"
+                    "locref_head: refining location of predicted points from the heatmap findings"
+                ),
+            )
+        )
         self.eval_layers_text = tk.Text(layers, wrap="none", height=16)
         self.eval_layers_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
 
@@ -2376,16 +2396,61 @@ class ProjectSetupUI:
             return
 
         first_image = image_paths[0]
+        first_points: pd.DataFrame | None = None
+
+        csv_candidates = sorted(labeled_dir.rglob("CollectedData_*.csv"))
+        if csv_candidates:
+            try:
+                first_csv = csv_candidates[0]
+                df = pd.read_csv(first_csv, header=[0, 1, 2], index_col=0)
+                if not df.empty and isinstance(df.columns, pd.MultiIndex):
+                    row_id = str(df.index[0])
+                    resolved = self._resolve_labeled_image_from_row_id(labeled_dir, row_id)
+                    if resolved is not None and resolved.exists():
+                        first_image = resolved
+
+                    first_points = self._extract_first_row_points(df)
+            except Exception:
+                first_points = None
+
         self.image_info_label.configure(
             text=f"Path: {first_image}\nRelative: {first_image.relative_to(labeled_dir).as_posix()}"
         )
 
-        if Image is None or ImageTk is None:
+        if Image is None or ImageDraw is None or ImageTk is None:
             self.image_preview_label.configure(text="Pillow is not available for image preview.", image="")
             self._preview_photo = None
             return
 
         pil_img = Image.open(first_image)
+
+        if first_points is not None and not first_points.empty:
+            draw = ImageDraw.Draw(pil_img)
+            color_map = self._bodypart_color_map(first_points["bodypart"].tolist())
+            radius = 4
+            border_width = 2
+
+            for _, row in first_points.iterrows():
+                x = row.get("x")
+                y = row.get("y")
+                bp = str(row.get("bodypart", ""))
+                if pd.isna(x) or pd.isna(y):
+                    continue
+
+                x_f = float(x)
+                y_f = float(y)
+                color = color_map.get(bp, (255, 0, 0))
+
+                draw.ellipse(
+                    [(x_f - radius, y_f - radius), (x_f + radius, y_f + radius)],
+                    outline=color,
+                    width=border_width,
+                    fill=None,
+                )
+
+                coord_text = f"{bp} ({int(round(x_f))}, {int(round(y_f))})"
+                draw.text((x_f + radius + 2, y_f + radius + 2), coord_text, fill=color)
+
         pil_img.thumbnail((360, 360))
         self._preview_photo = ImageTk.PhotoImage(pil_img)
         self.image_preview_label.configure(image=self._preview_photo, text="")
@@ -2439,6 +2504,56 @@ class ProjectSetupUI:
         self.xy_long_text.insert(tk.END, f"CSV: {first_csv}\n")
         self.xy_long_text.insert(tk.END, f"Row ID: {df.index[0]}\n\n")
         self.xy_long_text.insert(tk.END, long_df.to_string(index=False))
+
+    def _resolve_labeled_image_from_row_id(self, labeled_dir: Path, row_id: str) -> Path | None:
+        row_id_norm = str(row_id).strip().replace("\\", "/")
+        candidates = [
+            labeled_dir / row_id_norm,
+            labeled_dir / Path(row_id_norm).name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _extract_first_row_points(self, df: pd.DataFrame) -> pd.DataFrame:
+        first_row = df.iloc[0]
+        points: list[dict[str, float | str | None]] = []
+
+        bp_level = 1 if df.columns.nlevels >= 2 else 0
+        coord_level = df.columns.nlevels - 1
+        bodyparts = [str(bp) for bp in df.columns.get_level_values(bp_level).unique()]
+
+        for bp in bodyparts:
+            x_val = None
+            y_val = None
+            for col in df.columns:
+                if str(col[bp_level]) != bp:
+                    continue
+                coord = str(col[coord_level]).lower()
+                value = first_row[col]
+                if coord == "x":
+                    x_val = value
+                elif coord == "y":
+                    y_val = value
+            points.append({"bodypart": bp, "x": x_val, "y": y_val})
+
+        return pd.DataFrame(points)
+
+    def _bodypart_color_map(self, bodyparts: list[str]) -> dict[str, tuple[int, int, int]]:
+        unique_bodyparts = list(dict.fromkeys(str(bp) for bp in bodyparts))
+        n = max(1, len(unique_bodyparts))
+        cmap = plt.get_cmap("tab20", n)
+        color_map: dict[str, tuple[int, int, int]] = {}
+
+        for idx, bp in enumerate(unique_bodyparts):
+            rgba = cmap(idx)
+            color_map[bp] = (
+                int(rgba[0] * 255),
+                int(rgba[1] * 255),
+                int(rgba[2] * 255),
+            )
+        return color_map
 
     def _load_step2_from_config(self) -> None:
         if self.current_config_path is None or self.bodyparts_text is None:
