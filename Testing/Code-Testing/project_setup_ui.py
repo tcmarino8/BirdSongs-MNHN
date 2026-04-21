@@ -15,6 +15,7 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -104,10 +105,14 @@ class ProjectSetupUI:
         self._eval_snapshot_map: dict[str, Path] = {}
 
         self.step6_frame: ttk.LabelFrame | None = None
+        self.step7_frame: ttk.LabelFrame | None = None
         self.eval_video_folder_var = tk.StringVar()
         self.eval_existing_data_folder_var = tk.StringVar()
         self.eval_truth_csv_var = tk.StringVar()
         self.eval_status_var = tk.StringVar(value="Idle")
+        self.eval_analysis_status_var = tk.StringVar(value="Idle")
+        self.eval_inference_pcutoff_var = tk.StringVar(value="0.6")
+        self.eval_inference_dotsize_var = tk.StringVar(value="12")
         self.eval_plot_type_var = tk.StringVar(value="likelihood_over_time")
         self.eval_color_mode_var = tk.StringVar(value="likelihood")
         self.eval_bodypart_filter_var = tk.StringVar(value="all")
@@ -117,9 +122,15 @@ class ProjectSetupUI:
         self.eval_camera_combo: ttk.Combobox | None = None
         self.eval_logs_text: tk.Text | None = None
         self.eval_plot_host: ttk.Frame | None = None
+        self.eval_progress: ttk.Progressbar | None = None
+        self.eval_progress_text_var = tk.StringVar(value="Frames: 0/0")
         self._eval_canvas = None
         self._eval_loaded_data: pd.DataFrame | None = None
         self._eval_inference_in_progress = False
+        self._eval_total_frames = 0
+        self._eval_current_frames = 0
+        self._eval_progress_phase = "analysis"
+        self._info_bubble_windows: dict[str, tk.Toplevel] = {}
 
         self._build_start_page()
 
@@ -195,7 +206,7 @@ class ProjectSetupUI:
         self.page.columnconfigure(0, weight=1)
         self._ensure_step5_section()
         self._ensure_step6_section()
-
+        self._ensure_step7_section()
     def _build_layout(self) -> None:
         self._clear_root_children()
         outer = ttk.Frame(self.root)
@@ -233,22 +244,70 @@ class ProjectSetupUI:
         step1.columnconfigure(1, weight=1)
         step1.columnconfigure(3, weight=1)
 
-        ttk.Label(step1, text="Task").grid(row=0, column=0, sticky="w")
+        task_label_row = ttk.Frame(step1)
+        task_label_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(task_label_row, text="Task").pack(side="left")
+        task_info_btn = ttk.Button(task_label_row, text="(i)")
+        task_info_btn.pack(side="left", padx=(4, 0))
+        task_info_btn.configure(
+            command=lambda w=task_info_btn: self._toggle_info_bubble(
+                key="step1_task",
+                anchor_widget=w,
+                title="Task",
+                message="The name of the project, study species, or individual you wish to track.",
+            )
+        )
         ttk.Entry(step1, textvariable=self.task_var, width=35).grid(row=0, column=1, sticky="we", padx=(8, 16), pady=4)
 
         ttk.Label(step1, text="Experimenter").grid(row=0, column=2, sticky="w")
         ttk.Entry(step1, textvariable=self.experimenter_var, width=35).grid(row=0, column=3, sticky="we", padx=(8, 0), pady=4)
 
-        ttk.Label(step1, text="Combined Project Root Name").grid(row=1, column=0, sticky="w")
+        root_label_row = ttk.Frame(step1)
+        root_label_row.grid(row=1, column=0, sticky="w")
+        ttk.Label(root_label_row, text="Combined Project Root Name").pack(side="left")
+        root_info_btn = ttk.Button(root_label_row, text="(i)")
+        root_info_btn.pack(side="left", padx=(4, 0))
+        root_info_btn.configure(
+            command=lambda w=root_info_btn: self._toggle_info_bubble(
+                key="step1_combined_root",
+                anchor_widget=w,
+                title="Combined Project Root Name",
+                message="This creates a folder with your chosen name that holds all modeling efforts you will run.",
+            )
+        )
         ttk.Entry(step1, textvariable=self.project_root_name_var, width=35).grid(row=1, column=1, sticky="we", padx=(8, 16), pady=4)
 
-        ttk.Label(step1, text="Project Parent Folder").grid(row=2, column=0, sticky="w")
+        parent_label_row = ttk.Frame(step1)
+        parent_label_row.grid(row=2, column=0, sticky="w")
+        ttk.Label(parent_label_row, text="Project Parent Folder").pack(side="left")
+        parent_info_btn = ttk.Button(parent_label_row, text="(i)")
+        parent_info_btn.pack(side="left", padx=(4, 0))
+        parent_info_btn.configure(
+            command=lambda w=parent_info_btn: self._toggle_info_bubble(
+                key="step1_parent_folder",
+                anchor_widget=w,
+                title="Project Parent Folder",
+                message="This is the folder where your data exists.",
+            )
+        )
         ttk.Entry(step1, textvariable=self.project_parent_dir, width=70).grid(
             row=2, column=1, columnspan=2, sticky="we", padx=(8, 8), pady=4
         )
         ttk.Button(step1, text="Browse...", command=self._pick_project_parent).grid(row=2, column=3, sticky="e", pady=4)
 
-        ttk.Label(step1, text="Dummy Video Folder").grid(row=3, column=0, sticky="w")
+        dummy_label_row = ttk.Frame(step1)
+        dummy_label_row.grid(row=3, column=0, sticky="w")
+        ttk.Label(dummy_label_row, text="Dummy Video Folder").pack(side="left")
+        dummy_info_btn = ttk.Button(dummy_label_row, text="(i)")
+        dummy_info_btn.pack(side="left", padx=(4, 0))
+        dummy_info_btn.configure(
+            command=lambda w=dummy_info_btn: self._toggle_info_bubble(
+                key="step1_dummy_video_folder",
+                anchor_widget=w,
+                title="Dummy Video Folder",
+                message="Folder where your training data lives as AVI files.",
+            )
+        )
         ttk.Entry(step1, textvariable=self.dummy_video_dir, width=70).grid(
             row=3, column=1, columnspan=2, sticky="we", padx=(8, 8), pady=4
         )
@@ -275,8 +334,21 @@ class ProjectSetupUI:
         ttk.Button(action_row, text="Save Dictionary As JSON", command=self._save_dict_json).pack(side="left", padx=10)
         ttk.Button(action_row, text="Clear Output", command=self._clear_output).pack(side="left")
 
-        ttk.Label(step1, text="Dictionary Output", font=("Segoe UI", 11, "bold")).grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=(8, 4)
+        dict_label_row = ttk.Frame(step1)
+        dict_label_row.grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        ttk.Label(dict_label_row, text="Dictionary Output", font=("Segoe UI", 11, "bold")).pack(side="left")
+        dict_info_btn = ttk.Button(dict_label_row, text="(i)")
+        dict_info_btn.pack(side="left", padx=(6, 0))
+        dict_info_btn.configure(
+            command=lambda w=dict_info_btn: self._toggle_info_bubble(
+                key="step1_dictionary_output",
+                anchor_widget=w,
+                title="Dictionary Output",
+                message=(
+                    "All important file paths and key information about your modeling efforts are displayed here. "
+                    "Most paths point to mostly empty folders until you begin training models."
+                ),
+            )
         )
 
         self.output = tk.Text(step1, wrap="word", height=16)
@@ -570,8 +642,18 @@ class ProjectSetupUI:
         bird_combo.grid(row=0, column=1, sticky="we", padx=(8, 0))
         bird_combo.bind("<<ComboboxSelected>>", self._on_bird_suggestion_selected)
 
-        ttk.Label(left, text="Editable Bodyparts (one per line)", font=("Segoe UI", 10, "bold")).grid(
-            row=1, column=0, sticky="w"
+        bodyparts_label_row = ttk.Frame(left)
+        bodyparts_label_row.grid(row=1, column=0, sticky="w")
+        ttk.Label(bodyparts_label_row, text="Editable Bodyparts (one per line)", font=("Segoe UI", 10, "bold")).pack(side="left")
+        bodyparts_info_btn = ttk.Button(bodyparts_label_row, text="(i)")
+        bodyparts_info_btn.pack(side="left", padx=(4, 0))
+        bodyparts_info_btn.configure(
+            command=lambda w=bodyparts_info_btn: self._toggle_info_bubble(
+                key="step2_editable_bodyparts",
+                anchor_widget=w,
+                title="Editable Bodyparts",
+                message="You must define bodyparts for the study animal and the keypoints you want to track.",
+            )
         )
 
         self.bodyparts_text = tk.Text(left, wrap="none", height=16)
@@ -633,13 +715,49 @@ class ProjectSetupUI:
         ttk.Entry(controls, textvariable=self.dataset_data_path_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
         ttk.Button(controls, text="Browse...", command=self._pick_dataset_data_path).grid(row=0, column=2, sticky="e", pady=3)
 
-        ttk.Label(controls, text="Dataset Name (Typically Canari)").grid(row=1, column=0, sticky="w")
+        dataset_name_row = ttk.Frame(controls)
+        dataset_name_row.grid(row=1, column=0, sticky="w")
+        ttk.Label(dataset_name_row, text="Dataset Name (Typically Canari)").pack(side="left")
+        dataset_name_info_btn = ttk.Button(dataset_name_row, text="(i)")
+        dataset_name_info_btn.pack(side="left", padx=(4, 0))
+        dataset_name_info_btn.configure(
+            command=lambda w=dataset_name_info_btn: self._toggle_info_bubble(
+                key="step3_dataset_name",
+                anchor_widget=w,
+                title="Dataset Name",
+                message="Same as Task.",
+            )
+        )
         ttk.Entry(controls, textvariable=self.dataset_name_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=3)
 
-        ttk.Label(controls, text="Frame Counts").grid(row=2, column=0, sticky="w")
+        frame_counts_row = ttk.Frame(controls)
+        frame_counts_row.grid(row=2, column=0, sticky="w")
+        ttk.Label(frame_counts_row, text="Frame Counts").pack(side="left")
+        frame_counts_info_btn = ttk.Button(frame_counts_row, text="(i)")
+        frame_counts_info_btn.pack(side="left", padx=(4, 0))
+        frame_counts_info_btn.configure(
+            command=lambda w=frame_counts_info_btn: self._toggle_info_bubble(
+                key="step3_frame_counts",
+                anchor_widget=w,
+                title="Frame Counts",
+                message="Selects an amount of frames from your labeled data for training.",
+            )
+        )
         ttk.Entry(controls, textvariable=self.frame_counts_var).grid(row=2, column=1, sticky="we", padx=(8, 8), pady=3)
 
-        ttk.Label(controls, text="Selection Seed").grid(row=3, column=0, sticky="w")
+        seed_row = ttk.Frame(controls)
+        seed_row.grid(row=3, column=0, sticky="w")
+        ttk.Label(seed_row, text="Selection Seed").pack(side="left")
+        seed_info_btn = ttk.Button(seed_row, text="(i)")
+        seed_info_btn.pack(side="left", padx=(4, 0))
+        seed_info_btn.configure(
+            command=lambda w=seed_info_btn: self._toggle_info_bubble(
+                key="step3_selection_seed",
+                anchor_widget=w,
+                title="Selection Seed",
+                message="A value representing pseudo-randomness used to select frames.",
+            )
+        )
         ttk.Entry(controls, textvariable=self.dataset_seed_var).grid(row=3, column=1, sticky="we", padx=(8, 8), pady=3)
 
         action = ttk.Frame(self.step3_frame)
@@ -695,7 +813,22 @@ class ProjectSetupUI:
         controls.grid(row=1, column=0, sticky="we")
         controls.columnconfigure(5, weight=1)
 
-        ttk.Label(controls, text="Train Mode").grid(row=0, column=0, sticky="w")
+        train_mode_row = ttk.Frame(controls)
+        train_mode_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(train_mode_row, text="Train Mode").pack(side="left")
+        train_mode_info_btn = ttk.Button(train_mode_row, text="(i)")
+        train_mode_info_btn.pack(side="left", padx=(4, 0))
+        train_mode_info_btn.configure(
+            command=lambda w=train_mode_info_btn: self._toggle_info_bubble(
+                key="step4_train_mode",
+                anchor_widget=w,
+                title="Train Mode",
+                message=(
+                    "Select between fulltrain and testtrain. "
+                    "testtrain is primarily for verifying the model will run and uses only two epochs."
+                ),
+            )
+        )
         mode_combo = ttk.Combobox(
             controls,
             textvariable=self.train_mode_var,
@@ -705,7 +838,22 @@ class ProjectSetupUI:
         )
         mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 16))
 
-        ttk.Label(controls, text="Log Interval (epochs)").grid(row=0, column=2, sticky="w")
+        interval_row = ttk.Frame(controls)
+        interval_row.grid(row=0, column=2, sticky="w")
+        ttk.Label(interval_row, text="Log Interval (epochs)").pack(side="left")
+        interval_info_btn = ttk.Button(interval_row, text="(i)")
+        interval_info_btn.pack(side="left", padx=(4, 0))
+        interval_info_btn.configure(
+            command=lambda w=interval_info_btn: self._toggle_info_bubble(
+                key="step4_log_interval",
+                anchor_widget=w,
+                title="Log Interval (epochs)",
+                message=(
+                    "How often training reports are shown. "
+                    "An epoch is one training iteration where the model sees the entirety of the training data."
+                ),
+            )
+        )
         interval_combo = ttk.Combobox(
             controls,
             textvariable=self.log_interval_var,
@@ -763,7 +911,24 @@ class ProjectSetupUI:
         ttk.Button(btns, text="Browse...", command=self._pick_eval_config).pack(side="left")
         ttk.Button(btns, text="Load Models", command=self._load_eval_models).pack(side="left", padx=(8, 0))
 
-        ttk.Label(controls, text="Model Snapshot").grid(row=1, column=0, sticky="w")
+        snapshot_label_row = ttk.Frame(controls)
+        snapshot_label_row.grid(row=1, column=0, sticky="w")
+        ttk.Label(snapshot_label_row, text="Model Snapshot").pack(side="left")
+        snapshot_info_button = ttk.Button(snapshot_label_row, text="(i)")
+        snapshot_info_button.pack(side="left", padx=(4, 0))
+        snapshot_info_button.configure(
+            command=lambda w=snapshot_info_button: self._toggle_info_bubble(
+                key="step5_model_snapshot",
+                anchor_widget=w,
+                title="Model Snapshot",
+                message=(
+                    "When training a model, you make updates many times while learning how data is represented. "
+                    "These snapshots showcase those updates (usually 4-8 intervals throughout training). "
+                    "Stored in each snapshot are the weights for each node that are used to transform and share data "
+                    "with the rest of the model."
+                ),
+            )
+        )
         self.eval_model_combo = ttk.Combobox(
             controls,
             textvariable=self.eval_model_var,
@@ -812,6 +977,42 @@ class ProjectSetupUI:
         if selected:
             self.eval_config_var.set(selected)
 
+    def _toggle_info_bubble(
+        self,
+        *,
+        key: str,
+        anchor_widget: tk.Widget,
+        title: str,
+        message: str,
+    ) -> None:
+        existing = self._info_bubble_windows.get(key)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+            return
+
+        bubble = tk.Toplevel(self.root)
+        bubble.title(title)
+        bubble.transient(self.root)
+        bubble.resizable(False, False)
+
+        # Position the bubble just below the clicked info button.
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 8
+        bubble.geometry(f"+{x}+{y}")
+
+        container = ttk.Frame(bubble, padding=10)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container, text=title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(container, text=message, wraplength=380, justify="left").pack(anchor="w", pady=(6, 8))
+        ttk.Button(container, text="Close", command=bubble.destroy).pack(anchor="e")
+
+        def _on_destroy(_event: tk.Event) -> None:
+            self._info_bubble_windows.pop(key, None)
+
+        bubble.bind("<Destroy>", _on_destroy)
+        self._info_bubble_windows[key] = bubble
+
     def _load_eval_models(self) -> None:
         config_path = Path(self.eval_config_var.get().strip())
         if not config_path.exists() or config_path.name.lower() not in {"config.yaml", "config.yml"}:
@@ -834,6 +1035,7 @@ class ProjectSetupUI:
             self._set_checkpoint_layers_text(None)
 
         self._set_config_preview(config_path)
+        self._load_inference_visual_params_from_config()
 
     def _discover_snapshot_options(self, config_path: Path) -> dict[str, Path]:
         project_dir = config_path.parent
@@ -1083,51 +1285,92 @@ class ProjectSetupUI:
 
         self.step6_frame = ttk.LabelFrame(
             self.page,
-            text="Step 6: Run inference + interactive diagnostics",
+            text="Step 6: Run inference",
             padding=10,
         )
         self.step6_frame.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
         self.step6_frame.columnconfigure(0, weight=1)
-        self.step6_frame.columnconfigure(1, weight=1)
 
         helper = ttk.Label(
             self.step6_frame,
             text=(
-                "Run inference on a folder of videos using the selected model/snapshot, or load an existing output folder. "
-                "Then filter plots by bodypart and minimum likelihood, and color by likelihood/bodypart/truth-distance."
+                "Run inference on a folder of videos using the selected model/snapshot. "
+                "You can edit pcutoff and dotsize in config before running labeled output generation."
             ),
         )
-        helper.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        helper.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = ttk.Frame(self.step6_frame)
-        controls.grid(row=1, column=0, columnspan=2, sticky="we")
+        controls.grid(row=1, column=0, sticky="we")
         controls.columnconfigure(1, weight=1)
 
         ttk.Label(controls, text="Videos Folder").grid(row=0, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.eval_video_folder_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
         ttk.Button(controls, text="Browse...", command=self._pick_eval_video_folder).grid(row=0, column=2, sticky="e", pady=3)
 
-        ttk.Label(controls, text="Existing Data Folder").grid(row=1, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.eval_existing_data_folder_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=3)
-        ttk.Button(controls, text="Browse...", command=self._pick_eval_existing_data_folder).grid(row=1, column=2, sticky="e", pady=3)
+        ttk.Label(controls, text="pcutoff").grid(row=1, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_inference_pcutoff_var, width=12).grid(row=1, column=1, sticky="w", padx=(8, 8), pady=3)
 
-        ttk.Label(controls, text="Truth CSV (optional)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.eval_truth_csv_var).grid(row=2, column=1, sticky="we", padx=(8, 8), pady=3)
-        ttk.Button(controls, text="Browse...", command=self._pick_eval_truth_csv).grid(row=2, column=2, sticky="e", pady=3)
+        ttk.Label(controls, text="dotsize").grid(row=2, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_inference_dotsize_var, width=12).grid(row=2, column=1, sticky="w", padx=(8, 8), pady=3)
+
+        ttk.Button(controls, text="Load from config", command=self._load_inference_visual_params_from_config).grid(row=1, column=2, sticky="e", pady=3)
+        ttk.Button(controls, text="Apply to config", command=self._apply_inference_visual_params_to_config).grid(row=2, column=2, sticky="e", pady=3)
 
         action_row = ttk.Frame(self.step6_frame)
-        action_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 6))
+        action_row.grid(row=2, column=0, sticky="w", pady=(8, 6))
         ttk.Button(action_row, text="Run Inference", command=self._start_step6_inference).pack(side="left")
-        ttk.Button(action_row, text="Load Existing Data", command=self._load_step6_existing_data).pack(side="left", padx=(8, 0))
 
         status_row = ttk.Frame(self.step6_frame)
-        status_row.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        status_row.grid(row=3, column=0, sticky="we", pady=(0, 8))
         status_row.columnconfigure(1, weight=1)
         ttk.Label(status_row, text="Status:").grid(row=0, column=0, sticky="w")
         ttk.Label(status_row, textvariable=self.eval_status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(status_row, textvariable=self.eval_progress_text_var).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
 
-        plot_controls = ttk.Frame(self.step6_frame)
-        plot_controls.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        self.eval_progress = ttk.Progressbar(self.step6_frame, orient="horizontal", mode="determinate")
+        self.eval_progress.grid(row=4, column=0, sticky="we", pady=(0, 6))
+
+        ttk.Label(self.step6_frame, text="Use Step 7 to load and plot results.").grid(row=5, column=0, sticky="w", pady=(2, 0))
+        self._load_inference_visual_params_from_config()
+
+    def _ensure_step7_section(self) -> None:
+        if self.step7_frame is not None:
+            return
+
+        self.step7_frame = ttk.LabelFrame(
+            self.page,
+            text="Step 7: Analyze results",
+            padding=10,
+        )
+        self.step7_frame.grid(row=7, column=0, sticky="nsew", pady=(12, 0))
+        self.step7_frame.columnconfigure(0, weight=1)
+        self.step7_frame.columnconfigure(1, weight=1)
+
+        controls = ttk.Frame(self.step7_frame)
+        controls.grid(row=0, column=0, columnspan=2, sticky="we")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Existing Data Folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_existing_data_folder_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_eval_existing_data_folder).grid(row=0, column=2, sticky="e", pady=3)
+
+        ttk.Label(controls, text="Truth CSV (optional)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.eval_truth_csv_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_eval_truth_csv).grid(row=1, column=2, sticky="e", pady=3)
+
+        action_row = ttk.Frame(self.step7_frame)
+        action_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 6))
+        ttk.Button(action_row, text="Load Existing Data", command=self._load_step6_existing_data).pack(side="left")
+
+        status_row = ttk.Frame(self.step7_frame)
+        status_row.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        status_row.columnconfigure(1, weight=1)
+        ttk.Label(status_row, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_row, textvariable=self.eval_analysis_status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        plot_controls = ttk.Frame(self.step7_frame)
+        plot_controls.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
         plot_controls.columnconfigure(7, weight=1)
 
         ttk.Label(plot_controls, text="Plot").grid(row=0, column=0, sticky="w")
@@ -1173,21 +1416,61 @@ class ProjectSetupUI:
 
         ttk.Button(plot_controls, text="Refresh Plot", command=self._refresh_step6_plot).grid(row=1, column=4, sticky="w", pady=(6, 0))
 
-        self.eval_plot_host = ttk.Frame(self.step6_frame)
-        self.eval_plot_host.grid(row=5, column=0, sticky="nsew", padx=(0, 8))
+        self.eval_plot_host = ttk.Frame(self.step7_frame)
+        self.eval_plot_host.grid(row=4, column=0, sticky="nsew", padx=(0, 8))
         self.eval_plot_host.columnconfigure(0, weight=1)
         self.eval_plot_host.rowconfigure(0, weight=1)
-        placeholder = ttk.Label(self.eval_plot_host, text="No plot yet. Run inference or load existing data, then click Refresh Plot.")
+        placeholder = ttk.Label(self.eval_plot_host, text="No plot yet. Load existing data, then click Refresh Plot.")
         placeholder.grid(row=0, column=0, sticky="nsew")
 
-        logs = ttk.Frame(self.step6_frame)
-        logs.grid(row=5, column=1, sticky="nsew", padx=(8, 0))
+        logs = ttk.Frame(self.step7_frame)
+        logs.grid(row=4, column=1, sticky="nsew", padx=(8, 0))
         logs.columnconfigure(0, weight=1)
         logs.rowconfigure(1, weight=1)
 
-        ttk.Label(logs, text="Step 6 Logs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(logs, text="Step 7 Logs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
         self.eval_logs_text = tk.Text(logs, wrap="word", height=20)
         self.eval_logs_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+    def _load_inference_visual_params_from_config(self) -> None:
+        config_path = Path(self.eval_config_var.get().strip())
+        if not config_path.exists():
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            self.eval_inference_pcutoff_var.set(str(cfg.get("pcutoff", self.eval_inference_pcutoff_var.get())))
+            self.eval_inference_dotsize_var.set(str(cfg.get("dotsize", self.eval_inference_dotsize_var.get())))
+        except Exception:
+            pass
+
+    def _apply_inference_visual_params_to_config(self) -> bool:
+        config_path = Path(self.eval_config_var.get().strip())
+        if not config_path.exists():
+            messagebox.showerror("Missing config", "Select a valid config.yaml in Step 5 first.")
+            return False
+
+        try:
+            pcutoff = float(self.eval_inference_pcutoff_var.get().strip())
+            dotsize = int(float(self.eval_inference_dotsize_var.get().strip()))
+        except Exception:
+            messagebox.showerror("Invalid value", "pcutoff must be numeric and dotsize must be an integer.")
+            return False
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            cfg["pcutoff"] = pcutoff
+            cfg["dotsize"] = dotsize
+            with open(config_path, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(cfg, fh, sort_keys=False)
+            self._set_config_preview(config_path)
+            self.eval_status_var.set(f"Config updated: pcutoff={pcutoff}, dotsize={dotsize}")
+            self._append_eval_log(f"Updated config visual params in {config_path}: pcutoff={pcutoff}, dotsize={dotsize}")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Config update failed", str(exc))
+            return False
 
     def _pick_eval_video_folder(self) -> None:
         selected = filedialog.askdirectory(title="Select folder containing videos for inference")
@@ -1214,6 +1497,89 @@ class ProjectSetupUI:
         self.eval_logs_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.eval_logs_text.see(tk.END)
 
+    class _EvalStreamWriter:
+        def __init__(self, emit_line_callback):
+            self._emit = emit_line_callback
+            self._buffer = ""
+
+        def write(self, text: str) -> int:
+            if not text:
+                return 0
+            self._buffer += text
+
+            while True:
+                n_idx = self._buffer.find("\n")
+                r_idx = self._buffer.find("\r")
+                idxs = [i for i in (n_idx, r_idx) if i != -1]
+                if not idxs:
+                    break
+                idx = min(idxs)
+                line = self._buffer[:idx]
+                self._buffer = self._buffer[idx + 1:]
+                if line.strip():
+                    self._emit(line)
+            return len(text)
+
+        def flush(self) -> None:
+            if self._buffer.strip():
+                self._emit(self._buffer)
+            self._buffer = ""
+
+    def _set_eval_progress_phase(self, phase: str) -> None:
+        self._eval_progress_phase = phase
+        phase_text = "Analyzing" if phase == "analysis" else "Labeling"
+        self.root.after(0, lambda: self.eval_status_var.set(f"{phase_text} in progress..."))
+
+    def _reset_eval_progress(self) -> None:
+        self._eval_total_frames = 0
+        self._eval_current_frames = 0
+        self._eval_progress_phase = "analysis"
+        if self.eval_progress is not None:
+            self.eval_progress.configure(value=0, maximum=1)
+        self.eval_progress_text_var.set("Frames: 0/0")
+
+    def _update_eval_progress(self, current: int, total: int) -> None:
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        self._eval_total_frames = total
+        self._eval_current_frames = current
+
+        phase_text = "Analyzing" if self._eval_progress_phase == "analysis" else "Labeling"
+
+        if self.eval_progress is not None:
+            self.eval_progress.configure(maximum=total, value=current)
+        self.eval_progress_text_var.set(f"{phase_text} frames: {current}/{total}")
+
+    def _handle_eval_output_line(self, line: str) -> None:
+        clean = line.strip()
+        if not clean:
+            return
+
+        self.root.after(0, lambda msg=clean: self._append_eval_log(msg))
+
+        if "Running pose prediction" in clean:
+            self._set_eval_progress_phase("analysis")
+        elif clean.lower().startswith("labeling") or "Generating frames and creating video" in clean:
+            self._set_eval_progress_phase("labeling")
+
+        total_match = re.search(r"Overall\s+#\s+of\s+frames:\s*(\d+)", clean, flags=re.IGNORECASE)
+        if total_match:
+            total = int(total_match.group(1))
+            self.root.after(0, lambda t=total: self._update_eval_progress(self._eval_current_frames, t))
+
+        dur_match = re.search(r"Duration of video \[s\]:\s*([0-9.]+)", clean, flags=re.IGNORECASE)
+        fps_match = re.search(r"fps:\s*([0-9.]+)", clean, flags=re.IGNORECASE)
+        res_match = re.search(r"resolution:\s*w\s*=\s*(\d+)\s*,\s*h\s*=\s*(\d+)", clean, flags=re.IGNORECASE)
+        if dur_match or fps_match or res_match:
+            # Keep the original line in logs; this branch is for future UI-side metadata cards.
+            pass
+
+        progress_match = re.search(r"(\d+)\/(\d+)\s*\[", clean)
+        if progress_match:
+            current = int(progress_match.group(1))
+            total = int(progress_match.group(2))
+            self.root.after(0, lambda c=current, t=total: self._update_eval_progress(c, t))
+
     def _start_step6_inference(self) -> None:
         if self._eval_inference_in_progress:
             messagebox.showwarning("Inference running", "Inference is already in progress.")
@@ -1222,6 +1588,9 @@ class ProjectSetupUI:
         config_path = Path(self.eval_config_var.get().strip())
         if not config_path.exists():
             messagebox.showerror("Missing config", "Select a valid config.yaml in Step 5 first.")
+            return
+
+        if not self._apply_inference_visual_params_to_config():
             return
 
         selected_label = self.eval_model_var.get().strip()
@@ -1248,6 +1617,7 @@ class ProjectSetupUI:
         self.eval_existing_data_folder_var.set(str(out_folder))
 
         self._eval_inference_in_progress = True
+        self._reset_eval_progress()
         self.eval_status_var.set("Running inference...")
         self._append_eval_log(f"Output folder: {out_folder}")
         self._append_eval_log(f"Videos found: {len(videos)}")
@@ -1270,42 +1640,52 @@ class ProjectSetupUI:
             config_str = str(config_path)
             video_strs = [str(v) for v in videos]
 
-            self.root.after(0, lambda: self._append_eval_log("Running analyze_videos..."))
-            deeplabcut.analyze_videos(
-                config=config_str,
-                videos=video_strs,
-                destfolder=str(out_folder),
-                videotype="",
-                save_as_csv=True,
-            )
+            writer = self._EvalStreamWriter(self._handle_eval_output_line)
 
-            self.root.after(0, lambda: self._append_eval_log("Running filterpredictions..."))
-            try:
-                deeplabcut.filterpredictions(
+            self._set_eval_progress_phase("analysis")
+            self.root.after(0, lambda: self._append_eval_log("Running analyze_videos..."))
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                deeplabcut.analyze_videos(
                     config=config_str,
                     videos=video_strs,
                     destfolder=str(out_folder),
                     videotype="",
                     save_as_csv=True,
                 )
+
+            self.root.after(0, lambda: self._append_eval_log("Running filterpredictions..."))
+            try:
+                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                    deeplabcut.filterpredictions(
+                        config=config_str,
+                        videos=video_strs,
+                        destfolder=str(out_folder),
+                        videotype="",
+                        save_as_csv=True,
+                    )
             except Exception as exc:
                 self.root.after(0, lambda e=exc: self._append_eval_log(f"filterpredictions skipped: {e}"))
 
+            self._set_eval_progress_phase("labeling")
             self.root.after(0, lambda: self._append_eval_log("Creating labeled videos..."))
-            deeplabcut.create_labeled_video(
-                config=config_str,
-                videos=video_strs,
-                destfolder=str(out_folder),
-                videotype="",
-            )
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                deeplabcut.create_labeled_video(
+                    config=config_str,
+                    videos=video_strs,
+                    destfolder=str(out_folder),
+                    videotype="",
+                )
 
             self.root.after(0, lambda: self._append_eval_log("Creating trajectory plots..."))
-            deeplabcut.plot_trajectories(
-                config=config_str,
-                videos=video_strs,
-                destfolder=str(out_folder),
-                videotype="",
-            )
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                deeplabcut.plot_trajectories(
+                    config=config_str,
+                    videos=video_strs,
+                    destfolder=str(out_folder),
+                    videotype="",
+                )
+
+            writer.flush()
 
             self.root.after(0, lambda: self._on_step6_inference_complete(out_folder))
         except Exception:
@@ -1317,8 +1697,13 @@ class ProjectSetupUI:
         self.eval_status_var.set("Inference complete")
         self._append_eval_log("Inference complete.")
         self._append_eval_log(f"Saved outputs in: {out_folder}")
-        self._load_step6_data_from_folder(out_folder)
-        messagebox.showinfo("Step 6", f"Inference complete.\n\nOutputs saved in:\n{out_folder}")
+        self.eval_analysis_status_var.set("Ready to load outputs in Step 7")
+        messagebox.showinfo(
+            "Step 6",
+            "Inference complete.\n\n"
+            f"Outputs saved in:\n{out_folder}\n\n"
+            "Go to Step 7 and click 'Load Existing Data' to analyze.",
+        )
 
     def _on_step6_inference_failed(self, details: str) -> None:
         self._eval_inference_in_progress = False
@@ -1343,7 +1728,7 @@ class ProjectSetupUI:
 
             self._eval_loaded_data = df
             self._update_step6_filter_options(df)
-            self.eval_status_var.set(f"Loaded {len(df):,} points from {folder.name}")
+            self.eval_analysis_status_var.set(f"Loaded {len(df):,} points from {folder.name}")
             self._append_eval_log(f"Loaded prediction rows: {len(df):,}")
 
             labeled_outputs = sorted(folder.rglob("*labeled*.*"))
@@ -1559,7 +1944,7 @@ class ProjectSetupUI:
             plot_name = f"plot_{self.eval_plot_type_var.get()}_{self.eval_color_mode_var.get()}_{bodypart}_{camera}.png"
             plot_name = self._safe_name_for_folder(plot_name).replace(".png", "") + ".png"
             plot_path = data_folder / plot_name
-            fig.savefig(plot_path, dpi=170, bbox_inches="tight")
+            #fig.savefig(plot_path, dpi=170, bbox_inches="tight")
             self._append_eval_log(f"Saved plot: {plot_path}")
 
     def _build_step6_figure(self, df: pd.DataFrame):
