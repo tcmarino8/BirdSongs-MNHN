@@ -530,6 +530,8 @@ class ProjectSetupUI:
         task, experimenter, combined_project_root, dummy_video, _parent = validated
 
         try:
+            print(combined_project_root)
+            print(dummy_video)
             config_path = create_combined_project_if_missing(
                 task=task,
                 experimenter=experimenter,

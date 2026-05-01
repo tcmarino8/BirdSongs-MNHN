@@ -547,6 +547,56 @@ def assert_bodyparts_match(
 # ===========================================================================
 # Project and dataset management
 # ===========================================================================
+
+def truth_csv_to_long(truth_csv_path: Path) -> pd.DataFrame:
+    """Convert wide-format truth CSV into long-format point records.
+
+    Expected columns follow the pattern <bodypart>_cam<1|2>_<X|Y>.
+
+    Args:
+        truth_csv_path: Path to the truth CSV file.
+
+    Returns:
+        DataFrame with columns: frame_id, bodypart, camera, x_true, y_true.
+
+    Raises:
+        ValueError: If no valid truth columns are detected.
+    """
+    truth_df = pd.read_csv(truth_csv_path)
+
+    rows = []
+    for col in truth_df.columns:
+        m = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", col)
+        if m is None:
+            continue
+        rows.append((m.group("bodypart"), f"cam{m.group('cam')}", m.group("coord").lower(), col))
+
+    if not rows:
+        raise ValueError("Could not parse truth CSV columns with pattern <bodypart>_cam<1|2>_<X|Y>.")
+
+    meta = pd.DataFrame(rows, columns=["bodypart", "camera", "coord", "column"])
+    xmeta = meta[meta["coord"] == "x"].rename(columns={"column": "xcol"})
+    ymeta = meta[meta["coord"] == "y"].rename(columns={"column": "ycol"})
+    pairs = xmeta.merge(ymeta[["bodypart", "camera", "ycol"]], on=["bodypart", "camera"], how="inner")
+
+    long_parts = []
+    frame_ids = np.arange(1, len(truth_df) + 1)  # 1-based frame ids
+
+    for _, r in pairs.iterrows():
+        temp = pd.DataFrame(
+            {
+                "frame_id": frame_ids,
+                "bodypart": r["bodypart"],
+                "camera": r["camera"],
+                "x_true": pd.to_numeric(truth_df[r["xcol"]], errors="coerce"),
+                "y_true": pd.to_numeric(truth_df[r["ycol"]], errors="coerce"),
+            }
+        )
+        long_parts.append(temp)
+
+    out = pd.concat(long_parts, ignore_index=True)
+    return out
+
 def set_net_type(config_path: Path, net_type: str) -> None:
     """Patch the net_type field in a DLC config.yaml in-place."""
     config_path = Path(config_path)
