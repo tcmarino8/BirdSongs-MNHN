@@ -232,6 +232,134 @@ def tiff_stack_to_avi(
     }
 
 
+
+def jpg_stack_to_avi(
+    input_folder: pathlib.Path,
+    output_path: pathlib.Path,
+    fps: int = 500,
+    fourcc: str = "MJPG",
+    sort_numeric: bool = True,
+) -> dict[str, object]:
+    """Convert a folder of JPG/JPEG frames into an AVI file."""
+    if not input_folder.is_dir():
+        raise FileNotFoundError(f"Input folder not found: {input_folder}")
+
+    jpg_files = [
+        path
+        for path in input_folder.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
+    ]
+    if not jpg_files:
+        raise FileNotFoundError(f"No .jpg or .jpeg files found in: {input_folder}")
+
+    if sort_numeric:
+        def sort_key(path: pathlib.Path) -> tuple[int, int | str, str]:
+            match = re.search(r"(\d+)(?!.*\d)", path.name)
+            if match:
+                return (0, int(match.group(1)), path.name.lower())
+            return (1, path.name.lower(), path.name.lower())
+
+        jpg_files = sorted(jpg_files, key=sort_key)
+    else:
+        jpg_files = sorted(jpg_files)
+
+    first_frame = _to_uint8_bgr(cv2.imread(str(jpg_files[0]), cv2.IMREAD_COLOR))
+    height, width = first_frame.shape[:2]
+
+    if output_path.parent != pathlib.Path(""):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*fourcc),
+        float(fps),
+        (width, height),
+        True,
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open VideoWriter for output: {output_path}")
+
+    frames_written = 0
+    try:
+        for jpg_path in jpg_files:
+            frame = _to_uint8_bgr(cv2.imread(str(jpg_path), cv2.IMREAD_COLOR))
+            if frame.shape[:2] != (height, width):
+                raise ValueError(
+                    "Frame size mismatch in %s. Expected %sx%s, got %sx%s."
+                    % (jpg_path, width, height, frame.shape[1], frame.shape[0])
+                )
+            writer.write(frame)
+            frames_written += 1
+    finally:
+        writer.release()
+
+    return {
+        "output_path": str(output_path),
+        "frames_written": frames_written,
+        "fps": fps,
+        "codec": fourcc,
+        "width": width,
+        "height": height,
+    }
+
+from pathlib import Path
+import cv2
+
+from pathlib import Path
+import cv2
+
+
+def avi_to_jpg_stack(
+    avi_path: str | Path,
+    output_dir: str | Path,
+    prefix: str = "Cam1_Img00_UND",
+    every_n: int = 1,
+    jpg_quality: int = 95,
+    start_index: int = 1,
+) -> int:
+    """
+    Writes frames like: Cam1_Img00_UND.0001.jpg
+    Returns number of images written.
+    """
+    avi_path = Path(avi_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(avi_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {avi_path}")
+
+    written = 0
+    i = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            if i % every_n == 0:
+                frame_idx = start_index + written
+                out_file = output_dir / f"{prefix}.{frame_idx:04d}.jpg"
+                cv2.imwrite(
+                    str(out_file),
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(jpg_quality)],
+                )
+                written += 1
+            i += 1
+    finally:
+        cap.release()
+
+    return written
+
+def infer_camera_tag(path: pathlib.Path) -> str | None:
+    text = path.stem.lower()
+    if "cam2" in text:
+            return "cam2"
+    elif "cam1" in text:
+        return "cam1"
+    return None
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line interface parser.
 
