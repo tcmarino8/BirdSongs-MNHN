@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
-from matplotlib.widgets import CheckButtons, RadioButtons, Slider
+from matplotlib import colors as mcolors
+from matplotlib.widgets import CheckButtons, RadioButtons, Slider, TextBox
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -266,6 +267,7 @@ class OverlayState:
 	pred_long: pd.DataFrame
 	truth_long: pd.DataFrame
 	truth_found: bool
+	bodypart_color_map: dict[str, str]
 
 
 def make_postanalysis_overlay_popout(
@@ -315,20 +317,35 @@ def make_postanalysis_overlay_popout(
 		pred_long=pred_long,
 		truth_long=truth_long,
 		truth_found=truth_found,
+		bodypart_color_map={},
 	)
+
+	all_bodyparts = sorted(pd.Index(state.pred_long["bodypart"].dropna().astype(str)).unique().tolist())
+	if not state.truth_long.empty:
+		truth_parts = pd.Index(state.truth_long["bodypart"].dropna().astype(str)).unique().tolist()
+		all_bodyparts = sorted(set(all_bodyparts).union(set(truth_parts)))
+	palette = plt.cm.get_cmap("tab20", max(len(all_bodyparts), 1))
+	state.bodypart_color_map = {bp: mcolors.to_hex(palette(i)) for i, bp in enumerate(all_bodyparts)}
 
 	cam = _cam_norm(default_camera)
 	max_len = max(1, len(state.images_by_cam.get(cam, []))) - 1
 	start_pos = min(max(0, int(default_frame_pos)), max_len)
 
-	fig, ax = plt.subplots(figsize=(11.5, 8))
-	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.27)
+	fig, ax = plt.subplots(figsize=(12.2, 8.4))
+	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
 
 	ax_cam = fig.add_axes([0.82, 0.72, 0.16, 0.18])
-	ax_checks = fig.add_axes([0.82, 0.52, 0.16, 0.16])
-	ax_frame = fig.add_axes([0.08, 0.18, 0.62, 0.03])
-	ax_like = fig.add_axes([0.08, 0.13, 0.62, 0.03])
-	ax_offset = fig.add_axes([0.08, 0.08, 0.62, 0.03])
+	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
+	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
+	ax_like = fig.add_axes([0.08, 0.21, 0.62, 0.03])
+	ax_offset = fig.add_axes([0.08, 0.16, 0.62, 0.03])
+	ax_pred_size = fig.add_axes([0.08, 0.11, 0.29, 0.03])
+	ax_pred_alpha = fig.add_axes([0.41, 0.11, 0.29, 0.03])
+	ax_true_size = fig.add_axes([0.08, 0.06, 0.29, 0.03])
+	ax_true_alpha = fig.add_axes([0.41, 0.06, 0.29, 0.03])
+	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
+	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
+	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
@@ -340,6 +357,23 @@ def make_postanalysis_overlay_popout(
 	slider_frame = Slider(ax_frame, "frame_pos", 0, float(max_len), valinit=float(start_pos), valstep=1)
 	slider_like = Slider(ax_like, "min_likelihood", 0.0, 1.0, valinit=0.0, valstep=0.01)
 	slider_offset = Slider(ax_offset, "truth_offset", -5000, 5000, valinit=0, valstep=1)
+	slider_pred_size = Slider(ax_pred_size, "pred_size", 10, 300, valinit=60, valstep=1)
+	slider_pred_alpha = Slider(ax_pred_alpha, "pred_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
+	slider_true_size = Slider(ax_true_size, "true_size", 10, 300, valinit=45, valstep=1)
+	slider_true_alpha = Slider(ax_true_alpha, "true_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
+	textbox_pred_color = TextBox(ax_pred_color, "pred_color", initial="deepskyblue")
+	textbox_true_color = TextBox(ax_true_color, "true_color", initial="orange")
+	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
+
+	for text in radio_color_mode.labels:
+		text.set_fontsize(9)
+
+	def _safe_color(value: str, fallback: str) -> str:
+		try:
+			mcolors.to_rgba(value)
+			return value
+		except Exception:
+			return fallback
 
 	def _pred_points(camera: str, frame_id: int) -> pd.DataFrame:
 		d = state.pred_long[
@@ -370,6 +404,13 @@ def make_postanalysis_overlay_popout(
 		annotate = bool(check.get_status()[2])
 		min_like = float(slider_like.val)
 		truth_offset = int(slider_offset.val)
+		pred_size = float(slider_pred_size.val)
+		pred_alpha = float(slider_pred_alpha.val)
+		true_size = float(slider_true_size.val)
+		true_alpha = float(slider_true_alpha.val)
+		pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
+		true_color = _safe_color(textbox_true_color.text.strip(), "orange")
+		color_mode = str(radio_color_mode.value_selected)
 
 		ax.clear()
 
@@ -395,40 +436,50 @@ def make_postanalysis_overlay_popout(
 			if not pred_pts.empty:
 				pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
 			if not pred_pts.empty:
+				if color_mode == "by_name":
+					pred_colors = [state.bodypart_color_map.get(str(bp), pred_color) for bp in pred_pts["bodypart"]]
+				else:
+					pred_colors = pred_color
 				ax.scatter(
 					pred_pts["x"],
 					pred_pts["y"],
-					c="deepskyblue",
-					s=60,
-					alpha=0.9,
+					c=pred_colors,
+					s=pred_size,
+					alpha=pred_alpha,
 					edgecolors="white",
 					linewidths=1.0,
 					label="Predicted",
 				)
 				if annotate:
 					for _, row in pred_pts.iterrows():
-						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color="deepskyblue")
+						label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if color_mode == "by_name" else pred_color
+						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
 
 		if show_true:
 			true_pts = _true_points(camera, truth_frame_id)
 			if not true_pts.empty:
+				if color_mode == "by_name":
+					true_colors = [state.bodypart_color_map.get(str(bp), true_color) for bp in true_pts["bodypart"]]
+				else:
+					true_colors = true_color
 				ax.scatter(
 					true_pts["x"],
 					true_pts["y"],
-					c="orange",
-					s=45,
-					alpha=0.9,
+					c=true_colors,
+					s=true_size,
+					alpha=true_alpha,
 					marker="x",
 					linewidths=1.8,
 					label="True",
 				)
 				if annotate:
 					for _, row in true_pts.iterrows():
-						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color="orange")
+						label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if color_mode == "by_name" else true_color
+						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
 
 		ax.set_title(
 			f"{camera} | frame_pos={frame_pos} | image_frame_id={frame_id_img} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
-			f"pred_csv={state.pred_csv_by_cam[camera].name}"
+			f"pred_csv={state.pred_csv_by_cam[camera].name} | point_customizer={color_mode}"
 		)
 		ax.set_axis_off()
 
@@ -443,6 +494,13 @@ def make_postanalysis_overlay_popout(
 	slider_frame.on_changed(redraw)
 	slider_like.on_changed(redraw)
 	slider_offset.on_changed(redraw)
+	slider_pred_size.on_changed(redraw)
+	slider_pred_alpha.on_changed(redraw)
+	slider_true_size.on_changed(redraw)
+	slider_true_alpha.on_changed(redraw)
+	textbox_pred_color.on_submit(redraw)
+	textbox_true_color.on_submit(redraw)
+	radio_color_mode.on_clicked(redraw)
 
 	redraw()
 	print("Close the plot window to exit.")
