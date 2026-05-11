@@ -275,7 +275,7 @@ def make_postanalysis_overlay_popout(
 	search_truth: bool = False,
 	truth_csv_path: str | Path | None = None,
 	default_camera: str = "cam1",
-	default_frame_pos: int = 0,
+	default_frame_pos: int = 1,
 ) -> None:
 	"""Launch an interactive matplotlib popout to inspect predictions on image stacks."""
 	root = Path(prediction_path)
@@ -330,6 +330,9 @@ def make_postanalysis_overlay_popout(
 	cam = _cam_norm(default_camera)
 	max_len = max(1, len(state.images_by_cam.get(cam, []))) - 1
 	start_pos = min(max(0, int(default_frame_pos)), max_len)
+	current_points: list[dict[str, Any]] = []
+	selected_text = None
+	view_limits: dict[str, tuple[float, float] | None] = {"xlim": None, "ylim": None}
 
 	fig, ax = plt.subplots(figsize=(12.2, 8.4))
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
@@ -390,6 +393,8 @@ def make_postanalysis_overlay_popout(
 		return d[["bodypart", "x_true", "y_true"]].rename(columns={"x_true": "x", "y_true": "y"})
 
 	def redraw(*_args: Any) -> None:
+		nonlocal selected_text
+		nonlocal view_limits
 		camera = _cam_norm(radio_cam.value_selected)
 		imgs = state.images_by_cam.get(camera, [])
 
@@ -412,7 +417,14 @@ def make_postanalysis_overlay_popout(
 		true_color = _safe_color(textbox_true_color.text.strip(), "orange")
 		color_mode = str(radio_color_mode.value_selected)
 
+		# Preserve current zoom/pan before redraw so interaction persists.
+		if ax.has_data():
+			view_limits["xlim"] = tuple(float(v) for v in ax.get_xlim())
+			view_limits["ylim"] = tuple(float(v) for v in ax.get_ylim())
+
 		ax.clear()
+		current_points.clear()
+		selected_text = None
 
 		if not imgs:
 			ax.text(0.5, 0.5, f"No images for {camera}", ha="center", va="center", transform=ax.transAxes)
@@ -454,6 +466,15 @@ def make_postanalysis_overlay_popout(
 					for _, row in pred_pts.iterrows():
 						label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if color_mode == "by_name" else pred_color
 						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+				for _, row in pred_pts.iterrows():
+					current_points.append(
+						{
+							"x": float(row["x"]),
+							"y": float(row["y"]),
+							"bodypart": str(row["bodypart"]),
+							"kind": "Predicted",
+						}
+					)
 
 		if show_true:
 			true_pts = _true_points(camera, truth_frame_id)
@@ -476,6 +497,15 @@ def make_postanalysis_overlay_popout(
 					for _, row in true_pts.iterrows():
 						label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if color_mode == "by_name" else true_color
 						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+				for _, row in true_pts.iterrows():
+					current_points.append(
+						{
+							"x": float(row["x"]),
+							"y": float(row["y"]),
+							"bodypart": str(row["bodypart"]),
+							"kind": "True",
+						}
+					)
 
 		ax.set_title(
 			f"{camera} | frame_pos={frame_pos} | image_frame_id={frame_id_img} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
@@ -483,10 +513,89 @@ def make_postanalysis_overlay_popout(
 		)
 		ax.set_axis_off()
 
+		# Reapply previous view limits when available.
+		if view_limits["xlim"] is not None and view_limits["ylim"] is not None:
+			ax.set_xlim(view_limits["xlim"])
+			ax.set_ylim(view_limits["ylim"])
+
 		handles, labels = ax.get_legend_handles_labels()
 		if handles:
 			ax.legend(loc="upper right")
 
+		fig.canvas.draw_idle()
+
+	def _on_click(event: Any) -> None:
+		nonlocal selected_text
+		if event.inaxes != ax:
+			return
+		if event.xdata is None or event.ydata is None:
+			return
+		if not current_points:
+			return
+
+		click_px = np.array([event.x, event.y], dtype=float)
+		best = None
+		best_dist = float("inf")
+		for p in current_points:
+			pt_px = np.array(ax.transData.transform((p["x"], p["y"])), dtype=float)
+			d = float(np.linalg.norm(click_px - pt_px))
+			if d < best_dist:
+				best_dist = d
+				best = p
+
+		# Only select when user clicks near a point.
+		if best is None or best_dist > 12.0:
+			return
+
+		if selected_text is not None:
+			try:
+				selected_text.remove()
+			except Exception:
+				pass
+
+		selected_text = ax.text(
+			best["x"] + 6,
+			best["y"] + 6,
+			f"{best['kind']} | {best['bodypart']}\n(x={best['x']:.1f}, y={best['y']:.1f})",
+			fontsize=9,
+			color="white",
+			bbox={"facecolor": "black", "alpha": 0.65, "pad": 2, "edgecolor": "none"},
+		)
+		fig.canvas.draw_idle()
+
+	def _on_scroll(event: Any) -> None:
+		"""Zoom in/out around cursor using mouse wheel."""
+		nonlocal view_limits
+		if event.inaxes != ax:
+			return
+		if event.xdata is None or event.ydata is None:
+			return
+
+		xlim = ax.get_xlim()
+		ylim = ax.get_ylim()
+		xdata = float(event.xdata)
+		ydata = float(event.ydata)
+
+		# Scroll up -> zoom in, scroll down -> zoom out.
+		step = getattr(event, "step", 0)
+		if step > 0:
+			scale = 1.0 / 1.2
+		elif step < 0:
+			scale = 1.2
+		else:
+			button = str(getattr(event, "button", "")).lower()
+			scale = (1.0 / 1.2) if button == "up" else 1.2
+
+		new_w = (xlim[1] - xlim[0]) * scale
+		new_h = (ylim[1] - ylim[0]) * scale
+
+		rel_x = (xdata - xlim[0]) / (xlim[1] - xlim[0]) if (xlim[1] - xlim[0]) != 0 else 0.5
+		rel_y = (ydata - ylim[0]) / (ylim[1] - ylim[0]) if (ylim[1] - ylim[0]) != 0 else 0.5
+
+		ax.set_xlim([xdata - new_w * rel_x, xdata + new_w * (1 - rel_x)])
+		ax.set_ylim([ydata - new_h * rel_y, ydata + new_h * (1 - rel_y)])
+		view_limits["xlim"] = tuple(float(v) for v in ax.get_xlim())
+		view_limits["ylim"] = tuple(float(v) for v in ax.get_ylim())
 		fig.canvas.draw_idle()
 
 	radio_cam.on_clicked(redraw)
@@ -501,6 +610,8 @@ def make_postanalysis_overlay_popout(
 	textbox_pred_color.on_submit(redraw)
 	textbox_true_color.on_submit(redraw)
 	radio_color_mode.on_clicked(redraw)
+	fig.canvas.mpl_connect("button_press_event", _on_click)
+	fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
 	redraw()
 	print("Close the plot window to exit.")
@@ -543,7 +654,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--frame-pos",
 		type=int,
-		default=0,
+		default=1,
 		help="Default frame index position when window opens.",
 	)
 	parser.add_argument(
