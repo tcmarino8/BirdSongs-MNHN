@@ -334,10 +334,13 @@ def make_postanalysis_overlay_popout(
 	selected_text = None
 	view_limits: dict[str, tuple[float, float] | None] = {"xlim": None, "ylim": None}
 	rng = np.random.default_rng()
-	random_frames_by_cam: dict[str, list[int]] = {"cam1": [], "cam2": []}
-	current_random_index_by_cam: dict[str, int | None] = {"cam1": None, "cam2": None}
-	random_marker_artists: list[Any] = []
-	random_controls_visible = False
+	selected_frames: list[int] = []
+	selected_frame_index: int | None = None
+	selected_frame_meta: dict[int, dict[str, Any]] = {}
+	selection_marker_artists: list[Any] = []
+	selection_controls_visible = False
+	selection_mode = ""
+	selection_summary_lines: list[str] = []
 
 	fig, ax = plt.subplots(figsize=(12.2, 8.4))
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
@@ -345,6 +348,7 @@ def make_postanalysis_overlay_popout(
 	ax_cam = fig.add_axes([0.82, 0.72, 0.16, 0.18])
 	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
 	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
+	ax_select_displacement = fig.add_axes([0.82, 0.15, 0.16, 0.04])
 	ax_prev = fig.add_axes([0.015, 0.252, 0.045, 0.05])
 	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
 	ax_next = fig.add_axes([0.705, 0.252, 0.045, 0.05])
@@ -357,10 +361,12 @@ def make_postanalysis_overlay_popout(
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
+	ax_selection_info = fig.add_axes([0.82, 0.03, 0.16, 0.09])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
+	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	if not state.truth_found:
 		labels = check.labels
 		if len(labels) >= 2:
@@ -378,6 +384,7 @@ def make_postanalysis_overlay_popout(
 	textbox_pred_color = TextBox(ax_pred_color, "pred_color", initial="deepskyblue")
 	textbox_true_color = TextBox(ax_true_color, "true_color", initial="orange")
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
+	ax_selection_info.set_axis_off()
 
 	for text in radio_color_mode.labels:
 		text.set_fontsize(9)
@@ -388,93 +395,6 @@ def make_postanalysis_overlay_popout(
 			return value
 		except Exception:
 			return fallback
-
-	def _resample_random_frames(camera: str) -> None:
-		imgs = state.images_by_cam.get(camera, [])
-		count = min(20, len(imgs))
-		if count <= 0:
-			random_frames_by_cam[camera] = []
-			current_random_index_by_cam[camera] = None
-			return
-
-		sampled = np.sort(rng.choice(np.arange(len(imgs), dtype=int), size=count, replace=False)).tolist()
-		random_frames_by_cam[camera] = [int(v) for v in sampled]
-		current_random_index_by_cam[camera] = 0
-
-	def _draw_random_markers(camera: str) -> None:
-		nonlocal random_marker_artists
-		for artist in random_marker_artists:
-			try:
-				artist.remove()
-			except Exception:
-				pass
-		random_marker_artists = []
-
-		if not random_controls_visible:
-			return
-
-		frames = random_frames_by_cam.get(camera, [])
-		if not frames:
-			return
-
-		selected_idx = current_random_index_by_cam.get(camera)
-		selected_frame = None
-		if selected_idx is not None and 0 <= selected_idx < len(frames):
-			selected_frame = int(frames[selected_idx])
-
-		for frame in frames:
-			is_selected = selected_frame is not None and int(frame) == selected_frame
-			line = ax_frame.axvline(
-				float(frame),
-				color="firebrick" if is_selected else "crimson",
-				linewidth=2.0 if is_selected else 1.0,
-				alpha=0.95 if is_selected else 0.4,
-				zorder=0,
-			)
-			random_marker_artists.append(line)
-
-	def _sync_random_status(camera: str, frame_pos: int) -> None:
-		if not random_controls_visible:
-			ax_frame.set_title("", fontsize=9, pad=6)
-			return
-
-		frames = random_frames_by_cam.get(camera, [])
-		if not frames:
-			ax_frame.set_title("Random set: no frames available", fontsize=9, pad=6)
-			return
-
-		if frame_pos in frames:
-			idx = int(frames.index(frame_pos))
-			current_random_index_by_cam[camera] = idx
-			ax_frame.set_title(f"Random set: {idx + 1}/{len(frames)} | frame {frame_pos}", fontsize=9, pad=6)
-		else:
-			ax_frame.set_title(
-				f"Random set: {len(frames)} frames | current frame {frame_pos} (not selected)",
-				fontsize=9,
-				pad=6,
-			)
-
-	def _goto_random_index(camera: str, index: int) -> None:
-		frames = random_frames_by_cam.get(camera, [])
-		if not frames:
-			return
-		idx = int(index) % len(frames)
-		current_random_index_by_cam[camera] = idx
-		slider_frame.set_val(float(frames[idx]))
-
-	def _set_random_controls_visible(visible: bool) -> None:
-		nonlocal random_controls_visible
-		random_controls_visible = bool(visible)
-		ax_prev.set_visible(random_controls_visible)
-		ax_next.set_visible(random_controls_visible)
-		ax_resample.set_visible(random_controls_visible)
-		redraw()
-
-	for camera_name in ("cam1", "cam2"):
-		_resample_random_frames(camera_name)
-
-	if random_frames_by_cam.get(cam):
-		_goto_random_index(cam, 0)
 
 	def _pred_points(camera: str, frame_id: int) -> pd.DataFrame:
 		d = state.pred_long[
@@ -489,6 +409,275 @@ def make_postanalysis_overlay_popout(
 			(state.truth_long["camera"] == camera) & (state.truth_long["frame_id"] == int(frame_id))
 		].copy()
 		return d[["bodypart", "x_true", "y_true"]].rename(columns={"x_true": "x", "y_true": "y"})
+
+	def _shared_frame_limit() -> int:
+		counts = [len(v) for v in state.images_by_cam.values() if len(v) > 0]
+		return min(counts) if counts else 0
+
+	def _build_zone_specs(frame_limit: int) -> list[dict[str, Any]]:
+		if frame_limit <= 0:
+			return []
+
+		starts = [0]
+		if frame_limit > 399:
+			starts.extend(range(399, frame_limit, 400))
+
+		zones: list[dict[str, Any]] = []
+		for idx, start in enumerate(starts):
+			end = starts[idx + 1] if idx + 1 < len(starts) else frame_limit
+			end = max(start + 1, min(end, frame_limit))
+			zones.append(
+				{
+					"zone_index": idx,
+					"start": int(start),
+					"end": int(end),
+					"label": f"Z{idx + 1} {start + 1}-{end}",
+				}
+			)
+		return zones
+
+	def _frame_displacement(camera: str, start_frame: int, end_frame: int) -> float | None:
+		start_pts = _pred_points(camera, start_frame)
+		end_pts = _pred_points(camera, end_frame)
+		if start_pts.empty or end_pts.empty:
+			return None
+
+		merged = start_pts.merge(end_pts, on="bodypart", suffixes=("_start", "_end"))
+		if merged.empty:
+			return None
+
+		dx = pd.to_numeric(merged["x_end"], errors="coerce") - pd.to_numeric(merged["x_start"], errors="coerce")
+		dy = pd.to_numeric(merged["y_end"], errors="coerce") - pd.to_numeric(merged["y_start"], errors="coerce")
+		dist = np.sqrt(np.square(dx) + np.square(dy))
+		valid = dist[np.isfinite(dist)]
+		if len(valid) == 0:
+			return None
+		return float(np.mean(valid))
+
+	def _allocate_counts(weights: list[float], total_count: int) -> list[int]:
+		if total_count <= 0 or not weights:
+			return [0 for _ in weights]
+
+		weights_arr = np.asarray(weights, dtype=float)
+		weights_arr = np.where(np.isfinite(weights_arr) & (weights_arr > 0), weights_arr, 0.0)
+		if float(np.sum(weights_arr)) <= 0:
+			weights_arr = np.ones(len(weights), dtype=float)
+		weights_arr = weights_arr / float(np.sum(weights_arr))
+
+		raw = weights_arr * int(total_count)
+		counts = np.floor(raw).astype(int)
+		remaining = int(total_count - np.sum(counts))
+		if remaining > 0:
+			remainders = raw - counts
+			for idx in np.argsort(-remainders)[:remaining]:
+				counts[int(idx)] += 1
+		return counts.tolist()
+
+	def _zone_for_frame(frame_idx: int, zones: list[dict[str, Any]]) -> dict[str, Any] | None:
+		for zone in zones:
+			if zone["start"] <= frame_idx < zone["end"]:
+				return zone
+		return zones[-1] if zones else None
+
+	def _build_random_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
+		frame_limit = _shared_frame_limit()
+		count = min(20, frame_limit)
+		if count <= 0:
+			return [], {}, ["Random", "No shared frames"]
+
+		frames = np.sort(rng.choice(np.arange(frame_limit, dtype=int), size=count, replace=False)).tolist()
+		meta = {int(frame): {"label": "Random sample", "color": "crimson"} for frame in frames}
+		return [int(frame) for frame in frames], meta, [f"Random {count} frames"]
+
+	def _build_displacement_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
+		frame_limit = _shared_frame_limit()
+		count = min(20, frame_limit)
+		zones = _build_zone_specs(frame_limit)
+		if count <= 0 or not zones:
+			return [], {}, ["Disp", "No shared frames"]
+
+		zone_scores: list[float] = []
+		for zone in zones:
+			end_frame = zone["start"] + 400
+			camera_scores: list[float] = []
+			for camera_name in ("cam1", "cam2"):
+				if end_frame >= len(state.images_by_cam.get(camera_name, [])):
+					continue
+				disp = _frame_displacement(camera_name, zone["start"], end_frame)
+				if disp is not None and np.isfinite(disp):
+					camera_scores.append(float(disp))
+			zone_scores.append(float(np.mean(camera_scores)) if camera_scores else 0.0)
+
+		zone_counts = _allocate_counts(zone_scores, count)
+		total_score = float(np.sum(zone_scores))
+		zone_weights = [float(score) / total_score for score in zone_scores] if total_score > 0 else [1.0 / len(zones) for _ in zones]
+		palette = plt.cm.get_cmap("tab10", max(len(zones), 1))
+
+		selected: list[int] = []
+		meta: dict[int, dict[str, Any]] = {}
+		for zone, alloc_count, zone_weight, zone_score, color_idx in zip(zones, zone_counts, zone_weights, zone_scores, range(len(zones))):
+			zone_frames = np.arange(zone["start"], zone["end"], dtype=int)
+			if alloc_count <= 0 or zone_frames.size == 0:
+				continue
+			pick_count = min(int(alloc_count), int(zone_frames.size))
+			picks = np.sort(rng.choice(zone_frames, size=pick_count, replace=False))
+			color = mcolors.to_hex(palette(color_idx))
+			for frame in picks.tolist():
+				selected.append(int(frame))
+				meta[int(frame)] = {
+					"label": str(zone["label"]),
+					"zone_weight": float(zone_weight),
+					"avg_displacement": float(zone_score),
+					"color": color,
+				}
+
+		if len(selected) < count:
+			remaining = np.setdiff1d(np.arange(frame_limit, dtype=int), np.asarray(selected, dtype=int), assume_unique=False)
+			fill_count = min(int(count - len(selected)), int(remaining.size))
+			if fill_count > 0:
+				fill = np.sort(rng.choice(remaining, size=fill_count, replace=False))
+				for frame in fill.tolist():
+					zone = _zone_for_frame(int(frame), zones)
+					color = "gray"
+					label = "Fallback"
+					zone_weight = 0.0
+					zone_score = 0.0
+					if zone is not None:
+						color = mcolors.to_hex(palette(int(zone["zone_index"])))
+						label = str(zone["label"])
+						zone_weight = float(zone_weights[int(zone["zone_index"])])
+						zone_score = float(zone_scores[int(zone["zone_index"])])
+					selected.append(int(frame))
+					meta[int(frame)] = {
+						"label": label,
+						"zone_weight": zone_weight,
+						"avg_displacement": zone_score,
+						"color": color,
+					}
+
+		selected = sorted(set(int(frame) for frame in selected))[:count]
+		summary_lines = [f"Disp {count} frames"]
+		for zone, zone_weight, zone_count in zip(zones, zone_weights, zone_counts):
+			if zone_count > 0:
+				summary_lines.append(f"Z{zone['zone_index'] + 1} {zone_weight:.2f} ({zone_count})")
+		if len(summary_lines) > 5:
+			summary_lines = summary_lines[:4] + ["..."]
+		return selected, meta, summary_lines
+
+	def _set_selection(frames: list[int], meta: dict[int, dict[str, Any]], mode: str, summary_lines: list[str]) -> None:
+		nonlocal selected_frames
+		nonlocal selected_frame_index
+		nonlocal selected_frame_meta
+		nonlocal selection_mode
+		nonlocal selection_summary_lines
+
+		selected_frames = [int(frame) for frame in frames]
+		selected_frame_index = 0 if selected_frames else None
+		selected_frame_meta = meta
+		selection_mode = mode
+		selection_summary_lines = summary_lines
+
+	def _draw_selection_markers() -> None:
+		nonlocal selection_marker_artists
+		for artist in selection_marker_artists:
+			try:
+				artist.remove()
+			except Exception:
+				pass
+		selection_marker_artists = []
+
+		if not selection_controls_visible or not selected_frames:
+			return
+
+		current_frame = None
+		if selected_frame_index is not None and 0 <= selected_frame_index < len(selected_frames):
+			current_frame = int(selected_frames[selected_frame_index])
+
+		for frame in selected_frames:
+			meta = selected_frame_meta.get(int(frame), {})
+			line = ax_frame.axvline(
+				float(frame),
+				color=str(meta.get("color", "crimson")),
+				linewidth=2.2 if current_frame == int(frame) else 1.1,
+				alpha=1.0 if current_frame == int(frame) else 0.5,
+				zorder=0,
+			)
+			selection_marker_artists.append(line)
+
+	def _update_selection_info(frame_pos: int) -> None:
+		nonlocal selected_frame_index
+		ax_selection_info.clear()
+		ax_selection_info.set_axis_off()
+
+		if not selection_controls_visible:
+			ax_frame.set_title("", fontsize=9, pad=6)
+			return
+
+		if not selected_frames:
+			ax_frame.set_title("No selected frames", fontsize=9, pad=6)
+			ax_selection_info.text(0.0, 0.95, "No frame set", va="top", fontsize=8)
+			return
+
+		if frame_pos in selected_frames:
+			selected_frame_index = int(selected_frames.index(frame_pos))
+			meta = selected_frame_meta.get(frame_pos, {})
+			if selection_mode == "displacement":
+				ax_frame.set_title(
+					f"Displacement set: {selected_frame_index + 1}/{len(selected_frames)} | {meta.get('label', 'Zone')} | weight {float(meta.get('zone_weight', 0.0)):.2f} | avg {float(meta.get('avg_displacement', 0.0)):.2f}",
+					fontsize=9,
+					pad=6,
+				)
+			else:
+				ax_frame.set_title(
+					f"Random set: {selected_frame_index + 1}/{len(selected_frames)} | frame {frame_pos}",
+					fontsize=9,
+					pad=6,
+				)
+		else:
+			ax_frame.set_title(
+				f"{selection_mode.title() if selection_mode else 'Selected'} set: {len(selected_frames)} frames | current frame {frame_pos} (not selected)",
+				fontsize=9,
+				pad=6,
+			)
+
+		y = 0.95
+		for line in selection_summary_lines:
+			ax_selection_info.text(0.0, y, str(line), va="top", fontsize=8)
+			y -= 0.22
+		if frame_pos in selected_frame_meta:
+			meta = selected_frame_meta[frame_pos]
+			ax_selection_info.text(0.0, max(y, 0.05), str(meta.get("label", "")), va="bottom", fontsize=8, color=str(meta.get("color", "black")))
+
+	def _goto_selected_index(index: int) -> None:
+		nonlocal selected_frame_index
+		if not selected_frames:
+			return
+		selected_frame_index = int(index) % len(selected_frames)
+		slider_frame.set_val(float(selected_frames[selected_frame_index]))
+
+	def _set_selection_controls_visible(visible: bool) -> None:
+		nonlocal selection_controls_visible
+		selection_controls_visible = bool(visible)
+		ax_prev.set_visible(selection_controls_visible)
+		ax_next.set_visible(selection_controls_visible)
+		ax_resample.set_visible(selection_controls_visible)
+		redraw()
+
+	def _activate_selection(mode: str, force_resample: bool = False) -> None:
+		if not force_resample and selection_controls_visible and selection_mode == mode:
+			_set_selection_controls_visible(False)
+			return
+
+		if force_resample or selection_mode != mode or not selected_frames:
+			if mode == "displacement":
+				frames, meta, summary_lines = _build_displacement_selection()
+			else:
+				frames, meta, summary_lines = _build_random_selection()
+			_set_selection(frames, meta, mode, summary_lines)
+
+		_set_selection_controls_visible(True)
+		if selected_frames:
+			_goto_selected_index(0)
 
 	def redraw(*_args: Any) -> None:
 		nonlocal selected_text
@@ -524,8 +713,8 @@ def make_postanalysis_overlay_popout(
 		selected_text = None
 
 		if not imgs:
-			_sync_random_status(camera, 0)
-			_draw_random_markers(camera)
+			_update_selection_info(0)
+			_draw_selection_markers()
 			ax.text(0.5, 0.5, f"No images for {camera}", ha="center", va="center", transform=ax.transAxes)
 			ax.set_axis_off()
 			fig.canvas.draw_idle()
@@ -610,8 +799,8 @@ def make_postanalysis_overlay_popout(
 			f"{camera} | frame_pos={frame_pos} | image_frame_id={frame_id_img} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
 			f"pred_csv={state.pred_csv_by_cam[camera].name} | point_customizer={color_mode}"
 		)
-		_sync_random_status(camera, frame_pos)
-		_draw_random_markers(camera)
+		_update_selection_info(frame_pos)
+		_draw_selection_markers()
 		ax.set_axis_off()
 
 		# Reapply previous view limits when available.
@@ -700,47 +889,38 @@ def make_postanalysis_overlay_popout(
 		fig.canvas.draw_idle()
 
 	def _on_prev(_event: Any) -> None:
-		if not random_controls_visible:
+		if not selection_controls_visible or not selected_frames:
 			return
-		camera = _cam_norm(radio_cam.value_selected)
-		frames = random_frames_by_cam.get(camera, [])
-		if not frames:
-			return
-		curr = current_random_index_by_cam.get(camera)
+		curr = selected_frame_index
 		if curr is None:
 			curr_frame = int(slider_frame.val)
-			curr = frames.index(curr_frame) if curr_frame in frames else 0
-		_goto_random_index(camera, curr - 1)
+			curr = selected_frames.index(curr_frame) if curr_frame in selected_frames else 0
+		_goto_selected_index(curr - 1)
 
 	def _on_next(_event: Any) -> None:
-		if not random_controls_visible:
+		if not selection_controls_visible or not selected_frames:
 			return
-		camera = _cam_norm(radio_cam.value_selected)
-		frames = random_frames_by_cam.get(camera, [])
-		if not frames:
-			return
-		curr = current_random_index_by_cam.get(camera)
+		curr = selected_frame_index
 		if curr is None:
 			curr_frame = int(slider_frame.val)
-			curr = frames.index(curr_frame) if curr_frame in frames else -1
-		_goto_random_index(camera, curr + 1)
+			curr = selected_frames.index(curr_frame) if curr_frame in selected_frames else -1
+		_goto_selected_index(curr + 1)
 
 	def _on_resample(_event: Any) -> None:
-		if not random_controls_visible:
+		if not selection_controls_visible:
 			return
-		camera = _cam_norm(radio_cam.value_selected)
-		_resample_random_frames(camera)
-		if random_frames_by_cam.get(camera):
-			_goto_random_index(camera, 0)
-		else:
-			redraw()
+		_activate_selection(selection_mode or "random", force_resample=True)
 
 	def _on_select_random_frames(_event: Any) -> None:
-		_set_random_controls_visible(not random_controls_visible)
+		_activate_selection("random")
+
+	def _on_select_displacement_frames(_event: Any) -> None:
+		_activate_selection("displacement")
 
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
 	btn_select_random.on_clicked(_on_select_random_frames)
+	btn_select_displacement.on_clicked(_on_select_displacement_frames)
 	btn_prev.on_clicked(_on_prev)
 	btn_next.on_clicked(_on_next)
 	btn_resample.on_clicked(_on_resample)
@@ -756,7 +936,7 @@ def make_postanalysis_overlay_popout(
 	fig.canvas.mpl_connect("button_press_event", _on_click)
 	fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
-	_set_random_controls_visible(False)
+	_set_selection_controls_visible(False)
 	redraw()
 	print("Close the plot window to exit.")
 	plt.show()
