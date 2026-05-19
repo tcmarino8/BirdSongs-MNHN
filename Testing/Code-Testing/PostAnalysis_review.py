@@ -349,6 +349,7 @@ def make_postanalysis_overlay_popout(
 	fig, ax = plt.subplots(figsize=(12.2, 8.4))
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
 
+	ax_correction_tab = fig.add_axes([0.82, 0.92, 0.16, 0.05])
 	ax_cam = fig.add_axes([0.82, 0.72, 0.16, 0.18])
 	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
 	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
@@ -371,6 +372,7 @@ def make_postanalysis_overlay_popout(
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
+	btn_correction_tab = Button(ax_correction_tab, "Correction Tab")
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
@@ -686,6 +688,41 @@ def make_postanalysis_overlay_popout(
 	def _method_folder_name(method_name: str) -> str:
 		return {"random": "random", "displacement": "displacement", "dino": "dino"}.get(method_name, method_name)
 
+	def _list_active_update_sets() -> list[str]:
+		active_root = state.pred_root / "active_updates"
+		if not active_root.exists() or not active_root.is_dir():
+			return []
+		sets: list[str] = []
+		for candidate in sorted([p for p in active_root.iterdir() if p.is_dir()]):
+			if (candidate / "cam1").is_dir() and (candidate / "cam2").is_dir():
+				sets.append(candidate.name)
+		return sets
+
+	def _frames_for_active_update_set(set_name: str) -> list[int]:
+		method_dir = state.pred_root / "active_updates" / str(set_name)
+		cam_frames: dict[str, set[int]] = {}
+		for camera_name in ("cam1", "cam2"):
+			camera_dir = method_dir / camera_name
+			if not camera_dir.exists() or not camera_dir.is_dir():
+				cam_frames[camera_name] = set()
+				continue
+
+			subset_images = [p for p in camera_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+			name_to_index = {img_path.name: idx for idx, img_path in enumerate(state.images_by_cam.get(camera_name, []))}
+			cam_frames[camera_name] = {
+				int(name_to_index[p.name])
+				for p in subset_images
+				if p.name in name_to_index
+			}
+
+		if cam_frames.get("cam1") and cam_frames.get("cam2"):
+			frames = sorted(cam_frames["cam1"].intersection(cam_frames["cam2"]))
+			if frames:
+				return [int(frame) for frame in frames]
+
+		merged = sorted(cam_frames.get("cam1", set()).union(cam_frames.get("cam2", set())))
+		return [int(frame) for frame in merged]
+
 	def _choose_frame_values(frame_series: pd.Series, frames: list[int]) -> np.ndarray:
 		frame_array = np.asarray(sorted(set(int(frame) for frame in frames)), dtype=int)
 		series_numeric = pd.to_numeric(frame_series, errors="coerce")
@@ -892,8 +929,68 @@ def make_postanalysis_overlay_popout(
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
 		slider_review.on_changed(_redraw_review)
+		# Keep widget references attached to the figure so callbacks remain active.
+		setattr(
+			review_fig,
+			"_correction_widgets",
+			{
+				"btn_prev": btn_review_prev,
+				"btn_next": btn_review_next,
+				"slider": slider_review,
+			},
+		)
 		_redraw_review()
 		review_fig.show()
+
+	def _open_active_updates_browser() -> None:
+		available_sets = _list_active_update_sets()
+		if not available_sets:
+			raise RuntimeError("No active_updates subsets found. Create one first with a frame selection and Correction.")
+
+		browser_fig, browser_ax = plt.subplots(figsize=(4.8, 3.8))
+		browser_fig.subplots_adjust(left=0.12, right=0.95, bottom=0.18, top=0.90)
+		browser_ax.set_axis_off()
+
+		radio_ax = browser_fig.add_axes([0.12, 0.30, 0.76, 0.52])
+		open_ax = browser_fig.add_axes([0.12, 0.08, 0.36, 0.12])
+		cancel_ax = browser_fig.add_axes([0.54, 0.08, 0.34, 0.12])
+
+		radio_sets = RadioButtons(radio_ax, available_sets, active=0)
+		btn_open = Button(open_ax, "Open")
+		btn_cancel = Button(cancel_ax, "Close")
+		browser_fig.suptitle("Correction Tab: active_updates", fontsize=11)
+
+		manager = getattr(browser_fig.canvas, "manager", None)
+		if manager is not None:
+			try:
+				manager.set_window_title("Correction Tab")
+			except Exception:
+				pass
+
+		def _open_selected(_event: Any) -> None:
+			set_name = str(radio_sets.value_selected)
+			frames = _frames_for_active_update_set(set_name)
+			if not frames:
+				print(f"Correction tab: no index-matched frames found in active_updates/{set_name}.")
+				return
+			_open_correction_subset_view(set_name, frames, state.pred_root / "active_updates" / set_name)
+			plt.close(browser_fig)
+
+		def _close_browser(_event: Any) -> None:
+			plt.close(browser_fig)
+
+		btn_open.on_clicked(_open_selected)
+		btn_cancel.on_clicked(_close_browser)
+		setattr(
+			browser_fig,
+			"_correction_tab_widgets",
+			{
+				"radio": radio_sets,
+				"open": btn_open,
+				"cancel": btn_cancel,
+			},
+		)
+		browser_fig.show()
 
 	def _set_selection(frames: list[int], meta: dict[int, dict[str, Any]], mode: str, summary_lines: list[str]) -> None:
 		nonlocal selected_frames
@@ -1262,6 +1359,12 @@ def make_postanalysis_overlay_popout(
 	def _on_select_dino_frames(_event: Any) -> None:
 		_activate_selection("dino", source_camera=_cam_norm(radio_cam.value_selected))
 
+	def _on_open_correction_tab(_event: Any) -> None:
+		try:
+			_open_active_updates_browser()
+		except Exception as exc:
+			print(f"Correction tab failed: {exc}")
+
 	def _on_correction_export(_event: Any) -> None:
 		try:
 			if not selected_frames or not selection_mode:
@@ -1276,6 +1379,7 @@ def make_postanalysis_overlay_popout(
 
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
+	btn_correction_tab.on_clicked(_on_open_correction_tab)
 	btn_select_random.on_clicked(_on_select_random_frames)
 	btn_select_displacement.on_clicked(_on_select_displacement_frames)
 	btn_select_dino.on_clicked(_on_select_dino_frames)
