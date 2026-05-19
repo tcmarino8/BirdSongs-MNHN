@@ -376,7 +376,7 @@ def make_postanalysis_overlay_popout(
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
-	btn_correction = Button(ax_correction, "Correction")
+	btn_correction = Button(ax_correction, "Save Correction Frames")
 	if not state.truth_found:
 		labels = check.labels
 		if len(labels) >= 2:
@@ -396,8 +396,38 @@ def make_postanalysis_overlay_popout(
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
 	ax_selection_info.set_axis_off()
 
-	for text in radio_color_mode.labels:
-		text.set_fontsize(9)
+	def _scaled_font(figure_obj: Any, base_size: float, ref_w: float, ref_h: float, min_size: float, max_size: float) -> float:
+		fig_w, fig_h = figure_obj.get_size_inches()
+		scale = float(np.sqrt((fig_w * fig_h) / max(ref_w * ref_h, 1e-6)))
+		return float(np.clip(base_size * scale, min_size, max_size))
+
+	def _apply_main_widget_scaling(_event: Any = None) -> None:
+		button_font = _scaled_font(fig, base_size=9.5, ref_w=12.2, ref_h=8.4, min_size=8.0, max_size=16.0)
+		control_font = _scaled_font(fig, base_size=9.0, ref_w=12.2, ref_h=8.4, min_size=7.5, max_size=14.0)
+		value_font = _scaled_font(fig, base_size=8.5, ref_w=12.2, ref_h=8.4, min_size=7.0, max_size=13.0)
+
+		for btn in (btn_correction_tab, btn_select_random, btn_select_displacement, btn_select_dino, btn_correction, btn_prev, btn_next, btn_resample):
+			btn.label.set_fontsize(button_font)
+
+		for txt in radio_cam.labels:
+			txt.set_fontsize(control_font)
+		for txt in check.labels:
+			txt.set_fontsize(control_font)
+		for txt in radio_color_mode.labels:
+			txt.set_fontsize(control_font)
+
+		for sld in (slider_frame, slider_like, slider_pred_size, slider_pred_alpha, slider_true_size, slider_true_alpha):
+			sld.label.set_fontsize(control_font)
+			sld.valtext.set_fontsize(value_font)
+
+		for txtbox in (textbox_pred_color, textbox_true_color):
+			txtbox.label.set_fontsize(control_font)
+			txtbox.text_disp.set_fontsize(value_font)
+
+		fig.canvas.draw_idle()
+
+	_apply_main_widget_scaling()
+	fig.canvas.mpl_connect("resize_event", _apply_main_widget_scaling)
 
 	def _safe_color(value: str, fallback: str) -> str:
 		try:
@@ -822,16 +852,20 @@ def make_postanalysis_overlay_popout(
 		if not frames_local:
 			raise RuntimeError("No selected frames are available for correction review.")
 
-		review_fig, review_axes = plt.subplots(1, 2, figsize=(12.6, 6.9))
-		review_fig.subplots_adjust(left=0.05, right=0.98, bottom=0.16, top=0.88, wspace=0.06)
+		review_fig, review_axes = plt.subplots(1, 2, figsize=(16.0, 9.0), dpi=100)
+		review_fig.subplots_adjust(left=0.04, right=0.98, bottom=0.24, top=0.90, wspace=0.05)
 		for review_ax in review_axes:
 			review_ax.set_axis_off()
 
-		ax_review_prev = review_fig.add_axes([0.20, 0.05, 0.08, 0.05])
-		ax_review_slider = review_fig.add_axes([0.31, 0.055, 0.38, 0.035])
-		ax_review_next = review_fig.add_axes([0.72, 0.05, 0.08, 0.05])
+		ax_review_prev = review_fig.add_axes([0.12, 0.09, 0.05, 0.05])
+		ax_review_slider = review_fig.add_axes([0.18, 0.095, 0.28, 0.035])
+		ax_review_next = review_fig.add_axes([0.47, 0.09, 0.05, 0.05])
+		ax_review_pred_size = review_fig.add_axes([0.55, 0.095, 0.12, 0.03])
+		ax_review_true_size = review_fig.add_axes([0.69, 0.095, 0.12, 0.03])
+		ax_zoom_reset = review_fig.add_axes([0.84, 0.09, 0.12, 0.05])
 		btn_review_prev = Button(ax_review_prev, "<")
 		btn_review_next = Button(ax_review_next, ">")
+		btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
 		slider_review = Slider(
 			ax_review_slider,
 			"selected_idx",
@@ -840,6 +874,140 @@ def make_postanalysis_overlay_popout(
 			valinit=0.0,
 			valstep=1,
 		)
+		slider_review_pred_size = Slider(
+			ax_review_pred_size,
+			"pred_size",
+			10,
+			300,
+			valinit=float(slider_pred_size.val),
+			valstep=1,
+		)
+		slider_review_true_size = Slider(
+			ax_review_true_size,
+			"true_size",
+			10,
+			300,
+			valinit=float(slider_true_size.val),
+			valstep=1,
+		)
+		zoom_axes = {
+			"cam1": review_axes[0].inset_axes([0.02, 0.02, 0.34, 0.34]),
+			"cam2": review_axes[1].inset_axes([0.64, 0.02, 0.34, 0.34]),
+		}
+		for zax in zoom_axes.values():
+			zax.set_facecolor("black")
+			zax.set_xticks([])
+			zax.set_yticks([])
+
+		correction_cache: dict[tuple[int, str, str], tuple[float, float]] = {}
+		active_marker: dict[str, Any] | None = None
+		drag_state: dict[str, Any] = {"active": False, "camera": None, "bodypart": None, "moved": False}
+		zoom_half_window: dict[str, float] = {"cam1": 15.0, "cam2": 15.0}
+		hit_threshold_px = 12.0
+
+		def _autosave_corrections() -> None:
+			if not correction_cache:
+				return
+			auto_path = export_dir / "data" / "corrections_autosave.csv"
+			auto_path.parent.mkdir(parents=True, exist_ok=True)
+			rows: list[dict[str, Any]] = []
+			for (frame_pos, camera_name, bodypart_name), (x_val, y_val) in sorted(correction_cache.items()):
+				rows.append(
+					{
+						"frame_id": int(frame_pos),
+						"camera": str(camera_name),
+						"bodypart": str(bodypart_name),
+						"x_corrected": float(x_val),
+						"y_corrected": float(y_val),
+					}
+				)
+			pd.DataFrame(rows).to_csv(auto_path, index=False)
+
+		def _resolve_point_xy(camera_name: str, frame_pos: int, bodypart_name: str) -> tuple[float, float] | None:
+			pts = _pred_points(camera_name, frame_pos)
+			if pts.empty:
+				return None
+			pts = pts[pts["bodypart"].astype(str) == str(bodypart_name)]
+			if pts.empty:
+				return None
+			row = pts.iloc[0]
+			key = (int(frame_pos), str(camera_name), str(bodypart_name))
+			if key in correction_cache:
+				return correction_cache[key]
+			x_val = float(pd.to_numeric(row["x"], errors="coerce"))
+			y_val = float(pd.to_numeric(row["y"], errors="coerce"))
+			if np.isfinite(x_val) and np.isfinite(y_val):
+				return x_val, y_val
+			return None
+
+		def _pred_points_with_corrections(camera_name: str, frame_pos: int, min_like: float) -> pd.DataFrame:
+			pts = _pred_points(camera_name, frame_pos)
+			if pts.empty:
+				return pts
+			pts = pts[pts["likelihood"].fillna(0.0) >= min_like].copy()
+			if pts.empty:
+				return pts
+			for idx, row in pts.iterrows():
+				key = (int(frame_pos), str(camera_name), str(row["bodypart"]))
+				if key in correction_cache:
+					new_x, new_y = correction_cache[key]
+					pts.at[idx, "x"] = float(new_x)
+					pts.at[idx, "y"] = float(new_y)
+			return pts
+
+		def _nearest_marker_in_axes(event: Any, camera_name: str, frame_pos: int, min_like: float) -> tuple[str, float, float, float] | None:
+			if event.x is None or event.y is None:
+				return None
+			pts = _pred_points_with_corrections(camera_name, frame_pos, min_like)
+			if pts.empty:
+				return None
+			click_px = np.array([event.x, event.y], dtype=float)
+			best_bodypart = None
+			best_x = 0.0
+			best_y = 0.0
+			best_dist = float("inf")
+			for _, row in pts.iterrows():
+				pt_px = np.array(event.inaxes.transData.transform((float(row["x"]), float(row["y"]))), dtype=float)
+				dist = float(np.linalg.norm(click_px - pt_px))
+				if dist < best_dist:
+					best_dist = dist
+					best_bodypart = str(row["bodypart"])
+					best_x = float(row["x"])
+					best_y = float(row["y"])
+			if best_bodypart is None or best_dist > hit_threshold_px:
+				return None
+			return best_bodypart, best_x, best_y, best_dist
+
+		def _set_active_marker(frame_pos: int, source_camera: str, bodypart_name: str) -> None:
+			nonlocal active_marker
+			active_marker = {
+				"frame_pos": int(frame_pos),
+				"source_camera": str(source_camera),
+				"bodypart": str(bodypart_name),
+			}
+
+		def _apply_edit(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> None:
+			correction_cache[(int(frame_pos), str(camera_name), str(bodypart_name))] = (float(x_val), float(y_val))
+			_autosave_corrections()
+
+		def _active_marker_xy(camera_name: str, frame_pos: int) -> tuple[float, float] | None:
+			if active_marker is None:
+				return None
+			if int(active_marker["frame_pos"]) != int(frame_pos):
+				return None
+			return _resolve_point_xy(str(camera_name), int(frame_pos), str(active_marker["bodypart"]))
+
+		def _apply_review_widget_scaling(_event: Any = None) -> None:
+			button_font = _scaled_font(review_fig, base_size=10.0, ref_w=16.0, ref_h=9.0, min_size=8.0, max_size=16.0)
+			control_font = _scaled_font(review_fig, base_size=9.5, ref_w=16.0, ref_h=9.0, min_size=8.0, max_size=14.0)
+			value_font = _scaled_font(review_fig, base_size=9.0, ref_w=16.0, ref_h=9.0, min_size=7.0, max_size=13.0)
+			btn_review_prev.label.set_fontsize(button_font)
+			btn_review_next.label.set_fontsize(button_font)
+			btn_zoom_reset.label.set_fontsize(control_font)
+			for sld in (slider_review, slider_review_pred_size, slider_review_true_size):
+				sld.label.set_fontsize(control_font)
+				sld.valtext.set_fontsize(value_font)
+			review_fig.canvas.draw_idle()
 
 		manager = getattr(review_fig.canvas, "manager", None)
 		if manager is not None:
@@ -847,6 +1015,11 @@ def make_postanalysis_overlay_popout(
 				manager.set_window_title("Correction Review")
 			except Exception:
 				pass
+
+		review_limits: dict[str, tuple[tuple[float, float], tuple[float, float]] | None] = {
+			"cam1": None,
+			"cam2": None,
+		}
 
 		def _review_colors(bodyparts: pd.Series, fallback: str) -> list[str] | str:
 			if str(radio_color_mode.value_selected) != "by_name":
@@ -856,12 +1029,14 @@ def make_postanalysis_overlay_popout(
 		def _redraw_review(*_args: Any) -> None:
 			frame_idx = int(slider_review.val)
 			frame_pos = frames_local[frame_idx]
+			if active_marker is not None and int(active_marker.get("frame_pos", -1)) != int(frame_pos):
+				drag_state["active"] = False
 			show_true = bool(check.get_status()[1]) and state.truth_found
 			annotate = bool(check.get_status()[2])
 			min_like = float(slider_like.val)
-			pred_size = float(slider_pred_size.val)
+			pred_size = float(slider_review_pred_size.val)
 			pred_alpha = float(slider_pred_alpha.val)
-			true_size = float(slider_true_size.val)
+			true_size = float(slider_review_true_size.val)
 			true_alpha = float(slider_true_alpha.val)
 			pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
 			true_color = _safe_color(textbox_true_color.text.strip(), "orange")
@@ -870,16 +1045,23 @@ def make_postanalysis_overlay_popout(
 				review_ax.clear()
 				review_ax.set_axis_off()
 				images = state.images_by_cam.get(camera_name, [])
+				zoom_ax = zoom_axes[camera_name]
+				zoom_ax.clear()
+				zoom_ax.set_facecolor("black")
+				zoom_ax.set_xticks([])
+				zoom_ax.set_yticks([])
 				if not (0 <= frame_pos < len(images)):
 					review_ax.text(0.5, 0.5, f"No image for {camera_name} frame {frame_pos}", ha="center", va="center", transform=review_ax.transAxes)
+					zoom_ax.text(0.5, 0.5, "No image", ha="center", va="center", color="white", transform=zoom_ax.transAxes, fontsize=8)
 					continue
 
 				with Image.open(images[frame_pos]) as image_file:
-					review_ax.imshow(np.asarray(image_file.convert("RGB")))
+					img = np.asarray(image_file.convert("RGB"))
+					review_ax.imshow(img, interpolation="nearest")
+					zoom_ax.imshow(img, interpolation="nearest")
+				img_h, img_w = int(img.shape[0]), int(img.shape[1])
 
-				pred_pts = _pred_points(camera_name, frame_pos)
-				if not pred_pts.empty:
-					pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
+				pred_pts = _pred_points_with_corrections(camera_name, frame_pos, min_like)
 				if not pred_pts.empty:
 					review_ax.scatter(
 						pred_pts["x"],
@@ -894,6 +1076,12 @@ def make_postanalysis_overlay_popout(
 						for _, row in pred_pts.iterrows():
 							label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if str(radio_color_mode.value_selected) == "by_name" else pred_color
 							review_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+
+				marker_xy = _active_marker_xy(camera_name, frame_pos)
+				if active_marker is not None and marker_xy is not None:
+					mx, my = marker_xy
+					review_ax.scatter([mx], [my], s=max(220.0, pred_size * 2.5), facecolors="none", edgecolors="lime", linewidths=2.0, zorder=5)
+					review_ax.text(mx + 4, my - 4, str(active_marker["bodypart"]), color="lime", fontsize=8)
 
 				if show_true:
 					true_pts = _true_points(camera_name, frame_pos)
@@ -912,13 +1100,147 @@ def make_postanalysis_overlay_popout(
 								label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if str(radio_color_mode.value_selected) == "by_name" else true_color
 								review_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
 
-				review_ax.set_title(f"{camera_name} | frame {frame_pos}", fontsize=10)
+				if marker_xy is not None:
+					mx, my = marker_xy
+					half = float(zoom_half_window[camera_name])
+					zoom_ax.set_xlim(max(0.0, mx - half), min(float(img_w), mx + half))
+					zoom_ax.set_ylim(min(float(img_h), my + half), max(0.0, my - half))
+					zoom_ax.scatter([mx], [my], s=36, c="lime", marker="+", linewidths=1.4)
+					zoom_ax.set_title(
+						f"{camera_name} zoom {int(2 * half)}x{int(2 * half)}",
+						fontsize=_scaled_font(review_fig, base_size=8.0, ref_w=16.0, ref_h=9.0, min_size=7.0, max_size=11.0),
+					)
+				else:
+					zoom_ax.set_xlim(0, float(img_w))
+					zoom_ax.set_ylim(float(img_h), 0)
+					zoom_ax.text(0.5, 0.5, "Select marker", ha="center", va="center", color="white", transform=zoom_ax.transAxes, fontsize=8)
+
+				review_ax.set_title(
+					f"{camera_name} | frame {frame_pos}",
+					fontsize=_scaled_font(review_fig, base_size=10.0, ref_w=16.0, ref_h=9.0, min_size=8.0, max_size=14.0),
+				)
+				if review_limits[camera_name] is None:
+					review_ax.set_xlim(0, float(img_w))
+					review_ax.set_ylim(float(img_h), 0)
+				else:
+					xlim, ylim = review_limits[camera_name]
+					review_ax.set_xlim(xlim)
+					review_ax.set_ylim(ylim)
+				review_ax.set_aspect("equal")
 
 			review_fig.suptitle(
-				f"Correction Review | {method_name.title()} | {frame_idx + 1}/{len(frames_local)} | frame {frame_pos}\nExported to {export_dir}",
-				fontsize=11,
+				f"Correction Review | {method_name.title()} | {frame_idx + 1}/{len(frames_local)} | frame {frame_pos} | edits {len(correction_cache)}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate.",
+				fontsize=_scaled_font(review_fig, base_size=11.0, ref_w=16.0, ref_h=9.0, min_size=9.0, max_size=16.0),
 			)
 			review_fig.canvas.draw_idle()
+
+		def _on_review_scroll(event: Any) -> None:
+			for camera_name, zoom_ax in zoom_axes.items():
+				if event.inaxes == zoom_ax:
+					step = getattr(event, "step", 0)
+					if step > 0:
+						zoom_half_window[camera_name] = max(5.0, zoom_half_window[camera_name] / 1.2)
+					elif step < 0:
+						zoom_half_window[camera_name] = min(220.0, zoom_half_window[camera_name] * 1.2)
+					else:
+						button = str(getattr(event, "button", "")).lower()
+						if button == "up":
+							zoom_half_window[camera_name] = max(5.0, zoom_half_window[camera_name] / 1.2)
+						elif button == "down":
+							zoom_half_window[camera_name] = min(220.0, zoom_half_window[camera_name] * 1.2)
+					_redraw_review()
+					return
+
+			for review_ax, camera_name in zip(review_axes, ("cam1", "cam2")):
+				if event.inaxes != review_ax:
+					continue
+				if event.xdata is None or event.ydata is None:
+					return
+
+				xlim = review_ax.get_xlim()
+				ylim = review_ax.get_ylim()
+				xdata = float(event.xdata)
+				ydata = float(event.ydata)
+				step = getattr(event, "step", 0)
+				if step > 0:
+					scale = 1.0 / 1.2
+				elif step < 0:
+					scale = 1.2
+				else:
+					button = str(getattr(event, "button", "")).lower()
+					scale = (1.0 / 1.2) if button == "up" else 1.2
+
+				new_w = (xlim[1] - xlim[0]) * scale
+				new_h = (ylim[1] - ylim[0]) * scale
+				rel_x = (xdata - xlim[0]) / (xlim[1] - xlim[0]) if (xlim[1] - xlim[0]) != 0 else 0.5
+				rel_y = (ydata - ylim[0]) / (ylim[1] - ylim[0]) if (ylim[1] - ylim[0]) != 0 else 0.5
+
+				review_ax.set_xlim([xdata - new_w * rel_x, xdata + new_w * (1.0 - rel_x)])
+				review_ax.set_ylim([ydata - new_h * rel_y, ydata + new_h * (1.0 - rel_y)])
+				review_limits[camera_name] = (
+					tuple(float(v) for v in review_ax.get_xlim()),
+					tuple(float(v) for v in review_ax.get_ylim()),
+				)
+				review_fig.canvas.draw_idle()
+				return
+
+		def _on_review_press(event: Any) -> None:
+			if event.inaxes not in review_axes:
+				return
+			if event.xdata is None or event.ydata is None:
+				return
+			frame_pos = frames_local[int(slider_review.val)]
+			camera_name = "cam1" if event.inaxes == review_axes[0] else "cam2"
+			min_like = float(slider_like.val)
+			nearest = _nearest_marker_in_axes(event, camera_name, frame_pos, min_like)
+
+			if nearest is not None:
+				bodypart_name, _, _, _ = nearest
+				_set_active_marker(frame_pos, camera_name, bodypart_name)
+				drag_state["active"] = True
+				drag_state["camera"] = camera_name
+				drag_state["bodypart"] = bodypart_name
+				drag_state["moved"] = False
+				_redraw_review()
+				return
+
+			if active_marker is None:
+				return
+			if int(active_marker.get("frame_pos", -1)) != int(frame_pos):
+				return
+			bodypart_name = str(active_marker["bodypart"])
+			_apply_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
+			_set_active_marker(frame_pos, camera_name, bodypart_name)
+			_redraw_review()
+
+		def _on_review_motion(event: Any) -> None:
+			if not drag_state.get("active", False):
+				return
+			if event.inaxes not in review_axes:
+				return
+			if event.xdata is None or event.ydata is None:
+				return
+			camera_name = str(drag_state.get("camera", ""))
+			bodypart_name = str(drag_state.get("bodypart", ""))
+			expected_ax = review_axes[0] if camera_name == "cam1" else review_axes[1]
+			if event.inaxes != expected_ax:
+				return
+			frame_pos = frames_local[int(slider_review.val)]
+			_apply_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
+			drag_state["moved"] = True
+			_set_active_marker(frame_pos, camera_name, bodypart_name)
+			_redraw_review()
+
+		def _on_review_release(_event: Any) -> None:
+			if drag_state.get("active", False):
+				drag_state["active"] = False
+				drag_state["camera"] = None
+				drag_state["bodypart"] = None
+
+		def _on_zoom_reset(_event: Any) -> None:
+			zoom_half_window["cam1"] = 15.0
+			zoom_half_window["cam2"] = 15.0
+			_redraw_review()
 
 		def _on_review_prev(_event: Any) -> None:
 			slider_review.set_val((int(slider_review.val) - 1) % len(frames_local))
@@ -928,7 +1250,15 @@ def make_postanalysis_overlay_popout(
 
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
+		btn_zoom_reset.on_clicked(_on_zoom_reset)
 		slider_review.on_changed(_redraw_review)
+		slider_review_pred_size.on_changed(_redraw_review)
+		slider_review_true_size.on_changed(_redraw_review)
+		review_fig.canvas.mpl_connect("scroll_event", _on_review_scroll)
+		review_fig.canvas.mpl_connect("button_press_event", _on_review_press)
+		review_fig.canvas.mpl_connect("motion_notify_event", _on_review_motion)
+		review_fig.canvas.mpl_connect("button_release_event", _on_review_release)
+		review_fig.canvas.mpl_connect("resize_event", _apply_review_widget_scaling)
 		# Keep widget references attached to the figure so callbacks remain active.
 		setattr(
 			review_fig,
@@ -936,9 +1266,14 @@ def make_postanalysis_overlay_popout(
 			{
 				"btn_prev": btn_review_prev,
 				"btn_next": btn_review_next,
+				"btn_zoom_reset": btn_zoom_reset,
 				"slider": slider_review,
+				"pred_size": slider_review_pred_size,
+				"true_size": slider_review_true_size,
+				"zoom_axes": zoom_axes,
 			},
 		)
+		_apply_review_widget_scaling()
 		_redraw_review()
 		review_fig.show()
 
@@ -959,6 +1294,18 @@ def make_postanalysis_overlay_popout(
 		btn_open = Button(open_ax, "Open")
 		btn_cancel = Button(cancel_ax, "Close")
 		browser_fig.suptitle("Correction Tab: active_updates", fontsize=11)
+
+		def _apply_browser_widget_scaling(_event: Any = None) -> None:
+			button_font = _scaled_font(browser_fig, base_size=9.5, ref_w=4.8, ref_h=3.8, min_size=8.0, max_size=14.0)
+			radio_font = _scaled_font(browser_fig, base_size=9.0, ref_w=4.8, ref_h=3.8, min_size=7.5, max_size=13.0)
+			title_font = _scaled_font(browser_fig, base_size=11.0, ref_w=4.8, ref_h=3.8, min_size=9.0, max_size=16.0)
+			btn_open.label.set_fontsize(button_font)
+			btn_cancel.label.set_fontsize(button_font)
+			for txt in radio_sets.labels:
+				txt.set_fontsize(radio_font)
+			if browser_fig._suptitle is not None:
+				browser_fig._suptitle.set_fontsize(title_font)
+			browser_fig.canvas.draw_idle()
 
 		manager = getattr(browser_fig.canvas, "manager", None)
 		if manager is not None:
@@ -981,6 +1328,7 @@ def make_postanalysis_overlay_popout(
 
 		btn_open.on_clicked(_open_selected)
 		btn_cancel.on_clicked(_close_browser)
+		browser_fig.canvas.mpl_connect("resize_event", _apply_browser_widget_scaling)
 		setattr(
 			browser_fig,
 			"_correction_tab_widgets",
@@ -990,6 +1338,7 @@ def make_postanalysis_overlay_popout(
 				"cancel": btn_cancel,
 			},
 		)
+		_apply_browser_widget_scaling()
 		browser_fig.show()
 
 	def _set_selection(frames: list[int], meta: dict[int, dict[str, Any]], mode: str, summary_lines: list[str]) -> None:
