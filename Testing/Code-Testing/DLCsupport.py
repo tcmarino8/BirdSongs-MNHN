@@ -165,8 +165,30 @@ BIRD_BODYPARTS: dict[str, list[str]] = {
         "Pelvis_Right_Superior", 
         "Pelvis_Left_Superior", 
         "Pelvis_Left_Inferior"
+    ],
+    "Miguel": [
+        "Cranium_Right_Anterior",
+        "Cranium_Left_Anterior",
+        "Cranium_Right_Posterior",
+        "Cranium_Right_Middle",
+        "Cranium_Left_Posterior",
+        "Beak_Maxilla_Left_Anterior",
+        "Beak_Maxilla_Left_Posterior",
+        "Beak_Mandible_Right_Anterior",
+        "Beak_Mandible_Right_Posterior",
+        "Beak_Mandible_Left_Anterior",
+        "Beak_Mandible_Left_Posterior",
+        "Tongue",
+        "Superior_Trachea",
+        "Pelvis_Left_Superior",
+        "Pelvis_Left_Inferior",
+        "Pelvis_Right_Superior",
+        "Pelvis_Right_Inferior",
+        "Keel_Dorsal_Anterior",
+        "Keel_Dorsal_Middle",
+        "Keel_Dorsal_Inferior",
+        "Keel_Inferior"
     ]
-
 }
 
 
@@ -696,7 +718,8 @@ def build_combined_dataset(
 ) -> None:
     """Populate a combined project's labeled-data from XMA training folders.
 
-    Calls ``xrommtools.xma_to_dlc`` with ``nnetworks=1`` so frames from
+    Calls ``xrommtools_copy.xma_to_dlc`` (fallback: ``xrommtools.xma_to_dlc``)
+    with ``nnetworks=1`` so frames from
     both cameras are included in a single DLC dataset.  The random state is
     saved and restored around the call so the seed only affects frame
     sampling and does not bleed into subsequent operations.
@@ -725,7 +748,12 @@ def build_combined_dataset(
     FileNotFoundError
         If *data_path* does not exist.
     """
-    import xrommtools  # noqa: PLC0415
+    try:
+        import xrommtools_copy as xrommtools_impl  # noqa: PLC0415
+        logger.info("Using xrommtools_copy.xma_to_dlc for dataset build")
+    except ImportError:
+        import xrommtools as xrommtools_impl  # noqa: PLC0415
+        logger.info("Using xrommtools.xma_to_dlc for dataset build")
 
     combined_config = Path(combined_config)
     data_path = Path(data_path)
@@ -738,7 +766,7 @@ def build_combined_dataset(
             random.seed(frame_selection_seed)
             logger.info("Frame selection seed set to %s", frame_selection_seed)
 
-        xrommtools.xma_to_dlc(
+        xrommtools_impl.xma_to_dlc(
             as_posix_str(combined_config),
             as_posix_str(data_path),
             dataset_name,

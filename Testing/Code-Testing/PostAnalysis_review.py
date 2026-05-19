@@ -66,16 +66,11 @@ def _resolve_cam_dirs(root: Path) -> dict[str, Path]:
 
 
 def _resolve_prediction_csvs(root: Path) -> dict[str, Path]:
-	"""Resolve prediction CSVs from post_processed_data_*/cam1DLC*.csv and cam2DLC*.csv."""
+	"""Resolve prediction CSVs from post_processed_data_* or a single combined CSV."""
 	if not root.exists() or not root.is_dir():
 		raise FileNotFoundError(f"Prediction folder does not exist: {root}")
 
 	post_dirs = sorted([p for p in root.rglob("post_processed_data_*") if p.is_dir()])
-	if not post_dirs:
-		raise FileNotFoundError(
-			f"Could not find a post_processed_data_* folder under: {root}"
-		)
-
 	cam_csv: dict[str, Path] = {}
 	for d in post_dirs:
 		csvs = sorted([p for p in d.glob("*.csv") if p.is_file()])
@@ -86,11 +81,46 @@ def _resolve_prediction_csvs(root: Path) -> dict[str, Path]:
 			if "cam2dlc" in low and "cam2" not in cam_csv:
 				cam_csv["cam2"] = p
 
+	if "cam1" in cam_csv and "cam2" in cam_csv:
+		return cam_csv
+
+	def _is_combined_cam_csv(csv_path: Path) -> bool:
+		try:
+			headers = pd.read_csv(csv_path, nrows=0).columns
+		except Exception:
+			return False
+		cams: set[str] = set()
+		coords: dict[str, set[str]] = {"1": set(), "2": set()}
+		for col in headers:
+			match = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
+			if match is None:
+				continue
+			cam_id = str(match.group("cam"))
+			coord = str(match.group("coord")).upper()
+			cams.add(cam_id)
+			coords.setdefault(cam_id, set()).add(coord)
+		return cams == {"1", "2"} and {"X", "Y"}.issubset(coords.get("1", set())) and {"X", "Y"}.issubset(coords.get("2", set()))
+
+	root_csvs = sorted([p for p in root.glob("*.csv") if p.is_file()])
+	combined_candidates = [p for p in root_csvs if _is_combined_cam_csv(p)]
+	if not combined_candidates:
+		all_csvs = sorted([p for p in root.rglob("*.csv") if p.is_file() and "post_processed_data_" not in str(p).lower()])
+		combined_candidates = [p for p in all_csvs if _is_combined_cam_csv(p)]
+
+	if len(combined_candidates) == 1:
+		combined_path = combined_candidates[0]
+		return {"cam1": combined_path, "cam2": combined_path}
+	if len(combined_candidates) > 1:
+		preferred = [p for p in combined_candidates if "pred" in p.name.lower()]
+		chosen = preferred[0] if preferred else combined_candidates[0]
+		return {"cam1": chosen, "cam2": chosen}
+
 	missing = [c for c in ("cam1", "cam2") if c not in cam_csv]
 	if missing:
 		raise FileNotFoundError(
-			"Missing expected prediction CSV(s) under post_processed_data_*: "
-			+ ", ".join(missing)
+			"Missing expected prediction CSV(s). Expected either cam1/cam2 files under post_processed_data_* "
+			"or one combined CSV in truth-style format with both cam1 and cam2 columns under: "
+			f"{root}"
 		)
 
 	return cam_csv
@@ -169,6 +199,37 @@ def _load_prediction_long(pred_file: Path) -> pd.DataFrame:
 			out["frame_id"] = out.groupby("camera").cumcount() + 1
 		out["frame_id"] = out["frame_id"].astype(int)
 		return out.dropna(subset=["x_pred", "y_pred"])
+
+	# Combined truth-style columns: bodypart_cam1_X, bodypart_cam2_Y, etc.
+	rows = []
+	for col in raw.columns:
+		match = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
+		if match is None:
+			continue
+		rows.append((match.group("bodypart"), f"cam{match.group('cam')}", match.group("coord").lower(), str(col)))
+
+	if rows:
+		meta = pd.DataFrame(rows, columns=["bodypart", "camera", "coord", "column"])
+		xmeta = meta[meta["coord"] == "x"].rename(columns={"column": "xcol"})
+		ymeta = meta[meta["coord"] == "y"].rename(columns={"column": "ycol"})
+		pairs = xmeta.merge(ymeta[["bodypart", "camera", "ycol"]], on=["bodypart", "camera"], how="inner")
+		frame_ids = np.arange(0, len(raw), dtype=int)
+		out = []
+		for _, row in pairs.iterrows():
+			out.append(
+				pd.DataFrame(
+					{
+						"camera": row["camera"],
+						"frame_id": frame_ids,
+						"bodypart": str(row["bodypart"]),
+						"x_pred": pd.to_numeric(raw[row["xcol"]], errors="coerce"),
+						"y_pred": pd.to_numeric(raw[row["ycol"]], errors="coerce"),
+						"likelihood": np.nan,
+					}
+				)
+			)
+		if out:
+			return pd.concat(out, ignore_index=True).dropna(subset=["x_pred", "y_pred"])
 
 	# Fallback for DLC-style multi-index csv
 	wide = pd.read_csv(pred_file, header=[0, 1, 2], index_col=0)
@@ -291,10 +352,13 @@ def make_postanalysis_overlay_popout(
 		"cam2": collect_images(cam_dirs["cam2"]),
 	}
 
-	pred_long = pd.concat(
-		[_load_prediction_long(pred_csv_by_cam["cam1"]), _load_prediction_long(pred_csv_by_cam["cam2"])],
-		ignore_index=True,
-	)
+	if pred_csv_by_cam["cam1"] == pred_csv_by_cam["cam2"]:
+		pred_long = _load_prediction_long(pred_csv_by_cam["cam1"])
+	else:
+		pred_long = pd.concat(
+			[_load_prediction_long(pred_csv_by_cam["cam1"]), _load_prediction_long(pred_csv_by_cam["cam2"])],
+			ignore_index=True,
+		)
 
 	truth_long = pd.DataFrame(columns=["frame_id", "bodypart", "camera", "x_true", "y_true"])
 	truth_found = False
