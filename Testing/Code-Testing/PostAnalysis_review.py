@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -353,6 +354,7 @@ def make_postanalysis_overlay_popout(
 	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
 	ax_select_displacement = fig.add_axes([0.82, 0.15, 0.16, 0.04])
 	ax_select_dino = fig.add_axes([0.82, 0.10, 0.16, 0.04])
+	ax_correction = fig.add_axes([0.82, 0.05, 0.16, 0.04])
 	ax_prev = fig.add_axes([0.015, 0.252, 0.045, 0.05])
 	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
 	ax_next = fig.add_axes([0.705, 0.252, 0.045, 0.05])
@@ -365,13 +367,14 @@ def make_postanalysis_overlay_popout(
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
-	ax_selection_info = fig.add_axes([0.82, 0.01, 0.16, 0.07])
+	ax_selection_info = fig.add_axes([0.82, 0.005, 0.16, 0.035])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
+	btn_correction = Button(ax_correction, "Correction")
 	if not state.truth_found:
 		labels = check.labels
 		if len(labels) >= 2:
@@ -679,6 +682,218 @@ def make_postanalysis_overlay_popout(
 				"color": "seagreen",
 			}
 		return selected_idx, meta, [f"DINO {count} frames", f"Source {camera}"]
+
+	def _method_folder_name(method_name: str) -> str:
+		return {"random": "random", "displacement": "displacement", "dino": "dino"}.get(method_name, method_name)
+
+	def _choose_frame_values(frame_series: pd.Series, frames: list[int]) -> np.ndarray:
+		frame_array = np.asarray(sorted(set(int(frame) for frame in frames)), dtype=int)
+		series_numeric = pd.to_numeric(frame_series, errors="coerce")
+		exact_hits = int(series_numeric.isin(frame_array).sum())
+		plus_one_hits = int(series_numeric.isin(frame_array + 1).sum())
+		return frame_array + 1 if plus_one_hits > exact_hits else frame_array
+
+	def _write_standardized_subset_csv(camera: str, frames: list[int], destination: Path) -> None:
+		subset = state.pred_long[
+			(state.pred_long["camera"] == camera) & (state.pred_long["frame_id"].isin([int(frame) for frame in frames]))
+		].copy()
+		subset.to_csv(destination, index=False)
+
+	def _export_prediction_subset(camera: str, frames: list[int], data_dir: Path) -> None:
+		src = state.pred_csv_by_cam[camera]
+		destination = data_dir / src.name
+		selected_frames_local = [int(frame) for frame in frames]
+
+		if src.suffix.lower() == ".parquet":
+			raw = pd.read_parquet(src)
+			low_cols = {str(c).lower(): c for c in raw.columns}
+			frame_col = None
+			for name in ("frame_id", "frame", "image_index", "frame_idx"):
+				if name in low_cols:
+					frame_col = low_cols[name]
+					break
+			if frame_col is not None:
+				target_values = _choose_frame_values(raw[frame_col], selected_frames_local)
+				raw[pd.to_numeric(raw[frame_col], errors="coerce").isin(target_values)].to_parquet(destination, index=False)
+				return
+			_write_standardized_subset_csv(camera, selected_frames_local, destination.with_suffix(".csv"))
+			return
+
+		try:
+			raw = pd.read_csv(src)
+		except Exception:
+			raw = pd.DataFrame()
+
+		low_cols = {str(c).lower(): c for c in raw.columns}
+		bodypart_col = None
+		x_col = None
+		y_col = None
+		frame_col = None
+		for name in ("bodypart", "part", "keypoint"):
+			if name in low_cols:
+				bodypart_col = low_cols[name]
+				break
+		for name in ("x_pred", "x", "pred_x"):
+			if name in low_cols:
+				x_col = low_cols[name]
+				break
+		for name in ("y_pred", "y", "pred_y"):
+			if name in low_cols:
+				y_col = low_cols[name]
+				break
+		for name in ("frame_id", "frame", "image_index", "frame_idx"):
+			if name in low_cols:
+				frame_col = low_cols[name]
+				break
+
+		if bodypart_col and x_col and y_col and frame_col:
+			target_values = _choose_frame_values(raw[frame_col], selected_frames_local)
+			raw[pd.to_numeric(raw[frame_col], errors="coerce").isin(target_values)].to_csv(destination, index=False)
+			return
+
+		if not raw.empty and not (bodypart_col and x_col and y_col):
+			wide = pd.read_csv(src, header=[0, 1, 2], index_col=0)
+			valid_rows = [frame for frame in sorted(set(selected_frames_local)) if 0 <= frame < len(wide)]
+			wide.iloc[valid_rows].to_csv(destination)
+			return
+
+		_write_standardized_subset_csv(camera, selected_frames_local, destination)
+
+	def _export_active_updates_subset(method_name: str, frames: list[int]) -> Path:
+		method_dir = state.pred_root / "active_updates" / _method_folder_name(method_name)
+		cam1_dir = method_dir / "cam1"
+		cam2_dir = method_dir / "cam2"
+		data_dir = method_dir / "data"
+
+		if method_dir.exists():
+			shutil.rmtree(method_dir)
+		cam1_dir.mkdir(parents=True, exist_ok=True)
+		cam2_dir.mkdir(parents=True, exist_ok=True)
+		data_dir.mkdir(parents=True, exist_ok=True)
+
+		for camera_name, export_dir in (("cam1", cam1_dir), ("cam2", cam2_dir)):
+			images = state.images_by_cam.get(camera_name, [])
+			for frame in sorted(set(int(frame) for frame in frames)):
+				if 0 <= frame < len(images):
+					shutil.copy2(images[frame], export_dir / images[frame].name)
+			_export_prediction_subset(camera_name, frames, data_dir)
+
+		return method_dir
+
+	def _open_correction_subset_view(method_name: str, frames: list[int], export_dir: Path) -> None:
+		frames_local = [int(frame) for frame in sorted(set(frames))]
+		if not frames_local:
+			raise RuntimeError("No selected frames are available for correction review.")
+
+		review_fig, review_axes = plt.subplots(1, 2, figsize=(12.6, 6.9))
+		review_fig.subplots_adjust(left=0.05, right=0.98, bottom=0.16, top=0.88, wspace=0.06)
+		for review_ax in review_axes:
+			review_ax.set_axis_off()
+
+		ax_review_prev = review_fig.add_axes([0.20, 0.05, 0.08, 0.05])
+		ax_review_slider = review_fig.add_axes([0.31, 0.055, 0.38, 0.035])
+		ax_review_next = review_fig.add_axes([0.72, 0.05, 0.08, 0.05])
+		btn_review_prev = Button(ax_review_prev, "<")
+		btn_review_next = Button(ax_review_next, ">")
+		slider_review = Slider(
+			ax_review_slider,
+			"selected_idx",
+			0,
+			float(max(len(frames_local) - 1, 0)),
+			valinit=0.0,
+			valstep=1,
+		)
+
+		manager = getattr(review_fig.canvas, "manager", None)
+		if manager is not None:
+			try:
+				manager.set_window_title("Correction Review")
+			except Exception:
+				pass
+
+		def _review_colors(bodyparts: pd.Series, fallback: str) -> list[str] | str:
+			if str(radio_color_mode.value_selected) != "by_name":
+				return fallback
+			return [state.bodypart_color_map.get(str(bp), fallback) for bp in bodyparts]
+
+		def _redraw_review(*_args: Any) -> None:
+			frame_idx = int(slider_review.val)
+			frame_pos = frames_local[frame_idx]
+			show_true = bool(check.get_status()[1]) and state.truth_found
+			annotate = bool(check.get_status()[2])
+			min_like = float(slider_like.val)
+			pred_size = float(slider_pred_size.val)
+			pred_alpha = float(slider_pred_alpha.val)
+			true_size = float(slider_true_size.val)
+			true_alpha = float(slider_true_alpha.val)
+			pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
+			true_color = _safe_color(textbox_true_color.text.strip(), "orange")
+
+			for review_ax, camera_name in zip(review_axes, ("cam1", "cam2")):
+				review_ax.clear()
+				review_ax.set_axis_off()
+				images = state.images_by_cam.get(camera_name, [])
+				if not (0 <= frame_pos < len(images)):
+					review_ax.text(0.5, 0.5, f"No image for {camera_name} frame {frame_pos}", ha="center", va="center", transform=review_ax.transAxes)
+					continue
+
+				with Image.open(images[frame_pos]) as image_file:
+					review_ax.imshow(np.asarray(image_file.convert("RGB")))
+
+				pred_pts = _pred_points(camera_name, frame_pos)
+				if not pred_pts.empty:
+					pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
+				if not pred_pts.empty:
+					review_ax.scatter(
+						pred_pts["x"],
+						pred_pts["y"],
+						c=_review_colors(pred_pts["bodypart"], pred_color),
+						s=pred_size,
+						alpha=pred_alpha,
+						edgecolors="white",
+						linewidths=1.0,
+					)
+					if annotate:
+						for _, row in pred_pts.iterrows():
+							label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if str(radio_color_mode.value_selected) == "by_name" else pred_color
+							review_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+
+				if show_true:
+					true_pts = _true_points(camera_name, frame_pos)
+					if not true_pts.empty:
+						review_ax.scatter(
+							true_pts["x"],
+							true_pts["y"],
+							c=_review_colors(true_pts["bodypart"], true_color),
+							s=true_size,
+							alpha=true_alpha,
+							marker="x",
+							linewidths=1.8,
+						)
+						if annotate:
+							for _, row in true_pts.iterrows():
+								label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if str(radio_color_mode.value_selected) == "by_name" else true_color
+								review_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+
+				review_ax.set_title(f"{camera_name} | frame {frame_pos}", fontsize=10)
+
+			review_fig.suptitle(
+				f"Correction Review | {method_name.title()} | {frame_idx + 1}/{len(frames_local)} | frame {frame_pos}\nExported to {export_dir}",
+				fontsize=11,
+			)
+			review_fig.canvas.draw_idle()
+
+		def _on_review_prev(_event: Any) -> None:
+			slider_review.set_val((int(slider_review.val) - 1) % len(frames_local))
+
+		def _on_review_next(_event: Any) -> None:
+			slider_review.set_val((int(slider_review.val) + 1) % len(frames_local))
+
+		btn_review_prev.on_clicked(_on_review_prev)
+		btn_review_next.on_clicked(_on_review_next)
+		slider_review.on_changed(_redraw_review)
+		_redraw_review()
+		review_fig.show()
 
 	def _set_selection(frames: list[int], meta: dict[int, dict[str, Any]], mode: str, summary_lines: list[str]) -> None:
 		nonlocal selected_frames
@@ -1047,11 +1262,24 @@ def make_postanalysis_overlay_popout(
 	def _on_select_dino_frames(_event: Any) -> None:
 		_activate_selection("dino", source_camera=_cam_norm(radio_cam.value_selected))
 
+	def _on_correction_export(_event: Any) -> None:
+		try:
+			if not selected_frames or not selection_mode:
+				raise RuntimeError("Create a frame selection first with Random, Displacement, or DINO before opening Correction.")
+
+			frames = [int(frame) for frame in sorted(set(selected_frames))]
+			method_name = _method_folder_name(selection_mode)
+			export_dir = _export_active_updates_subset(method_name, frames)
+			_open_correction_subset_view(method_name, frames, export_dir)
+		except Exception as exc:
+			print(f"Correction export failed: {exc}")
+
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
 	btn_select_random.on_clicked(_on_select_random_frames)
 	btn_select_displacement.on_clicked(_on_select_displacement_frames)
 	btn_select_dino.on_clicked(_on_select_dino_frames)
+	btn_correction.on_clicked(_on_correction_export)
 	btn_prev.on_clicked(_on_prev)
 	btn_next.on_clicked(_on_next)
 	btn_resample.on_clicked(_on_resample)
