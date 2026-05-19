@@ -8,7 +8,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
-from matplotlib.widgets import CheckButtons, RadioButtons, Slider, TextBox
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider, TextBox
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -333,33 +333,44 @@ def make_postanalysis_overlay_popout(
 	current_points: list[dict[str, Any]] = []
 	selected_text = None
 	view_limits: dict[str, tuple[float, float] | None] = {"xlim": None, "ylim": None}
+	rng = np.random.default_rng()
+	random_frames_by_cam: dict[str, list[int]] = {"cam1": [], "cam2": []}
+	current_random_index_by_cam: dict[str, int | None] = {"cam1": None, "cam2": None}
+	random_marker_artists: list[Any] = []
+	random_controls_visible = False
 
 	fig, ax = plt.subplots(figsize=(12.2, 8.4))
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
 
 	ax_cam = fig.add_axes([0.82, 0.72, 0.16, 0.18])
 	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
+	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
+	ax_prev = fig.add_axes([0.015, 0.252, 0.045, 0.05])
 	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
+	ax_next = fig.add_axes([0.705, 0.252, 0.045, 0.05])
+	ax_resample = fig.add_axes([0.755, 0.252, 0.055, 0.05])
 	ax_like = fig.add_axes([0.08, 0.21, 0.62, 0.03])
-	ax_offset = fig.add_axes([0.08, 0.16, 0.62, 0.03])
-	ax_pred_size = fig.add_axes([0.08, 0.11, 0.29, 0.03])
-	ax_pred_alpha = fig.add_axes([0.41, 0.11, 0.29, 0.03])
-	ax_true_size = fig.add_axes([0.08, 0.06, 0.29, 0.03])
-	ax_true_alpha = fig.add_axes([0.41, 0.06, 0.29, 0.03])
+	ax_pred_size = fig.add_axes([0.08, 0.16, 0.29, 0.03])
+	ax_pred_alpha = fig.add_axes([0.41, 0.16, 0.29, 0.03])
+	ax_true_size = fig.add_axes([0.08, 0.11, 0.29, 0.03])
+	ax_true_alpha = fig.add_axes([0.41, 0.11, 0.29, 0.03])
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
+	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	if not state.truth_found:
 		labels = check.labels
 		if len(labels) >= 2:
 			labels[1].set_alpha(0.35)
 
+	btn_prev = Button(ax_prev, "<")
 	slider_frame = Slider(ax_frame, "frame_pos", 0, float(max_len), valinit=float(start_pos), valstep=1)
+	btn_next = Button(ax_next, ">")
+	btn_resample = Button(ax_resample, "R20")
 	slider_like = Slider(ax_like, "min_likelihood", 0.0, 1.0, valinit=0.0, valstep=0.01)
-	slider_offset = Slider(ax_offset, "truth_offset", -5000, 5000, valinit=0, valstep=1)
 	slider_pred_size = Slider(ax_pred_size, "pred_size", 10, 300, valinit=60, valstep=1)
 	slider_pred_alpha = Slider(ax_pred_alpha, "pred_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
 	slider_true_size = Slider(ax_true_size, "true_size", 10, 300, valinit=45, valstep=1)
@@ -377,6 +388,93 @@ def make_postanalysis_overlay_popout(
 			return value
 		except Exception:
 			return fallback
+
+	def _resample_random_frames(camera: str) -> None:
+		imgs = state.images_by_cam.get(camera, [])
+		count = min(20, len(imgs))
+		if count <= 0:
+			random_frames_by_cam[camera] = []
+			current_random_index_by_cam[camera] = None
+			return
+
+		sampled = np.sort(rng.choice(np.arange(len(imgs), dtype=int), size=count, replace=False)).tolist()
+		random_frames_by_cam[camera] = [int(v) for v in sampled]
+		current_random_index_by_cam[camera] = 0
+
+	def _draw_random_markers(camera: str) -> None:
+		nonlocal random_marker_artists
+		for artist in random_marker_artists:
+			try:
+				artist.remove()
+			except Exception:
+				pass
+		random_marker_artists = []
+
+		if not random_controls_visible:
+			return
+
+		frames = random_frames_by_cam.get(camera, [])
+		if not frames:
+			return
+
+		selected_idx = current_random_index_by_cam.get(camera)
+		selected_frame = None
+		if selected_idx is not None and 0 <= selected_idx < len(frames):
+			selected_frame = int(frames[selected_idx])
+
+		for frame in frames:
+			is_selected = selected_frame is not None and int(frame) == selected_frame
+			line = ax_frame.axvline(
+				float(frame),
+				color="firebrick" if is_selected else "crimson",
+				linewidth=2.0 if is_selected else 1.0,
+				alpha=0.95 if is_selected else 0.4,
+				zorder=0,
+			)
+			random_marker_artists.append(line)
+
+	def _sync_random_status(camera: str, frame_pos: int) -> None:
+		if not random_controls_visible:
+			ax_frame.set_title("", fontsize=9, pad=6)
+			return
+
+		frames = random_frames_by_cam.get(camera, [])
+		if not frames:
+			ax_frame.set_title("Random set: no frames available", fontsize=9, pad=6)
+			return
+
+		if frame_pos in frames:
+			idx = int(frames.index(frame_pos))
+			current_random_index_by_cam[camera] = idx
+			ax_frame.set_title(f"Random set: {idx + 1}/{len(frames)} | frame {frame_pos}", fontsize=9, pad=6)
+		else:
+			ax_frame.set_title(
+				f"Random set: {len(frames)} frames | current frame {frame_pos} (not selected)",
+				fontsize=9,
+				pad=6,
+			)
+
+	def _goto_random_index(camera: str, index: int) -> None:
+		frames = random_frames_by_cam.get(camera, [])
+		if not frames:
+			return
+		idx = int(index) % len(frames)
+		current_random_index_by_cam[camera] = idx
+		slider_frame.set_val(float(frames[idx]))
+
+	def _set_random_controls_visible(visible: bool) -> None:
+		nonlocal random_controls_visible
+		random_controls_visible = bool(visible)
+		ax_prev.set_visible(random_controls_visible)
+		ax_next.set_visible(random_controls_visible)
+		ax_resample.set_visible(random_controls_visible)
+		redraw()
+
+	for camera_name in ("cam1", "cam2"):
+		_resample_random_frames(camera_name)
+
+	if random_frames_by_cam.get(cam):
+		_goto_random_index(cam, 0)
 
 	def _pred_points(camera: str, frame_id: int) -> pd.DataFrame:
 		d = state.pred_long[
@@ -408,7 +506,6 @@ def make_postanalysis_overlay_popout(
 		show_true = bool(check.get_status()[1]) and state.truth_found
 		annotate = bool(check.get_status()[2])
 		min_like = float(slider_like.val)
-		truth_offset = int(slider_offset.val)
 		pred_size = float(slider_pred_size.val)
 		pred_alpha = float(slider_pred_alpha.val)
 		true_size = float(slider_true_size.val)
@@ -427,6 +524,8 @@ def make_postanalysis_overlay_popout(
 		selected_text = None
 
 		if not imgs:
+			_sync_random_status(camera, 0)
+			_draw_random_markers(camera)
 			ax.text(0.5, 0.5, f"No images for {camera}", ha="center", va="center", transform=ax.transAxes)
 			ax.set_axis_off()
 			fig.canvas.draw_idle()
@@ -437,7 +536,7 @@ def make_postanalysis_overlay_popout(
 		# This ensures the first image is always frame 0 regardless of filename token.
 		frame_id_img = int(frame_pos)
 		name_frame_token = parse_frame_number_from_stem(image_path.stem)
-		truth_frame_id = int(frame_id_img + truth_offset)
+		truth_frame_id = int(frame_id_img)
 
 		with Image.open(image_path) as im:
 			img = np.asarray(im.convert("RGB"))
@@ -511,6 +610,8 @@ def make_postanalysis_overlay_popout(
 			f"{camera} | frame_pos={frame_pos} | image_frame_id={frame_id_img} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
 			f"pred_csv={state.pred_csv_by_cam[camera].name} | point_customizer={color_mode}"
 		)
+		_sync_random_status(camera, frame_pos)
+		_draw_random_markers(camera)
 		ax.set_axis_off()
 
 		# Reapply previous view limits when available.
@@ -598,11 +699,53 @@ def make_postanalysis_overlay_popout(
 		view_limits["ylim"] = tuple(float(v) for v in ax.get_ylim())
 		fig.canvas.draw_idle()
 
+	def _on_prev(_event: Any) -> None:
+		if not random_controls_visible:
+			return
+		camera = _cam_norm(radio_cam.value_selected)
+		frames = random_frames_by_cam.get(camera, [])
+		if not frames:
+			return
+		curr = current_random_index_by_cam.get(camera)
+		if curr is None:
+			curr_frame = int(slider_frame.val)
+			curr = frames.index(curr_frame) if curr_frame in frames else 0
+		_goto_random_index(camera, curr - 1)
+
+	def _on_next(_event: Any) -> None:
+		if not random_controls_visible:
+			return
+		camera = _cam_norm(radio_cam.value_selected)
+		frames = random_frames_by_cam.get(camera, [])
+		if not frames:
+			return
+		curr = current_random_index_by_cam.get(camera)
+		if curr is None:
+			curr_frame = int(slider_frame.val)
+			curr = frames.index(curr_frame) if curr_frame in frames else -1
+		_goto_random_index(camera, curr + 1)
+
+	def _on_resample(_event: Any) -> None:
+		if not random_controls_visible:
+			return
+		camera = _cam_norm(radio_cam.value_selected)
+		_resample_random_frames(camera)
+		if random_frames_by_cam.get(camera):
+			_goto_random_index(camera, 0)
+		else:
+			redraw()
+
+	def _on_select_random_frames(_event: Any) -> None:
+		_set_random_controls_visible(not random_controls_visible)
+
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
+	btn_select_random.on_clicked(_on_select_random_frames)
+	btn_prev.on_clicked(_on_prev)
+	btn_next.on_clicked(_on_next)
+	btn_resample.on_clicked(_on_resample)
 	slider_frame.on_changed(redraw)
 	slider_like.on_changed(redraw)
-	slider_offset.on_changed(redraw)
 	slider_pred_size.on_changed(redraw)
 	slider_pred_alpha.on_changed(redraw)
 	slider_true_size.on_changed(redraw)
@@ -613,6 +756,7 @@ def make_postanalysis_overlay_popout(
 	fig.canvas.mpl_connect("button_press_event", _on_click)
 	fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
+	_set_random_controls_visible(False)
 	redraw()
 	print("Close the plot window to exit.")
 	plt.show()
