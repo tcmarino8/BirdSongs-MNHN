@@ -341,6 +341,9 @@ def make_postanalysis_overlay_popout(
 	selection_controls_visible = False
 	selection_mode = ""
 	selection_summary_lines: list[str] = []
+	selection_source_camera = cam
+	dino_components: dict[str, Any] = {}
+	dino_embeddings_by_cam: dict[str, Any] = {}
 
 	fig, ax = plt.subplots(figsize=(12.2, 8.4))
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
@@ -349,6 +352,7 @@ def make_postanalysis_overlay_popout(
 	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
 	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
 	ax_select_displacement = fig.add_axes([0.82, 0.15, 0.16, 0.04])
+	ax_select_dino = fig.add_axes([0.82, 0.10, 0.16, 0.04])
 	ax_prev = fig.add_axes([0.015, 0.252, 0.045, 0.05])
 	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
 	ax_next = fig.add_axes([0.705, 0.252, 0.045, 0.05])
@@ -361,12 +365,13 @@ def make_postanalysis_overlay_popout(
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
-	ax_selection_info = fig.add_axes([0.82, 0.03, 0.16, 0.09])
+	ax_selection_info = fig.add_axes([0.82, 0.01, 0.16, 0.07])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
+	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
 	if not state.truth_found:
 		labels = check.labels
 		if len(labels) >= 2:
@@ -395,6 +400,38 @@ def make_postanalysis_overlay_popout(
 			return value
 		except Exception:
 			return fallback
+
+	def _load_dino_components() -> dict[str, Any]:
+		if dino_components:
+			return dino_components
+
+		try:
+			import torch
+			from torchvision import transforms
+		except Exception as exc:
+			raise RuntimeError(
+				"DINO selection requires torch and torchvision in the active environment."
+			) from exc
+
+		device = "cuda" if torch.cuda.is_available() else "cpu"
+		model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+		model.eval().to(device)
+		transform = transforms.Compose(
+			[
+				transforms.Resize((224, 224)),
+				transforms.ToTensor(),
+				transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+			]
+		)
+		dino_components.update(
+			{
+				"torch": torch,
+				"transform": transform,
+				"model": model,
+				"device": device,
+			}
+		)
+		return dino_components
 
 	def _pred_points(camera: str, frame_id: int) -> pd.DataFrame:
 		d = state.pred_long[
@@ -564,18 +601,100 @@ def make_postanalysis_overlay_popout(
 			summary_lines = summary_lines[:4] + ["..."]
 		return selected, meta, summary_lines
 
+	def _compute_dino_embeddings(camera: str) -> Any:
+		frame_limit = _shared_frame_limit()
+		if frame_limit <= 0:
+			return None
+		cache_key = f"{camera}:{frame_limit}"
+		if cache_key in dino_embeddings_by_cam:
+			return dino_embeddings_by_cam[cache_key]
+
+		components = _load_dino_components()
+		torch = components["torch"]
+		transform = components["transform"]
+		model = components["model"]
+		device = components["device"]
+
+		image_paths = state.images_by_cam.get(camera, [])[:frame_limit]
+		if not image_paths:
+			dino_embeddings_by_cam[cache_key] = None
+			return None
+
+		embeddings = []
+		batch_size = 16
+		for start in range(0, len(image_paths), batch_size):
+			batch_paths = image_paths[start:start + batch_size]
+			batch_tensors = []
+			for image_path in batch_paths:
+				with Image.open(image_path) as image_file:
+					batch_tensors.append(transform(image_file.convert("RGB")))
+			batch = torch.stack(batch_tensors).to(device)
+			with torch.no_grad():
+				feats = model(batch)
+			embeddings.append(feats.detach().cpu())
+
+		if not embeddings:
+			dino_embeddings_by_cam[cache_key] = None
+			return None
+
+		embedding_tensor = torch.cat(embeddings, dim=0)
+		embedding_tensor = embedding_tensor / embedding_tensor.norm(dim=1, keepdim=True).clamp_min(1e-12)
+		dino_embeddings_by_cam[cache_key] = embedding_tensor
+		return embedding_tensor
+
+	def _k_center_greedy(embedding_tensor: Any, k: int) -> list[int]:
+		components = _load_dino_components()
+		torch = components["torch"]
+		n_samples = int(embedding_tensor.shape[0])
+		if n_samples <= 0 or k <= 0:
+			return []
+		if k >= n_samples:
+			return list(range(n_samples))
+
+		selected = [int(torch.randint(0, n_samples, (1,)).item())]
+		dist = torch.cdist(embedding_tensor, embedding_tensor[selected]).min(dim=1).values
+		for _ in range(k - 1):
+			idx = int(torch.argmax(dist).item())
+			selected.append(idx)
+			new_dist = torch.cdist(embedding_tensor, embedding_tensor[[idx]]).squeeze(1)
+			dist = torch.minimum(dist, new_dist)
+		return selected
+
+	def _build_dino_selection(camera: str) -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
+		frame_limit = _shared_frame_limit()
+		count = min(20, frame_limit)
+		if count <= 0:
+			return [], {}, ["DINO", "No shared frames"]
+
+		embedding_tensor = _compute_dino_embeddings(camera)
+		if embedding_tensor is None:
+			return [], {}, ["DINO", f"No embeddings for {camera}"]
+
+		selected_idx = sorted(int(idx) for idx in _k_center_greedy(embedding_tensor, count))
+		meta: dict[int, dict[str, Any]] = {}
+		for frame in selected_idx:
+			meta[int(frame)] = {
+				"label": f"DINO {camera}",
+				"source_camera": camera,
+				"color": "seagreen",
+			}
+		return selected_idx, meta, [f"DINO {count} frames", f"Source {camera}"]
+
 	def _set_selection(frames: list[int], meta: dict[int, dict[str, Any]], mode: str, summary_lines: list[str]) -> None:
 		nonlocal selected_frames
 		nonlocal selected_frame_index
 		nonlocal selected_frame_meta
 		nonlocal selection_mode
 		nonlocal selection_summary_lines
+		nonlocal selection_source_camera
 
 		selected_frames = [int(frame) for frame in frames]
 		selected_frame_index = 0 if selected_frames else None
 		selected_frame_meta = meta
 		selection_mode = mode
 		selection_summary_lines = summary_lines
+		if selected_frames:
+			selection_source_camera = str(meta.get(selected_frames[0], {}).get("source_camera", selection_source_camera))
 
 	def _draw_selection_markers() -> None:
 		nonlocal selection_marker_artists
@@ -627,6 +746,12 @@ def make_postanalysis_overlay_popout(
 					fontsize=9,
 					pad=6,
 				)
+			elif selection_mode == "dino":
+				ax_frame.set_title(
+					f"DINO set: {selected_frame_index + 1}/{len(selected_frames)} | source {meta.get('source_camera', selection_source_camera)} | frame {frame_pos}",
+					fontsize=9,
+					pad=6,
+				)
 			else:
 				ax_frame.set_title(
 					f"Random set: {selected_frame_index + 1}/{len(selected_frames)} | frame {frame_pos}",
@@ -663,7 +788,7 @@ def make_postanalysis_overlay_popout(
 		ax_resample.set_visible(selection_controls_visible)
 		redraw()
 
-	def _activate_selection(mode: str, force_resample: bool = False) -> None:
+	def _activate_selection(mode: str, force_resample: bool = False, source_camera: str | None = None) -> None:
 		if not force_resample and selection_controls_visible and selection_mode == mode:
 			_set_selection_controls_visible(False)
 			return
@@ -671,6 +796,8 @@ def make_postanalysis_overlay_popout(
 		if force_resample or selection_mode != mode or not selected_frames:
 			if mode == "displacement":
 				frames, meta, summary_lines = _build_displacement_selection()
+			elif mode == "dino":
+				frames, meta, summary_lines = _build_dino_selection(source_camera or selection_source_camera)
 			else:
 				frames, meta, summary_lines = _build_random_selection()
 			_set_selection(frames, meta, mode, summary_lines)
@@ -909,7 +1036,7 @@ def make_postanalysis_overlay_popout(
 	def _on_resample(_event: Any) -> None:
 		if not selection_controls_visible:
 			return
-		_activate_selection(selection_mode or "random", force_resample=True)
+		_activate_selection(selection_mode or "random", force_resample=True, source_camera=selection_source_camera)
 
 	def _on_select_random_frames(_event: Any) -> None:
 		_activate_selection("random")
@@ -917,10 +1044,14 @@ def make_postanalysis_overlay_popout(
 	def _on_select_displacement_frames(_event: Any) -> None:
 		_activate_selection("displacement")
 
+	def _on_select_dino_frames(_event: Any) -> None:
+		_activate_selection("dino", source_camera=_cam_norm(radio_cam.value_selected))
+
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
 	btn_select_random.on_clicked(_on_select_random_frames)
 	btn_select_displacement.on_clicked(_on_select_displacement_frames)
+	btn_select_dino.on_clicked(_on_select_dino_frames)
 	btn_prev.on_clicked(_on_prev)
 	btn_next.on_clicked(_on_next)
 	btn_resample.on_clicked(_on_resample)
