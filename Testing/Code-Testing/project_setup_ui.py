@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import re
 import threading
@@ -143,6 +144,9 @@ class ProjectSetupUI:
         self.examine_show_labels_var = tk.BooleanVar(value=False)
         self.examine_status_var = tk.StringVar(value="Idle")
         self.examine_frame_value_var = tk.StringVar(value="Frame: 0/0")
+        self.examine_trim_start_var = tk.StringVar(value="1")
+        self.examine_trim_end_var = tk.StringVar(value="1")
+        self.examine_avi_fps_var = tk.StringVar(value="500")
         self.examine_data_combo: ttk.Combobox | None = None
         self.examine_plot_host: ttk.Frame | None = None
         self.examine_logs_text: tk.Text | None = None
@@ -154,6 +158,8 @@ class ProjectSetupUI:
         self._examine_labeled_dir_path: Path | None = None
         self._examine_all_images: list[Path] = []
         self._examine_cam_images: dict[str, list[Path]] = {"cam1": [], "cam2": []}
+        self._examine_cam_dirs: dict[str, Path | None] = {"cam1": None, "cam2": None}
+        self._data_converters_module = None
         self._examine_playing = False
         self._examine_play_after_id: str | None = None
         self._examine_fig = None
@@ -276,10 +282,45 @@ class ProjectSetupUI:
         controls.grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
         controls.columnconfigure(1, weight=1)
 
-        ttk.Label(controls, text="Data folder").grid(row=0, column=0, sticky="w")
+        data_folder_row = ttk.Frame(controls)
+        data_folder_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(data_folder_row, text="Data folder").pack(side="left")
+        data_folder_info_btn = ttk.Button(data_folder_row, text="(i)")
+        data_folder_info_btn.pack(side="left", padx=(4, 0))
+        data_folder_info_btn.configure(
+            command=lambda w=data_folder_info_btn: self._toggle_info_bubble(
+                key="examine_data_folder",
+                anchor_widget=w,
+                title="Data folder",
+                message=(
+                    "Should contain two image folders with cam1 and cam2 in the folder name, "
+                    "and one CSV of points data."
+                ),
+            )
+        )
         ttk.Entry(controls, textvariable=self.examine_labeled_dir_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
         ttk.Button(controls, text="Browse...", command=self._pick_examine_labeled_data_folder).grid(row=0, column=2, sticky="e", pady=3)
         ttk.Button(controls, text="Load", command=self._load_examine_labeled_data).grid(row=0, column=3, sticky="e", pady=3, padx=(8, 0))
+
+        avi_fps_row = ttk.Frame(controls)
+        avi_fps_row.grid(row=2, column=0, sticky="w")
+        ttk.Label(avi_fps_row, text="AVI fps").pack(side="left")
+        avi_fps_info_btn = ttk.Button(avi_fps_row, text="(i)")
+        avi_fps_info_btn.pack(side="left", padx=(4, 0))
+        avi_fps_info_btn.configure(
+            command=lambda w=avi_fps_info_btn: self._toggle_info_bubble(
+                key="examine_avi_fps",
+                anchor_widget=w,
+                title="AVI fps",
+                message=(
+                    "What frames per second was the camera recording at for your images. "
+                    "Only use this after you have trimmed the data down to the key labeled frames. "
+                    "This can take a while, be patient (about 30 seconds for 3000 frames)."
+                ),
+            )
+        )
+        ttk.Entry(controls, textvariable=self.examine_avi_fps_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Write AVI from Image Stacks", command=self._write_examine_avi_from_stacks).grid(row=2, column=3, sticky="e", pady=3)
 
         ttk.Label(controls, text="Points file").grid(row=1, column=0, sticky="w")
         self.examine_data_combo = ttk.Combobox(
@@ -349,14 +390,45 @@ class ProjectSetupUI:
         ttk.Button(nav, text=">", width=4, command=lambda: self._render_examine_frame(delta=1)).grid(row=0, column=3, sticky="e", padx=(8, 0))
         ttk.Label(nav, textvariable=self.examine_frame_value_var).grid(row=0, column=4, sticky="e", padx=(10, 0))
 
+        trim = ttk.LabelFrame(self.examine_frame, text="Trim Dataset (destructive)", padding=8)
+        trim.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        trim.columnconfigure(6, weight=1)
+
+        trim_info_row = ttk.Frame(trim)
+        trim_info_row.grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
+        ttk.Label(trim_info_row, text="Trim help").pack(side="left")
+        trim_info_btn = ttk.Button(trim_info_row, text="(i)")
+        trim_info_btn.pack(side="left", padx=(4, 0))
+        trim_info_btn.configure(
+            command=lambda w=trim_info_btn: self._toggle_info_bubble(
+                key="examine_trim_dataset",
+                anchor_widget=w,
+                title="Trim Dataset (destructive)",
+                message=(
+                    "If you have NaN data or blank data, it is good to trim those out before training models. "
+                    "This action permanently deletes rows and images outside the kept frame range."
+                ),
+            )
+        )
+
+        ttk.Label(trim, text="Keep from frame").grid(row=1, column=0, sticky="w")
+        ttk.Entry(trim, textvariable=self.examine_trim_start_var, width=8).grid(row=1, column=1, sticky="w", padx=(6, 10))
+        ttk.Button(trim, text="Set = current", command=self._set_examine_trim_start_from_current).grid(row=1, column=2, sticky="w")
+
+        ttk.Label(trim, text="to frame").grid(row=1, column=3, sticky="w", padx=(16, 0))
+        ttk.Entry(trim, textvariable=self.examine_trim_end_var, width=8).grid(row=1, column=4, sticky="w", padx=(6, 10))
+        ttk.Button(trim, text="Set = current", command=self._set_examine_trim_end_from_current).grid(row=1, column=5, sticky="w")
+
+        ttk.Button(trim, text="Trim Rows + Images", command=self._trim_examine_data).grid(row=1, column=6, sticky="e")
+
         self.examine_plot_host = ttk.Frame(self.examine_frame)
-        self.examine_plot_host.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(4, 0))
+        self.examine_plot_host.grid(row=4, column=0, sticky="nsew", padx=(0, 8), pady=(4, 0))
         self.examine_plot_host.columnconfigure(0, weight=1)
         self.examine_plot_host.rowconfigure(0, weight=1)
-        ttk.Label(self.examine_plot_host, text="Load a labeled-data folder to view training frames.").grid(row=0, column=0, sticky="nsew")
+        ttk.Label(self.examine_plot_host, text="Load a data folder to view training frames.").grid(row=0, column=0, sticky="nsew")
 
         logs = ttk.Frame(self.examine_frame)
-        logs.grid(row=3, column=1, sticky="nsew", padx=(8, 0), pady=(4, 0))
+        logs.grid(row=4, column=1, sticky="nsew", padx=(8, 0), pady=(4, 0))
         logs.columnconfigure(0, weight=1)
         logs.rowconfigure(1, weight=1)
         ttk.Label(logs, text="Viewer Logs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
@@ -364,7 +436,7 @@ class ProjectSetupUI:
         self.examine_logs_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
 
         status = ttk.Frame(self.examine_frame)
-        status.grid(row=4, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        status.grid(row=5, column=0, columnspan=2, sticky="we", pady=(8, 0))
         ttk.Label(status, text="Status:").pack(side="left")
         ttk.Label(status, textvariable=self.examine_status_var).pack(side="left", padx=(8, 0))
 
@@ -397,7 +469,7 @@ class ProjectSetupUI:
         nested = sorted([p for p in base_dir.rglob("*") if p.is_dir() and cam_token in p.name.lower()])
         return nested[0] if nested else None
 
-    def _load_examine_labeled_data(self) -> None:
+    def _load_examine_labeled_data(self, preserve_file_label: str | None = None) -> None:
         base_dir = Path(self.examine_labeled_dir_var.get().strip())
         if not base_dir.exists() or not base_dir.is_dir():
             messagebox.showerror("Invalid folder", "Please select a valid data folder.")
@@ -425,19 +497,122 @@ class ProjectSetupUI:
 
         self._examine_labeled_dir_path = base_dir
         self._examine_cam_images = {"cam1": cam1_images, "cam2": cam2_images}
+        self._examine_cam_dirs = {"cam1": cam1_dir, "cam2": cam2_dir}
         self._examine_all_images = sorted(cam1_images + cam2_images, key=lambda p: p.name.lower())
         self._examine_data_files = {p.relative_to(base_dir).as_posix(): p for p in data_files}
 
         if self.examine_data_combo is not None:
             labels = list(self._examine_data_files.keys())
             self.examine_data_combo.configure(values=labels)
-            self.examine_data_file_var.set(labels[0])
+            if preserve_file_label and preserve_file_label in self._examine_data_files:
+                self.examine_data_file_var.set(preserve_file_label)
+            else:
+                self.examine_data_file_var.set(labels[0])
 
         self._append_examine_log(f"Loaded data folder: {base_dir}")
         self._append_examine_log(
             f"Detected point files: {len(self._examine_data_files)} | cam1 images: {len(cam1_images)} | cam2 images: {len(cam2_images)}"
         )
         self._on_examine_data_file_selected(None)
+
+    def _load_data_converters_module(self):
+        if self._data_converters_module is not None:
+            return self._data_converters_module
+
+        script_path = Path(__file__).resolve().parent / "data-converters.py"
+        if not script_path.exists():
+            raise FileNotFoundError(f"Could not find converter script: {script_path}")
+
+        spec = importlib.util.spec_from_file_location("data_converters_runtime", script_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load module spec from: {script_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._data_converters_module = module
+        return module
+
+    @staticmethod
+    def _detect_stack_type(image_dir: Path) -> str | None:
+        exts = {p.suffix.lower() for p in image_dir.iterdir() if p.is_file()}
+        if exts.intersection({".jpg", ".jpeg"}):
+            return "jpg"
+        if exts.intersection({".tif", ".tiff"}):
+            return "tiff"
+        return None
+
+    def _write_examine_avi_from_stacks(self) -> None:
+        base_dir = self._examine_labeled_dir_path
+        if base_dir is None or not base_dir.exists():
+            messagebox.showwarning("No data folder", "Load a data folder first.")
+            return
+
+        try:
+            fps = int(self.examine_avi_fps_var.get().strip())
+            if fps <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Invalid fps", "AVI fps must be a positive integer.")
+            return
+
+        cam1_dir = self._examine_cam_dirs.get("cam1")
+        cam2_dir = self._examine_cam_dirs.get("cam2")
+        if cam1_dir is None and cam2_dir is None:
+            messagebox.showwarning("No camera folders", "Load data so cam1/cam2 folders are detected first.")
+            return
+
+        try:
+            converters = self._load_data_converters_module()
+            jpg_to_avi = getattr(converters, "jpg_stack_to_avi")
+            tiff_to_avi = getattr(converters, "tiff_stack_to_avi")
+        except Exception as exc:
+            messagebox.showerror("Import failed", f"Could not import converters from data-converters.py:\n{exc}")
+            return
+
+        results: list[str] = []
+        errors: list[str] = []
+
+        for cam_name, cam_dir in (("cam1", cam1_dir), ("cam2", cam2_dir)):
+            if cam_dir is None or not cam_dir.exists():
+                continue
+
+            stack_type = self._detect_stack_type(cam_dir)
+            if stack_type is None:
+                errors.append(f"{cam_name}: no JPG/TIFF images found in {cam_dir}")
+                continue
+
+            output_path = base_dir / f"{cam_name}_stack.avi"
+            try:
+                if stack_type == "jpg":
+                    summary = jpg_to_avi(cam_dir, output_path, fps=fps)
+                else:
+                    summary = tiff_to_avi(cam_dir, output_path, fps=fps)
+                results.append(
+                    f"{cam_name}: wrote {summary.get('frames_written', 0)} frames ({stack_type}) -> {summary.get('output_path', output_path)}"
+                )
+            except Exception as exc:
+                errors.append(f"{cam_name}: {exc}")
+
+        for line in results:
+            self._append_examine_log(line)
+        for line in errors:
+            self._append_examine_log(f"ERROR {line}")
+
+        if results and not errors:
+            self.examine_status_var.set("AVI export complete")
+            messagebox.showinfo("AVI export complete", "\n".join(results))
+            return
+
+        if results and errors:
+            self.examine_status_var.set("AVI export completed with errors")
+            messagebox.showwarning(
+                "AVI export partial",
+                "Succeeded:\n" + "\n".join(results) + "\n\nErrors:\n" + "\n".join(errors),
+            )
+            return
+
+        self.examine_status_var.set("AVI export failed")
+        messagebox.showerror("AVI export failed", "\n".join(errors) if errors else "No camera stacks were processed.")
 
     def _on_examine_data_file_selected(self, _event: object | None) -> None:
         if self._examine_labeled_dir_path is None:
@@ -467,6 +642,90 @@ class ProjectSetupUI:
         self._render_examine_frame()
         self.examine_status_var.set("Viewer ready")
         self._append_examine_log(f"Loaded points file: {data_path.name} | rows={len(df)} | bodyparts={len(bp_map)}")
+
+    def _set_examine_trim_start_from_current(self) -> None:
+        if self.examine_frame_slider is None:
+            return
+        self.examine_trim_start_var.set(str(int(self.examine_frame_slider.get()) + 1))
+
+    def _set_examine_trim_end_from_current(self) -> None:
+        if self.examine_frame_slider is None:
+            return
+        self.examine_trim_end_var.set(str(int(self.examine_frame_slider.get()) + 1))
+
+    def _trim_examine_data(self) -> None:
+        if self._examine_df is None:
+            messagebox.showwarning("No data", "Load a points CSV first.")
+            return
+
+        selected_label = self.examine_data_file_var.get().strip()
+        csv_path = self._examine_data_files.get(selected_label)
+        if csv_path is None or not csv_path.exists():
+            messagebox.showerror("Missing CSV", "Selected points CSV was not found.")
+            return
+
+        nrows = len(self._examine_df)
+        if nrows <= 0:
+            messagebox.showwarning("No rows", "The selected CSV has no rows.")
+            return
+
+        try:
+            start = int(self.examine_trim_start_var.get().strip())
+            end = int(self.examine_trim_end_var.get().strip())
+        except Exception:
+            messagebox.showerror("Invalid range", "Trim start/end must be integers.")
+            return
+
+        start = max(1, min(start, nrows))
+        end = max(1, min(end, nrows))
+        if start > end:
+            messagebox.showerror("Invalid range", "Start frame must be <= end frame.")
+            return
+
+        cam1_images = self._examine_cam_images.get("cam1", [])
+        cam2_images = self._examine_cam_images.get("cam2", [])
+
+        cam1_delete = [p for i, p in enumerate(cam1_images, start=1) if i < start or i > end]
+        cam2_delete = [p for i, p in enumerate(cam2_images, start=1) if i < start or i > end]
+        rows_deleted = nrows - (end - start + 1)
+
+        confirm = messagebox.askyesno(
+            "Confirm trim",
+            (
+                f"This will permanently delete data outside frame range {start}..{end}.\n\n"
+                f"Rows to delete: {rows_deleted}\n"
+                f"cam1 images to delete: {len(cam1_delete)}\n"
+                f"cam2 images to delete: {len(cam2_delete)}\n\n"
+                "Proceed?"
+            ),
+            icon="warning",
+        )
+        if not confirm:
+            return
+
+        try:
+            trimmed_df = self._examine_df.iloc[start - 1 : end].copy()
+            trimmed_df.to_csv(csv_path, index=False)
+
+            deleted_count = 0
+            for p in cam1_delete + cam2_delete:
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
+                    deleted_count += 1
+
+            self._cached_examine_image.cache_clear()
+            self.examine_trim_start_var.set("1")
+            self.examine_trim_end_var.set(str(len(trimmed_df)))
+            self._append_examine_log(
+                f"Trim applied: kept frames {start}..{end}. Deleted rows={rows_deleted}, images={deleted_count}."
+            )
+            self._load_examine_labeled_data(preserve_file_label=selected_label)
+            messagebox.showinfo(
+                "Trim complete",
+                f"Kept frames {start}..{end}. Deleted rows={rows_deleted}, images={deleted_count}.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Trim failed", f"Could not trim dataset:\n{exc}")
 
     def _read_collecteddata_for_examine(self, path: Path) -> pd.DataFrame:
         if path.suffix.lower() == ".h5":
@@ -599,10 +858,14 @@ class ProjectSetupUI:
         if nrows == 0:
             self.examine_frame_slider.set(0)
             self.examine_frame_value_var.set("Frame: 0/0")
+            self.examine_trim_start_var.set("1")
+            self.examine_trim_end_var.set("1")
         else:
             cur = int(self.examine_frame_slider.get())
             if cur > upper:
                 self.examine_frame_slider.set(upper)
+            self.examine_trim_start_var.set("1")
+            self.examine_trim_end_var.set(str(nrows))
 
     def _ensure_examine_canvas(self) -> bool:
         if FigureCanvasTkAgg is None or self.examine_plot_host is None:
@@ -791,7 +1054,7 @@ class ProjectSetupUI:
             return
 
         if self._examine_im_artist is None:
-            self._examine_im_artist = ax.imshow(img, cmap="gray")
+            self._examine_im_artist = ax.imshow(img, cmap="gray", vmin=0, vmax=255)
         else:
             self._examine_im_artist.set_data(img)
 
@@ -827,7 +1090,7 @@ class ProjectSetupUI:
 
         ax.set_axis_off()
         ax.set_title(
-            f"Frame {row_idx + 1}/{len(self._examine_df)} | cam={selected_cam} | points={len(points)} | {image_path.name}",
+            f"Frame {row_idx }/{len(self._examine_df)} | cam={selected_cam} | points={len(points)} | {image_path.name}",
             fontsize=10,
         )
         fig.tight_layout()
