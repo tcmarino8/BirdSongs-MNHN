@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from functools import lru_cache
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -30,9 +31,10 @@ import pandas as pd
 import yaml
 
 try:
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 except Exception:  # pragma: no cover - optional dependency
     FigureCanvasTkAgg = None
+    NavigationToolbar2Tk = None
 
 from DLCsupport import (
     BIRD_BODYPARTS,
@@ -133,6 +135,36 @@ class ProjectSetupUI:
         self._eval_progress_phase = "analysis"
         self._info_bubble_windows: dict[str, tk.Toplevel] = {}
 
+        self.examine_frame: ttk.LabelFrame | None = None
+        self.examine_labeled_dir_var = tk.StringVar()
+        self.examine_data_file_var = tk.StringVar()
+        self.examine_camera_var = tk.StringVar(value="auto")
+        self.examine_point_size_var = tk.DoubleVar(value=42.0)
+        self.examine_show_labels_var = tk.BooleanVar(value=False)
+        self.examine_status_var = tk.StringVar(value="Idle")
+        self.examine_frame_value_var = tk.StringVar(value="Frame: 0/0")
+        self.examine_data_combo: ttk.Combobox | None = None
+        self.examine_plot_host: ttk.Frame | None = None
+        self.examine_logs_text: tk.Text | None = None
+        self.examine_frame_slider: tk.Scale | None = None
+        self.examine_play_button: ttk.Button | None = None
+        self._examine_data_files: dict[str, Path] = {}
+        self._examine_df: pd.DataFrame | None = None
+        self._examine_bp_map: dict[str, dict[str, object]] = {}
+        self._examine_labeled_dir_path: Path | None = None
+        self._examine_all_images: list[Path] = []
+        self._examine_cam_images: dict[str, list[Path]] = {"cam1": [], "cam2": []}
+        self._examine_playing = False
+        self._examine_play_after_id: str | None = None
+        self._examine_fig = None
+        self._examine_ax = None
+        self._examine_canvas = None
+        self._examine_toolbar = None
+        self._examine_im_artist = None
+        self._examine_scatter_artists: list = []
+        self._examine_text_artists: list = []
+        self._examine_scroll_cid = None
+
         self._build_start_page()
 
     def _clear_root_children(self) -> None:
@@ -141,6 +173,11 @@ class ProjectSetupUI:
 
     def _build_start_page(self) -> None:
         self.active_mode = "home"
+        self._examine_playing = False
+        if self._examine_play_after_id is not None:
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._examine_play_after_id)
+            self._examine_play_after_id = None
         self._clear_root_children()
 
         frame = ttk.Frame(self.root, padding=24)
@@ -160,8 +197,9 @@ class ProjectSetupUI:
 
         buttons = ttk.Frame(frame)
         buttons.pack(anchor="center")
-        ttk.Button(buttons, text="Train model", command=self._open_train_mode).pack(side="left", padx=10)
-        ttk.Button(buttons, text="Test model", command=self._open_test_mode).pack(side="left", padx=10)
+        ttk.Button(buttons, text="Train Model", command=self._open_train_mode).pack(side="left", padx=10)
+        ttk.Button(buttons, text="Test Model", command=self._open_test_mode).pack(side="left", padx=10)
+        ttk.Button(buttons, text="Examine Training Data", command=self._open_examine_training_mode).pack(side="left", padx=10)
 
     def _open_train_mode(self) -> None:
         self.active_mode = "train"
@@ -170,6 +208,633 @@ class ProjectSetupUI:
     def _open_test_mode(self) -> None:
         self.active_mode = "test"
         self._build_test_layout()
+
+    def _open_examine_training_mode(self) -> None:
+        self.active_mode = "examine"
+        self._build_examine_training_layout()
+
+    def _build_examine_training_layout(self) -> None:
+        self._examine_playing = False
+        if self._examine_play_after_id is not None:
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._examine_play_after_id)
+            self._examine_play_after_id = None
+        with contextlib.suppress(Exception):
+            if self._examine_fig is not None:
+                plt.close(self._examine_fig)
+        self._examine_fig = None
+        self._examine_ax = None
+        self._examine_canvas = None
+        self._examine_toolbar = None
+        self._examine_im_artist = None
+        self._examine_scatter_artists = []
+        self._examine_text_artists = []
+        self._examine_scroll_cid = None
+
+        self._clear_root_children()
+
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        page = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=page, anchor="nw")
+
+        def _on_page_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        page.bind("<Configure>", _on_page_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        ttk.Label(
+            page,
+            text="Examine Training Data",
+            font=("Segoe UI", 14, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Button(page, text="Back", command=self._build_start_page).grid(row=0, column=1, sticky="e", pady=(0, 12))
+
+        self.examine_frame = ttk.LabelFrame(
+            page,
+            text="Training Data Viewer",
+            padding=10,
+        )
+        self.examine_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.examine_frame.columnconfigure(0, weight=3)
+        self.examine_frame.columnconfigure(1, weight=2)
+        self.examine_frame.rowconfigure(4, weight=1)
+
+        controls = ttk.Frame(self.examine_frame)
+        controls.grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Data folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.examine_labeled_dir_var).grid(row=0, column=1, sticky="we", padx=(8, 8), pady=3)
+        ttk.Button(controls, text="Browse...", command=self._pick_examine_labeled_data_folder).grid(row=0, column=2, sticky="e", pady=3)
+        ttk.Button(controls, text="Load", command=self._load_examine_labeled_data).grid(row=0, column=3, sticky="e", pady=3, padx=(8, 0))
+
+        ttk.Label(controls, text="Points file").grid(row=1, column=0, sticky="w")
+        self.examine_data_combo = ttk.Combobox(
+            controls,
+            textvariable=self.examine_data_file_var,
+            state="readonly",
+            values=[],
+        )
+        self.examine_data_combo.grid(row=1, column=1, columnspan=3, sticky="we", padx=(8, 0), pady=3)
+        self.examine_data_combo.bind("<<ComboboxSelected>>", self._on_examine_data_file_selected)
+
+        viewer_controls = ttk.Frame(self.examine_frame)
+        viewer_controls.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 6))
+
+        ttk.Label(viewer_controls, text="Camera").pack(side="left")
+        cam_combo = ttk.Combobox(
+            viewer_controls,
+            textvariable=self.examine_camera_var,
+            values=["auto", "cam1", "cam2"],
+            state="readonly",
+            width=10,
+        )
+        cam_combo.pack(side="left", padx=(6, 12))
+        cam_combo.bind("<<ComboboxSelected>>", lambda _e: self._render_examine_frame())
+
+        ttk.Label(viewer_controls, text="Point size").pack(side="left")
+        point_size = tk.Scale(
+            viewer_controls,
+            from_=8,
+            to=140,
+            orient="horizontal",
+            resolution=1,
+            length=150,
+            variable=self.examine_point_size_var,
+            command=lambda _v: self._render_examine_frame(),
+        )
+        point_size.pack(side="left", padx=(6, 12))
+
+        ttk.Checkbutton(
+            viewer_controls,
+            text="Show labels",
+            variable=self.examine_show_labels_var,
+            command=self._render_examine_frame,
+        ).pack(side="left")
+
+        nav = ttk.Frame(self.examine_frame)
+        nav.grid(row=2, column=0, columnspan=2, sticky="we", pady=(2, 8))
+        nav.columnconfigure(2, weight=1)
+
+        ttk.Button(nav, text="<", width=4, command=lambda: self._render_examine_frame(delta=-1)).grid(row=0, column=0, sticky="w")
+
+        self.examine_play_button = ttk.Button(nav, text="Play", width=8, command=self._toggle_examine_play)
+        self.examine_play_button.grid(row=0, column=1, sticky="w", padx=(8, 8))
+
+        self.examine_frame_slider = tk.Scale(
+            nav,
+            from_=0,
+            to=0,
+            orient="horizontal",
+            resolution=1,
+            showvalue=False,
+            length=520,
+            command=lambda _v: self._render_examine_frame(),
+        )
+        self.examine_frame_slider.grid(row=0, column=2, sticky="we")
+
+        ttk.Button(nav, text=">", width=4, command=lambda: self._render_examine_frame(delta=1)).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ttk.Label(nav, textvariable=self.examine_frame_value_var).grid(row=0, column=4, sticky="e", padx=(10, 0))
+
+        self.examine_plot_host = ttk.Frame(self.examine_frame)
+        self.examine_plot_host.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(4, 0))
+        self.examine_plot_host.columnconfigure(0, weight=1)
+        self.examine_plot_host.rowconfigure(0, weight=1)
+        ttk.Label(self.examine_plot_host, text="Load a labeled-data folder to view training frames.").grid(row=0, column=0, sticky="nsew")
+
+        logs = ttk.Frame(self.examine_frame)
+        logs.grid(row=3, column=1, sticky="nsew", padx=(8, 0), pady=(4, 0))
+        logs.columnconfigure(0, weight=1)
+        logs.rowconfigure(1, weight=1)
+        ttk.Label(logs, text="Viewer Logs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.examine_logs_text = tk.Text(logs, wrap="word", height=20)
+        self.examine_logs_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        status = ttk.Frame(self.examine_frame)
+        status.grid(row=4, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        ttk.Label(status, text="Status:").pack(side="left")
+        ttk.Label(status, textvariable=self.examine_status_var).pack(side="left", padx=(8, 0))
+
+        page.columnconfigure(0, weight=1)
+
+    def _append_examine_log(self, message: str) -> None:
+        if self.examine_logs_text is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.examine_logs_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.examine_logs_text.see(tk.END)
+
+    def _pick_examine_labeled_data_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select data folder (cam1 folder, cam2 folder, and csv)")
+        if selected:
+            self.examine_labeled_dir_var.set(selected)
+
+    @staticmethod
+    def _collect_examine_images(image_dir: Path) -> list[Path]:
+        image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        images = [p for p in image_dir.rglob("*") if p.is_file() and p.suffix.lower() in image_exts]
+        return sorted(images, key=lambda p: p.name.lower())
+
+    @staticmethod
+    def _find_cam_dir(base_dir: Path, cam_token: str) -> Path | None:
+        direct = sorted([p for p in base_dir.iterdir() if p.is_dir() and cam_token in p.name.lower()])
+        if direct:
+            return direct[0]
+
+        nested = sorted([p for p in base_dir.rglob("*") if p.is_dir() and cam_token in p.name.lower()])
+        return nested[0] if nested else None
+
+    def _load_examine_labeled_data(self) -> None:
+        base_dir = Path(self.examine_labeled_dir_var.get().strip())
+        if not base_dir.exists() or not base_dir.is_dir():
+            messagebox.showerror("Invalid folder", "Please select a valid data folder.")
+            return
+
+        data_files = sorted(base_dir.rglob("*.csv"))
+        if not data_files:
+            messagebox.showerror("Missing points", "No CSV files were found in the selected folder.")
+            return
+
+        cam1_dir = self._find_cam_dir(base_dir, "cam1")
+        cam2_dir = self._find_cam_dir(base_dir, "cam2")
+        if cam1_dir is None or cam2_dir is None:
+            messagebox.showerror(
+                "Missing camera folders",
+                "Expected both cam1 and cam2 image folders under the selected data folder.",
+            )
+            return
+
+        cam1_images = self._collect_examine_images(cam1_dir)
+        cam2_images = self._collect_examine_images(cam2_dir)
+        if not cam1_images and not cam2_images:
+            messagebox.showerror("Missing images", "No images found in cam1/cam2 folders.")
+            return
+
+        self._examine_labeled_dir_path = base_dir
+        self._examine_cam_images = {"cam1": cam1_images, "cam2": cam2_images}
+        self._examine_all_images = sorted(cam1_images + cam2_images, key=lambda p: p.name.lower())
+        self._examine_data_files = {p.relative_to(base_dir).as_posix(): p for p in data_files}
+
+        if self.examine_data_combo is not None:
+            labels = list(self._examine_data_files.keys())
+            self.examine_data_combo.configure(values=labels)
+            self.examine_data_file_var.set(labels[0])
+
+        self._append_examine_log(f"Loaded data folder: {base_dir}")
+        self._append_examine_log(
+            f"Detected point files: {len(self._examine_data_files)} | cam1 images: {len(cam1_images)} | cam2 images: {len(cam2_images)}"
+        )
+        self._on_examine_data_file_selected(None)
+
+    def _on_examine_data_file_selected(self, _event: object | None) -> None:
+        if self._examine_labeled_dir_path is None:
+            return
+        selected = self.examine_data_file_var.get().strip()
+        if not selected:
+            return
+        data_path = self._examine_data_files.get(selected)
+        if data_path is None:
+            return
+
+        try:
+            df = self._read_collecteddata_for_examine(data_path)
+            if df.empty:
+                raise ValueError("The selected CollectedData file is empty.")
+            bp_map = self._build_examine_bp_coord_map(df)
+            if not bp_map:
+                raise ValueError("No x/y point columns could be parsed from the selected CollectedData file.")
+        except Exception as exc:
+            messagebox.showerror("Load failed", f"Could not parse points file:\n{exc}")
+            self.examine_status_var.set("Failed to parse points file")
+            return
+
+        self._examine_df = df
+        self._examine_bp_map = bp_map
+        self._update_examine_frame_bounds()
+        self._render_examine_frame()
+        self.examine_status_var.set("Viewer ready")
+        self._append_examine_log(f"Loaded points file: {data_path.name} | rows={len(df)} | bodyparts={len(bp_map)}")
+
+    def _read_collecteddata_for_examine(self, path: Path) -> pd.DataFrame:
+        if path.suffix.lower() == ".h5":
+            return pd.read_hdf(path)
+
+        flat_df = pd.read_csv(path)
+        if self._is_truth_style_flat_df(flat_df):
+            self._append_examine_log("Detected truth-style flat CSV schema (bodypart_camX_[X|Y]).")
+            return flat_df
+
+        try:
+            wide_df = pd.read_csv(path, header=[0, 1, 2], index_col=0)
+            levels = self._detect_bodypart_coord_levels(wide_df)
+            if levels is not None and not wide_df.empty:
+                return wide_df
+        except Exception:
+            pass
+
+        return flat_df
+
+    def _is_truth_style_flat_df(self, df: pd.DataFrame) -> bool:
+        parsed = []
+        for col in df.columns:
+            match = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XYxy])$", str(col))
+            if match is None:
+                continue
+            parsed.append((match.group("bodypart"), match.group("cam"), match.group("coord").upper()))
+
+        if not parsed:
+            return False
+
+        parsed_df = pd.DataFrame(parsed, columns=["bodypart", "cam", "coord"])
+        cams = set(parsed_df["cam"].unique().tolist())
+        coords = set(parsed_df["coord"].unique().tolist())
+        return cams.issuperset({"1", "2"}) and coords.issuperset({"X", "Y"})
+
+    def _build_examine_bp_coord_map(self, df: pd.DataFrame) -> dict[str, dict[str, object]]:
+        mapping: dict[str, dict[str, object]] = {}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            for col in df.columns:
+                parts = [str(p) for p in col]
+                coord = None
+                for p in reversed(parts):
+                    lp = p.lower()
+                    if lp in {"x", "y"}:
+                        coord = lp
+                        break
+                if coord is None:
+                    continue
+
+                bodypart = None
+                if "bodyparts" in df.columns.names:
+                    try:
+                        idx = df.columns.names.index("bodyparts")
+                        bodypart = str(col[idx])
+                    except Exception:
+                        bodypart = None
+                if not bodypart:
+                    bodypart = parts[1] if len(parts) > 1 else parts[0]
+
+                rec = mapping.setdefault(bodypart, {"x": [], "y": [], "camera": "any"})
+                rec[coord].append(col)
+            return mapping
+
+        for col in df.columns:
+            match = re.match(r"^(?P<bp>.+)_cam(?P<cam>[12])_(?P<coord>[XYxy])$", str(col))
+            if match:
+                bp = match.group("bp")
+                cam = f"cam{match.group('cam')}"
+                coord = match.group("coord").lower()
+                key = f"{bp}_{cam}"
+                rec = mapping.setdefault(key, {"x": [], "y": [], "camera": cam})
+                rec[coord].append(col)
+                continue
+
+            simple = re.match(r"^(?P<bp>.+)_(?P<coord>[XYxy])$", str(col))
+            if simple:
+                bp = simple.group("bp")
+                coord = simple.group("coord").lower()
+                rec = mapping.setdefault(bp, {"x": [], "y": [], "camera": "any"})
+                rec[coord].append(col)
+
+        return mapping
+
+    @staticmethod
+    def _first_finite_from_cols(row: pd.Series, cols: list) -> float | None:
+        for c in cols:
+            try:
+                v = pd.to_numeric(row[c], errors="coerce")
+            except Exception:
+                continue
+            if pd.notna(v):
+                vf = float(v)
+                if vf == vf:
+                    return vf
+        return None
+
+    def _get_examine_filtered_images(self) -> list[Path]:
+        cam = self.examine_camera_var.get().strip().lower()
+        if cam == "cam1":
+            return self._examine_cam_images.get("cam1", []) or self._examine_all_images
+        if cam == "cam2":
+            return self._examine_cam_images.get("cam2", []) or self._examine_all_images
+        # Auto mode defaults to cam1 sequence when available.
+        return self._examine_cam_images.get("cam1", []) or self._examine_all_images
+
+    def _resolve_examine_image_for_row(self, row_idx: int) -> Path | None:
+        if self._examine_df is None or self._examine_labeled_dir_path is None:
+            return None
+        if row_idx < 0 or row_idx >= len(self._examine_df):
+            return None
+
+        row_id = str(self._examine_df.index[row_idx])
+        resolved = self._resolve_labeled_image_from_row_id(self._examine_labeled_dir_path, row_id)
+        if resolved is not None and resolved.exists():
+            return resolved
+
+        images = self._get_examine_filtered_images()
+        if 0 <= row_idx < len(images):
+            return images[row_idx]
+        return None
+
+    def _update_examine_frame_bounds(self) -> None:
+        if self.examine_frame_slider is None:
+            return
+        nrows = len(self._examine_df) if self._examine_df is not None else 0
+        upper = max(0, nrows - 1)
+        self.examine_frame_slider.configure(from_=0, to=upper)
+        if nrows == 0:
+            self.examine_frame_slider.set(0)
+            self.examine_frame_value_var.set("Frame: 0/0")
+        else:
+            cur = int(self.examine_frame_slider.get())
+            if cur > upper:
+                self.examine_frame_slider.set(upper)
+
+    def _ensure_examine_canvas(self) -> bool:
+        if FigureCanvasTkAgg is None or self.examine_plot_host is None:
+            self.examine_status_var.set("Matplotlib Tk backend unavailable")
+            return False
+
+        if self._examine_canvas is not None:
+            return True
+
+        for child in self.examine_plot_host.winfo_children():
+            child.destroy()
+
+        self._examine_fig, self._examine_ax = plt.subplots(figsize=(8.8, 6.2))
+
+        canvas_host = ttk.Frame(self.examine_plot_host)
+        canvas_host.grid(row=0, column=0, sticky="nsew")
+        canvas_host.columnconfigure(0, weight=1)
+        canvas_host.rowconfigure(0, weight=1)
+
+        self._examine_canvas = FigureCanvasTkAgg(self._examine_fig, master=canvas_host)
+        widget = self._examine_canvas.get_tk_widget()
+        widget.grid(row=0, column=0, sticky="nsew")
+
+        if NavigationToolbar2Tk is not None:
+            toolbar_host = ttk.Frame(self.examine_plot_host)
+            toolbar_host.grid(row=1, column=0, sticky="we", pady=(4, 0))
+            self._examine_toolbar = NavigationToolbar2Tk(self._examine_canvas, toolbar_host, pack_toolbar=False)
+            self._examine_toolbar.update()
+            self._examine_toolbar.pack(side=tk.LEFT, fill=tk.X)
+            self._append_examine_log("Tip: Use toolbar Zoom/Pan/Home for robust interaction.")
+
+        # Fallback wheel binding for Tk on Windows where mpl scroll_event may be inconsistent.
+        widget.bind("<MouseWheel>", self._on_examine_tk_mousewheel)
+        widget.bind("<Button-4>", self._on_examine_tk_mousewheel)  # Linux scroll up
+        widget.bind("<Button-5>", self._on_examine_tk_mousewheel)  # Linux scroll down
+
+        self._examine_scroll_cid = self._examine_fig.canvas.mpl_connect("scroll_event", self._on_examine_scroll_zoom)
+        return True
+
+    def _zoom_examine_at(self, xdata: float, ydata: float, direction: int) -> None:
+        ax = self._examine_ax
+        fig = self._examine_fig
+        if ax is None or fig is None:
+            return
+
+        cur_xlim = ax.get_xlim()
+        cur_ylim = ax.get_ylim()
+        scale_base = 1.2
+        scale = 1.0 / scale_base if direction > 0 else scale_base
+
+        width = (cur_xlim[1] - cur_xlim[0]) * scale
+        height = (cur_ylim[1] - cur_ylim[0]) * scale
+        relx = (cur_xlim[1] - xdata) / max(cur_xlim[1] - cur_xlim[0], 1e-9)
+        rely = (cur_ylim[1] - ydata) / max(cur_ylim[1] - cur_ylim[0], 1e-9)
+
+        ax.set_xlim([xdata - width * (1 - relx), xdata + width * relx])
+        ax.set_ylim([ydata - height * (1 - rely), ydata + height * rely])
+        fig.canvas.draw_idle()
+
+    def _on_examine_tk_mousewheel(self, event: object) -> None:
+        ax = self._examine_ax
+        fig = self._examine_fig
+        canvas = self._examine_canvas
+        if ax is None or fig is None or canvas is None:
+            return
+
+        # Convert Tk pixel coordinates to Matplotlib data coordinates.
+        xpix = float(getattr(event, "x", 0.0))
+        ypix = float(getattr(event, "y", 0.0))
+        inv = ax.transData.inverted()
+        xdata, ydata = inv.transform((xpix, ypix))
+
+        raw_num = getattr(event, "num", 0)
+        raw_delta = getattr(event, "delta", 0)
+
+        # Some Tk backends report placeholders like '??' for unset fields.
+        try:
+            num = int(raw_num)
+        except Exception:
+            num = 0
+        try:
+            delta = int(raw_delta)
+        except Exception:
+            delta = 0
+
+        if delta == 0 and num == 0:
+            return
+
+        direction = 1 if (delta > 0 or num == 4) else -1
+        self._zoom_examine_at(float(xdata), float(ydata), direction)
+
+    def _on_examine_scroll_zoom(self, event: object) -> None:
+        ax = self._examine_ax
+        if ax is None:
+            return
+        if getattr(event, "inaxes", None) != ax:
+            return
+
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if xdata is None or ydata is None:
+            return
+
+        button = getattr(event, "button", "up")
+        if button == "up":
+            direction = 1
+        elif button == "down":
+            direction = -1
+        else:
+            step = float(getattr(event, "step", 0.0) or 0.0)
+            if step == 0:
+                return
+            direction = 1 if step > 0 else -1
+
+        self._zoom_examine_at(float(xdata), float(ydata), direction)
+
+    def _toggle_examine_play(self) -> None:
+        if self._examine_df is None or self.examine_frame_slider is None:
+            return
+        self._examine_playing = not self._examine_playing
+        if self.examine_play_button is not None:
+            self.examine_play_button.configure(text="Pause" if self._examine_playing else "Play")
+        if self._examine_playing:
+            self._tick_examine_play()
+        elif self._examine_play_after_id is not None:
+            self.root.after_cancel(self._examine_play_after_id)
+            self._examine_play_after_id = None
+
+    def _tick_examine_play(self) -> None:
+        if not self._examine_playing or self.examine_frame_slider is None or self._examine_df is None:
+            return
+
+        cur = int(self.examine_frame_slider.get())
+        max_idx = max(0, len(self._examine_df) - 1)
+        if cur >= max_idx:
+            self._examine_playing = False
+            if self.examine_play_button is not None:
+                self.examine_play_button.configure(text="Play")
+            return
+
+        self.examine_frame_slider.set(cur + 1)
+        self._render_examine_frame()
+        self._examine_play_after_id = self.root.after(65, self._tick_examine_play)
+
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def _cached_examine_image(path_str: str):
+        return plt.imread(path_str)
+
+    def _render_examine_frame(self, delta: int = 0) -> None:
+        if self._examine_df is None or self.examine_frame_slider is None:
+            return
+        if not self._ensure_examine_canvas():
+            return
+
+        if delta:
+            cur = int(self.examine_frame_slider.get()) + int(delta)
+            cur = max(0, min(cur, max(0, len(self._examine_df) - 1)))
+            self.examine_frame_slider.set(cur)
+
+        row_idx = int(self.examine_frame_slider.get())
+        image_path = self._resolve_examine_image_for_row(row_idx)
+        if image_path is None:
+            self.examine_status_var.set("No matching image for selected frame")
+            return
+
+        row = self._examine_df.iloc[row_idx]
+        selected_cam = self.examine_camera_var.get().strip().lower()
+        if selected_cam == "auto":
+            selected_cam = self._infer_camera_from_name(image_path.name)
+        points: list[tuple[str, float, float]] = []
+        for bp, rec in self._examine_bp_map.items():
+            cam = str(rec.get("camera", "any")).lower()
+            if selected_cam in {"cam1", "cam2"} and cam not in {"any", selected_cam}:
+                continue
+            x = self._first_finite_from_cols(row, list(rec.get("x", [])))
+            y = self._first_finite_from_cols(row, list(rec.get("y", [])))
+            if x is None or y is None:
+                continue
+            points.append((str(bp), float(x), float(y)))
+
+        img = self._cached_examine_image(str(image_path))
+        ax = self._examine_ax
+        fig = self._examine_fig
+        if ax is None or fig is None:
+            return
+
+        if self._examine_im_artist is None:
+            self._examine_im_artist = ax.imshow(img, cmap="gray")
+        else:
+            self._examine_im_artist.set_data(img)
+
+        for art in self._examine_scatter_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        for art in self._examine_text_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._examine_scatter_artists = []
+        self._examine_text_artists = []
+
+        cmap = plt.get_cmap("tab20")
+        size = float(self.examine_point_size_var.get())
+        for i, (bp, x, y) in enumerate(points):
+            color = cmap(i % cmap.N)
+            scat = ax.scatter(x, y, s=size, color=color, edgecolors="white", linewidths=0.6, alpha=0.95)
+            self._examine_scatter_artists.append(scat)
+            if self.examine_show_labels_var.get():
+                txt = ax.text(
+                    x + 2,
+                    y + 2,
+                    bp,
+                    fontsize=8,
+                    color=color,
+                    bbox=dict(facecolor="white", alpha=0.45, edgecolor="none", pad=0.2),
+                )
+                self._examine_text_artists.append(txt)
+
+        ax.set_axis_off()
+        ax.set_title(
+            f"Frame {row_idx + 1}/{len(self._examine_df)} | cam={selected_cam} | points={len(points)} | {image_path.name}",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+        self.examine_frame_value_var.set(f"Frame: {row_idx + 1}/{len(self._examine_df)}")
+        self.examine_status_var.set(f"Displaying {image_path.name} with {len(points)} points")
 
     def _build_test_layout(self) -> None:
         self._clear_root_children()
