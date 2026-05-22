@@ -138,9 +138,9 @@ BIRD_BODYPARTS: dict[str, list[str]] = {
         "Keel_Marker_Left_Inferior", 
         "Keel_Marker_Right_Superior", 
         "Keel_Marker_Right_Inferior", 
-        "Pelvis_Marker_Left", 
-        "Pelvis_Marker_Right_Superior", 
-        "Pelvis_Marker_Right_Inferior", 
+        "Pelvis_Marker_Right", 
+        "Pelvis_Marker_Left_Superior", 
+        "Pelvis_Marker_Left_Inferior", 
         "Maxilla_Marker_Right_Anterior"
     ],
     "DavidBowie": [

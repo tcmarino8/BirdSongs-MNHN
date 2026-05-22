@@ -41,8 +41,10 @@ from DLCsupport import (
     BIRD_BODYPARTS,
     build_combined_dataset,
     create_combined_project_if_missing,
+    edit_bodyparts_in_config,
     ensure_config_scorer_matches_data,
     find_latest_snapshot,
+    load_bodyparts,
     set_net_type,
 )
 
@@ -87,11 +89,28 @@ class ProjectSetupUI:
         self.xy_long_text: tk.Text | None = None
         self.image_preview_label: ttk.Label | None = None
         self.image_info_label: ttk.Label | None = None
+        self.step3_frame_value_var = tk.StringVar(value="Frame: 0/0")
+        self.step3_show_labels_var = tk.BooleanVar(value=True)
+        self.step3_point_size_var = tk.DoubleVar(value=34.0)
+        self.step3_frame_slider: tk.Scale | None = None
+        self.step3_plot_host: ttk.Frame | None = None
+        self._step3_df: pd.DataFrame | None = None
+        self._step3_csv_path: Path | None = None
+        self._step3_labeled_dir: Path | None = None
+        self._step3_dataset_dir: Path | None = None
+        self._step3_all_images: list[Path] = []
+        self._step3_image_paths: list[Path | None] = []
+        self._step3_fig = None
+        self._step3_ax = None
+        self._step3_canvas = None
+        self._step3_toolbar = None
+        self._step3_im_artist = None
+        self._step3_scatter_artists: list = []
+        self._step3_text_artists: list = []
         self._preview_photo = None
 
         self.step4_frame: ttk.LabelFrame | None = None
         self.train_mode_var = tk.StringVar(value="testtrain")
-        self.log_interval_var = tk.StringVar(value="10")
         self.train_status_var = tk.StringVar(value="Idle")
         self.train_progress: ttk.Progressbar | None = None
         self.train_logs_text: tk.Text | None = None
@@ -174,10 +193,15 @@ class ProjectSetupUI:
         self._build_start_page()
 
     def _clear_root_children(self) -> None:
+        """Destroy all root children before rebuilding the active page."""
         for child in self.root.winfo_children():
             child.destroy()
 
+    # =====================================================================
+    # PAGE: HOME / WORKFLOW LAUNCHER
+    # =====================================================================
     def _build_start_page(self) -> None:
+        """Render the home launcher page used to enter train/test/examine flows."""
         self.active_mode = "home"
         self._examine_playing = False
         if self._examine_play_after_id is not None:
@@ -208,18 +232,25 @@ class ProjectSetupUI:
         ttk.Button(buttons, text="Examine Training Data", command=self._open_examine_training_mode).pack(side="left", padx=10)
 
     def _open_train_mode(self) -> None:
+        """Switch to the training workflow page stack (Steps 1-4)."""
         self.active_mode = "train"
         self._build_layout()
 
     def _open_test_mode(self) -> None:
+        """Switch to the testing/evaluation workflow page stack (Steps 5-7)."""
         self.active_mode = "test"
         self._build_test_layout()
 
     def _open_examine_training_mode(self) -> None:
+        """Switch to the standalone training-data examination page."""
         self.active_mode = "examine"
         self._build_examine_training_layout()
 
+    # =====================================================================
+    # PAGE: EXAMINE TRAINING DATA
+    # =====================================================================
     def _build_examine_training_layout(self) -> None:
+        """Build the interactive examine page for browsing, trimming, and exporting stacks."""
         self._examine_playing = False
         if self._examine_play_after_id is not None:
             with contextlib.suppress(Exception):
@@ -470,6 +501,7 @@ class ProjectSetupUI:
         return nested[0] if nested else None
 
     def _load_examine_labeled_data(self, preserve_file_label: str | None = None) -> None:
+        """Load a generic examine folder and bind CSV + cam1/cam2 image stacks to the viewer."""
         base_dir = Path(self.examine_labeled_dir_var.get().strip())
         if not base_dir.exists() or not base_dir.is_dir():
             messagebox.showerror("Invalid folder", "Please select a valid data folder.")
@@ -654,6 +686,7 @@ class ProjectSetupUI:
         self.examine_trim_end_var.set(str(int(self.examine_frame_slider.get()) + 1))
 
     def _trim_examine_data(self) -> None:
+        """Destructively trim CSV rows and camera images outside the selected frame range."""
         if self._examine_df is None:
             messagebox.showwarning("No data", "Load a points CSV first.")
             return
@@ -1099,7 +1132,11 @@ class ProjectSetupUI:
         self.examine_frame_value_var.set(f"Frame: {row_idx + 1}/{len(self._examine_df)}")
         self.examine_status_var.set(f"Displaying {image_path.name} with {len(points)} points")
 
+    # =====================================================================
+    # PAGE: TEST WORKFLOW (STEPS 5-7)
+    # =====================================================================
     def _build_test_layout(self) -> None:
+        """Build the test/evaluation page and attach Step 5-7 sections."""
         self._clear_root_children()
 
         outer = ttk.Frame(self.root)
@@ -1136,7 +1173,12 @@ class ProjectSetupUI:
         self._ensure_step5_section()
         self._ensure_step6_section()
         self._ensure_step7_section()
+
+    # =====================================================================
+    # PAGE: TRAIN WORKFLOW (STEPS 1-4)
+    # =====================================================================
     def _build_layout(self) -> None:
+        """Build the training page and initialize Step 1 UI immediately."""
         self._clear_root_children()
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True)
@@ -1292,6 +1334,7 @@ class ProjectSetupUI:
         self.page.columnconfigure(0, weight=1)
 
     def _pick_existing_config(self) -> None:
+        """Prompt the user to select an existing DLC project config file."""
         selected = filedialog.askopenfilename(
             title="Select existing DLC config.yaml",
             filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
@@ -1336,6 +1379,7 @@ class ProjectSetupUI:
         }
 
     def _load_existing_project(self) -> None:
+        """Load an existing project and repopulate wizard state from config.yaml."""
         config_path = Path(self.existing_config_var.get().strip())
         if not config_path.exists() or config_path.name.lower() not in {"config.yaml", "config.yml"}:
             messagebox.showerror("Invalid config", "Please choose an existing project config.yaml file.")
@@ -1392,11 +1436,13 @@ class ProjectSetupUI:
             self.output.insert(tk.END, details)
 
     def _pick_project_parent(self) -> None:
+        """Pick the parent folder where the combined project root will be created."""
         selected = filedialog.askdirectory(title="Select parent folder for combined project root")
         if selected:
             self.project_parent_dir.set(selected)
 
     def _pick_dummy_video_folder(self) -> None:
+        """Pick a folder containing placeholder AVI files for project initialization."""
         selected = filedialog.askdirectory(title="Select folder containing dummy .avi files")
         if not selected:
             return
@@ -1451,6 +1497,7 @@ class ProjectSetupUI:
         return task, experimenter, combined_project_root, dummy_video, parent
 
     def _create_project_and_build_dict(self) -> None:
+        """Create/reuse a DLC project, then build and display the starter workflow dictionary."""
         validated = self._validate_inputs()
         if validated is None:
             return
@@ -1512,6 +1559,7 @@ class ProjectSetupUI:
             idx = f"{key_end}+1c"
 
     def _save_dict_json(self) -> None:
+        """Save the current starter dictionary to disk as JSON."""
         if not self.current_project_dict:
             messagebox.showwarning("Nothing to save", "Create a project dictionary first.")
             return
@@ -1532,7 +1580,11 @@ class ProjectSetupUI:
     def _clear_output(self) -> None:
         self.output.delete("1.0", tk.END)
 
+    # =====================================================================
+    # STEP 2: BODY PARTS + CONFIG PREVIEW
+    # =====================================================================
     def _ensure_step2_section(self) -> None:
+        """Create Step 2 controls for bodypart editing and config preview."""
         if self.step2_frame is not None:
             return
 
@@ -1616,7 +1668,11 @@ class ProjectSetupUI:
         preview_btn_row.grid(row=2, column=0, sticky="w")
         ttk.Button(preview_btn_row, text="Refresh Config Preview", command=self._refresh_config_preview).pack(side="left")
 
+    # =====================================================================
+    # STEP 3: DATASET BUILD + FRAME BROWSER
+    # =====================================================================
     def _ensure_step3_section(self) -> None:
+        """Create Step 3 controls for dataset creation and interactive frame review."""
         if self.step3_frame is not None:
             return
 
@@ -1694,6 +1750,7 @@ class ProjectSetupUI:
         action = ttk.Frame(self.step3_frame)
         action.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 8))
         ttk.Button(action, text="Create Training Dataset(s)", command=self._create_training_datasets).pack(side="left")
+        ttk.Button(action, text="Load Existing Frame Browser", command=self._refresh_step3_browser_from_disk).pack(side="left", padx=(8, 0))
 
         left = ttk.Frame(self.step3_frame)
         left.grid(row=3, column=0, sticky="nsew", padx=(0, 8))
@@ -1712,14 +1769,65 @@ class ProjectSetupUI:
         right = ttk.Frame(self.step3_frame)
         right.grid(row=3, column=1, sticky="nsew", padx=(8, 0))
         right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
 
-        ttk.Label(right, text="First Training Image", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
-        self.image_preview_label = ttk.Label(right, text="No preview yet", anchor="center")
-        self.image_preview_label.grid(row=1, column=0, sticky="nsew", pady=(4, 6))
-        self.image_info_label = ttk.Label(right, text="", wraplength=360, justify="left")
-        self.image_info_label.grid(row=2, column=0, sticky="w")
+        ttk.Label(right, text="Training Frame Browser", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
 
+        nav = ttk.Frame(right)
+        nav.grid(row=1, column=0, sticky="we", pady=(4, 4))
+        nav.columnconfigure(1, weight=1)
+        ttk.Button(nav, text="<", width=4, command=lambda: self._render_step3_frame(delta=-1)).grid(row=0, column=0, sticky="w")
+        ttk.Label(nav, textvariable=self.step3_frame_value_var, anchor="center").grid(row=0, column=1, sticky="we")
+        ttk.Button(nav, text=">", width=4, command=lambda: self._render_step3_frame(delta=1)).grid(row=0, column=2, sticky="e")
+
+        self.step3_frame_slider = tk.Scale(
+            nav,
+            from_=0,
+            to=0,
+            orient="horizontal",
+            command=lambda _v: self._render_step3_frame(),
+            showvalue=False,
+            resolution=1,
+        )
+        self.step3_frame_slider.grid(row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
+
+        style_row = ttk.Frame(nav)
+        style_row.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        style_row.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(
+            style_row,
+            text="Show labels",
+            variable=self.step3_show_labels_var,
+            command=self._render_step3_frame,
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(style_row, text="Point size").grid(row=0, column=1, sticky="w", padx=(12, 4))
+        tk.Scale(
+            style_row,
+            from_=6,
+            to=80,
+            orient="horizontal",
+            variable=self.step3_point_size_var,
+            resolution=1,
+            showvalue=True,
+            command=lambda _v: self._render_step3_frame(),
+            length=220,
+        ).grid(row=0, column=2, columnspan=2, sticky="we")
+
+        self.step3_plot_host = ttk.Frame(right)
+        self.step3_plot_host.grid(row=2, column=0, sticky="nsew", pady=(4, 6))
+        self.step3_plot_host.columnconfigure(0, weight=1)
+        self.step3_plot_host.rowconfigure(0, weight=1)
+
+        self.image_info_label = ttk.Label(right, text="", wraplength=420, justify="left")
+        self.image_info_label.grid(row=3, column=0, sticky="w")
+
+    # =====================================================================
+    # STEP 4: TRAINING
+    # =====================================================================
     def _ensure_step4_section(self) -> None:
+        """Create Step 4 controls for ResNet50 training and progress logging."""
         if self.step4_frame is not None:
             return
 
@@ -1735,14 +1843,14 @@ class ProjectSetupUI:
             self.step4_frame,
             text=(
                 "Follows notebook Cell 7 pattern: set net type to resnet_50 and train with mode "
-                "fulltrain|testtrain. Progress is logged at selected checkpoints."
+                "fulltrain|testtrain. Uses DeepLabCut native training logs for progress output."
             ),
         )
         helper.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         controls = ttk.Frame(self.step4_frame)
         controls.grid(row=1, column=0, sticky="we")
-        controls.columnconfigure(5, weight=1)
+        controls.columnconfigure(3, weight=1)
 
         train_mode_row = ttk.Frame(controls)
         train_mode_row.grid(row=0, column=0, sticky="w")
@@ -1769,32 +1877,7 @@ class ProjectSetupUI:
         )
         mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 16))
 
-        interval_row = ttk.Frame(controls)
-        interval_row.grid(row=0, column=2, sticky="w")
-        ttk.Label(interval_row, text="Log Interval (epochs)").pack(side="left")
-        interval_info_btn = ttk.Button(interval_row, text="(i)")
-        interval_info_btn.pack(side="left", padx=(4, 0))
-        interval_info_btn.configure(
-            command=lambda w=interval_info_btn: self._toggle_info_bubble(
-                key="step4_log_interval",
-                anchor_widget=w,
-                title="Log Interval (epochs)",
-                message=(
-                    "How often training reports are shown. "
-                    "An epoch is one training iteration where the model sees the entirety of the training data."
-                ),
-            )
-        )
-        interval_combo = ttk.Combobox(
-            controls,
-            textvariable=self.log_interval_var,
-            values=["10"],
-            state="readonly",
-            width=10,
-        )
-        interval_combo.grid(row=0, column=3, sticky="w", padx=(8, 16))
-
-        ttk.Button(controls, text="Train Model", command=self._start_training).grid(row=0, column=4, sticky="w")
+        ttk.Button(controls, text="Train Model", command=self._start_training).grid(row=0, column=2, sticky="w")
 
         status_row = ttk.Frame(self.step4_frame)
         status_row.grid(row=2, column=0, sticky="we", pady=(8, 4))
@@ -1809,7 +1892,11 @@ class ProjectSetupUI:
         self.train_logs_text = tk.Text(self.step4_frame, wrap="word", height=12)
         self.train_logs_text.grid(row=5, column=0, sticky="nsew", pady=(4, 0))
 
+    # =====================================================================
+    # STEP 5: TEST CONFIG + SNAPSHOT SELECTION
+    # =====================================================================
     def _ensure_step5_section(self) -> None:
+        """Create Step 5 controls for selecting config/model snapshot used in testing."""
         if self.step5_frame is not None:
             return
 
@@ -2229,7 +2316,11 @@ class ProjectSetupUI:
             self.eval_config_text.delete("1.0", tk.END)
             self.eval_config_text.insert(tk.END, f"Failed to read config:\n{exc}")
 
+    # =====================================================================
+    # STEP 6: INFERENCE + ANALYSIS
+    # =====================================================================
     def _ensure_step6_section(self) -> None:
+        """Create Step 6 controls for inference, data loading, and plotting."""
         if self.step6_frame is not None:
             return
 
@@ -2284,7 +2375,11 @@ class ProjectSetupUI:
         ttk.Label(self.step6_frame, text="Use Step 7 to load and plot results.").grid(row=5, column=0, sticky="w", pady=(2, 0))
         self._load_inference_visual_params_from_config()
 
+    # =====================================================================
+    # STEP 7: BATCH EXPERIMENT EVALUATION
+    # =====================================================================
     def _ensure_step7_section(self) -> None:
+        """Create Step 7 controls for multi-run experiment/evaluation summaries."""
         if self.step7_frame is not None:
             return
 
@@ -3009,19 +3104,6 @@ class ProjectSetupUI:
             return 200
         return 2
 
-    def _interval_epochs(self, total_epochs: int) -> int:
-        try:
-            interval_choice = int(self.log_interval_var.get().strip())
-        except (TypeError, ValueError):
-            interval_choice = 10
-        return max(1, min(interval_choice, total_epochs))
-
-    def _build_epoch_checkpoints(self, total_epochs: int, interval_epochs: int) -> list[int]:
-        checkpoints = list(range(interval_epochs, total_epochs + 1, interval_epochs))
-        if not checkpoints or checkpoints[-1] != total_epochs:
-            checkpoints.append(total_epochs)
-        return checkpoints
-
     def _append_train_log(self, message: str) -> None:
         if self.train_logs_text is None:
             return
@@ -3029,7 +3111,107 @@ class ProjectSetupUI:
         self.train_logs_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.train_logs_text.see(tk.END)
 
+    def _extract_bodyparts_from_labeled_data(self, config_path: Path) -> tuple[list[str], list[tuple[str, int]]]:
+        """Read bodyparts present in CollectedData files and validate consistency."""
+        labeled_dir = Path(config_path).parent / "labeled-data"
+        if not labeled_dir.exists():
+            return [], []
+
+        files = sorted(
+            list(labeled_dir.rglob("CollectedData_*.h5"))
+            + list(labeled_dir.rglob("CollectedData_*.csv"))
+        )
+
+        def _bodyparts_from_df(df: pd.DataFrame) -> list[str]:
+            if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels == 0:
+                return []
+
+            bp_level = 1 if df.columns.nlevels >= 2 else 0
+            # Prefer explicit level name when available.
+            with contextlib.suppress(Exception):
+                if "bodyparts" in (df.columns.names or []):
+                    bp_level = int(df.columns.names.index("bodyparts"))
+
+            raw_parts = [str(v).strip() for v in df.columns.get_level_values(bp_level).unique()]
+            return [p for p in raw_parts if p and p.lower() not in {"nan", "coords", "bodyparts", "scorer"}]
+
+        per_file: list[tuple[str, int]] = []
+        canonical: list[str] | None = None
+
+        for path in files:
+            parts: list[str] = []
+            try:
+                if path.suffix.lower() == ".h5":
+                    df = pd.read_hdf(path)
+                else:
+                    df = pd.read_csv(path, header=[0, 1, 2], index_col=0)
+                parts = _bodyparts_from_df(df)
+            except Exception:
+                parts = []
+
+            if not parts:
+                continue
+
+            per_file.append((path.name, len(parts)))
+            if canonical is None:
+                canonical = parts
+            elif canonical != parts:
+                raise ValueError(
+                    "Inconsistent bodyparts between CollectedData files. "
+                    f"First file has {len(canonical)} bodyparts, but {path.name} has {len(parts)}."
+                )
+
+        return canonical or [], per_file
+
+    def _sync_config_bodyparts_with_labeled_data(self, config_path: Path) -> tuple[bool, int, int]:
+        """Ensure config bodyparts match CollectedData bodyparts before DLC dataset formatting.
+
+        Add: pre-train auto-sync that updates config bodyparts from CollectedData
+        when counts/order drift.
+        Takeaway: prevents downstream DLC formatting crashes caused by bodypart
+        shape mismatches (for example, 24 in config vs 21 in data).
+        """
+        config_parts = [str(p) for p in load_bodyparts(config_path)]
+        data_parts, per_file = self._extract_bodyparts_from_labeled_data(config_path)
+
+        if not data_parts:
+            raise ValueError(
+                "Could not read bodyparts from any CollectedData file in labeled-data. "
+                "Check that Step 3 produced valid CollectedData_*.csv/.h5 files."
+            )
+
+        if config_parts == data_parts:
+            print(
+                 "Config already matches CollectedData; no rewrite needed."
+            )
+            return False, len(config_parts), len(data_parts)
+
+        only_in_config = [p for p in config_parts if p not in data_parts]
+        only_in_data = [p for p in data_parts if p not in config_parts]
+        print("MISMATCH DETECTED")
+        print(f"{len(config_parts)} config parts")
+        print(f"{len(data_parts)} data parts")
+        if only_in_config:
+            print(f" only in config ({len(only_in_config)}): {only_in_config}")
+        if only_in_data:
+            print(f" only in data   ({len(only_in_data)}): {only_in_data}")
+
+        edit_bodyparts_in_config(config_path, data_parts)
+
+        details = ", ".join(f"{name}={count}" for name, count in per_file[:6])
+        if len(per_file) > 6:
+            details += ", ..."
+        self.root.after(
+            0,
+            lambda d=details: self._append_train_log(
+                "Bodyparts mismatch fixed by syncing config to CollectedData. "
+                f"File counts: {d}"
+            ),
+        )
+        return True, len(config_parts), len(data_parts)
+
     def _start_training(self) -> None:
+        """Validate prerequisites and launch asynchronous model training."""
         if self.current_config_path is None:
             messagebox.showwarning("Missing config", "Please complete Step 1 first.")
             return
@@ -3047,8 +3229,6 @@ class ProjectSetupUI:
             return
 
         total_epochs = self._epochs_for_mode()
-        interval_epochs = self._interval_epochs(total_epochs)
-        checkpoints = self._build_epoch_checkpoints(total_epochs, interval_epochs)
 
         self._training_in_progress = True
         self._training_start_time = time.perf_counter()
@@ -3060,24 +3240,38 @@ class ProjectSetupUI:
             self.train_progress.configure(maximum=total_epochs, value=0)
 
         self.train_status_var.set(
-            f"Training started ({self.train_mode_var.get()}, epochs={total_epochs}, interval={interval_epochs})"
+            f"Training started ({self.train_mode_var.get()}, epochs={total_epochs})"
         )
         self._append_train_log("Preparing ResNet50 training...")
-        self._append_train_log(f"Checkpoints: {checkpoints}")
+        self._append_train_log(
+            f"Launching single DeepLabCut train_network run for {total_epochs} epochs."
+        )
 
         thread = threading.Thread(
             target=self._run_training_worker,
-            args=(self.current_config_path, checkpoints),
+            args=(self.current_config_path, total_epochs),
             daemon=True,
         )
         thread.start()
 
-    def _run_training_worker(self, config_path: Path, checkpoints: list[int]) -> None:
+    def _run_training_worker(self, config_path: Path, total_epochs: int) -> None:
+        """Worker thread that creates training dataset and performs a single training run."""
         try:
             import deeplabcut  # noqa: PLC0415
 
             set_net_type(config_path, "resnet_50")
             self.root.after(0, lambda: self._append_train_log("Set net_type to resnet_50."))
+
+            updated, n_cfg, n_data = self._sync_config_bodyparts_with_labeled_data(config_path)
+            if updated:
+                self.root.after(
+                    0,
+                    lambda: self._append_train_log(
+                        f"Updated config bodyparts to match labeled-data: {n_cfg} -> {n_data}."
+                    ),
+                )
+            else:
+                self.root.after(0, lambda: self._append_train_log(f"Bodyparts verified: {n_cfg}."))
 
             ensure_config_scorer_matches_data(config_path)
             self.root.after(0, lambda: self._append_train_log("Scorer synchronized with labeled-data."))
@@ -3085,40 +3279,18 @@ class ProjectSetupUI:
             deeplabcut.create_training_dataset(str(config_path))
             self.root.after(0, lambda: self._append_train_log("Created training dataset."))
 
-            snapshot_path: str | None = None
-            for target_epoch in checkpoints:
-                train_kwargs = {"epochs": target_epoch}
-                if snapshot_path is not None:
-                    train_kwargs["snapshot_path"] = snapshot_path
-
-                deeplabcut.train_network(str(config_path), **train_kwargs)
-                try:
-                    snapshot_path = find_latest_snapshot(config_path)
-                except FileNotFoundError:
-                    # In very short runs (e.g., 1-2 epochs), DLC may not emit a snapshot yet.
-                    snapshot_path = None
-
-                self.root.after(
-                    0,
-                    lambda e=target_epoch, s=snapshot_path: self._on_training_checkpoint(e, s),
-                )
+            deeplabcut.train_network(str(config_path), epochs=total_epochs)
+            try:
+                snapshot_path: str | None = find_latest_snapshot(config_path)
+            except FileNotFoundError:
+                # In very short runs (e.g., 1-2 epochs), DLC may not emit a snapshot yet.
+                snapshot_path = None
 
             elapsed = time.perf_counter() - self._training_start_time
             self.root.after(0, lambda: self._on_training_finished(snapshot_path, elapsed))
         except Exception:
             details = traceback.format_exc()
             self.root.after(0, lambda: self._on_training_failed(details))
-
-    def _on_training_checkpoint(self, epoch: int, snapshot_path: str | None) -> None:
-        if self.train_progress is not None:
-            self.train_progress.configure(value=epoch)
-        self.train_status_var.set(f"Checkpoint reached: epoch {epoch}")
-        if snapshot_path:
-            self._append_train_log(f"Reached epoch {epoch}. Latest snapshot: {snapshot_path}")
-        else:
-            self._append_train_log(
-                f"Reached epoch {epoch}. No snapshot file yet (normal for short/test runs)."
-            )
 
     def _on_training_finished(self, snapshot_path: str | None, elapsed_s: float) -> None:
         self._training_in_progress = False
@@ -3157,6 +3329,12 @@ class ProjectSetupUI:
         if selected:
             self.dataset_data_path_var.set(selected)
 
+    def _refresh_step3_browser_from_disk(self) -> None:
+        if self.current_config_path is None:
+            messagebox.showwarning("Missing config", "Please complete Step 1 first.")
+            return
+        self._load_step3_dataset_browser(config_path=self.current_config_path, dataset_name=None)
+
     def _parse_frame_counts(self, raw_text: str) -> list[int]:
         counts: list[int] = []
         for token in re.split(r"[\s,;]+", raw_text.strip()):
@@ -3172,6 +3350,7 @@ class ProjectSetupUI:
         return counts
 
     def _create_training_datasets(self) -> None:
+        """Run Step 3 dataset builds for each requested frame count and summarize outputs."""
         if self.current_config_path is None:
             messagebox.showwarning("Missing config", "Please complete Step 1 first.")
             return
@@ -3193,12 +3372,19 @@ class ProjectSetupUI:
             messagebox.showerror("Invalid input", str(exc))
             return
 
+        layout_ok, layout_msg = self._validate_step3_data_layout(data_path)
+        if not layout_ok:
+            messagebox.showerror("Invalid data layout", layout_msg)
+            return
+
         total_available, per_trial_counts = self._estimate_available_frames(data_path)
         if total_available <= 0:
             messagebox.showerror(
                 "No usable frames",
-                "No valid frames were found in trial CSV files under Data Path. "
-                "Expected per trial: 2 AVI files + 1 CSV with labeled 2D points.",
+                "No valid frames were found in points CSV files under Data Path. "
+                "Expected either:\n"
+                "1) one folder with cam1/cam2 image folders + one CSV, or\n"
+                "2) a parent folder containing trial subfolders of that same form.",
             )
             return
 
@@ -3238,10 +3424,14 @@ class ProjectSetupUI:
             if self.dataset_summary_text is not None:
                 df = pd.DataFrame(results)
                 self.dataset_summary_text.delete("1.0", tk.END)
+                self.dataset_summary_text.insert(
+                    tk.END,
+                    "Dataset builder uses DLCsupport.build_combined_dataset -> xrommtools_copy.xma_to_dlc (fallback xrommtools).\n\n",
+                )
                 self.dataset_summary_text.insert(tk.END, df.to_string(index=False))
 
-            self._populate_first_image_preview(self.current_config_path)
-            self._populate_first_xy_long(self.current_config_path)
+            latest_dataset_name = results[-1]["dataset_name"] if results else None
+            self._load_step3_dataset_browser(self.current_config_path, latest_dataset_name)
             messagebox.showinfo("Success", "Training dataset creation complete.")
         except Exception as exc:
             details = traceback.format_exc()
@@ -3250,27 +3440,78 @@ class ProjectSetupUI:
                 self.dataset_summary_text.delete("1.0", tk.END)
                 self.dataset_summary_text.insert(tk.END, details)
 
+    def _validate_step3_data_layout(self, data_path: Path) -> tuple[bool, str]:
+        # Layout A: direct folder with cam1/cam2 directories and CSV.
+        root_csv = sorted(data_path.glob("*.csv"))
+        root_cam_dirs = [p for p in data_path.iterdir() if p.is_dir()]
+        has_cam1 = any("cam1" in p.name.lower() for p in root_cam_dirs)
+        has_cam2 = any("cam2" in p.name.lower() for p in root_cam_dirs)
+        if root_csv and has_cam1 and has_cam2:
+            return True, ""
+
+        # Layout B: parent folder containing trial subfolders of layout A.
+        trial_dirs = [p for p in data_path.iterdir() if p.is_dir()]
+        valid_trial_count = 0
+        for trial_dir in trial_dirs:
+            trial_csv = sorted(trial_dir.glob("*.csv"))
+            cam_dirs = [p for p in trial_dir.iterdir() if p.is_dir()]
+            trial_has_cam1 = any("cam1" in p.name.lower() for p in cam_dirs)
+            trial_has_cam2 = any("cam2" in p.name.lower() for p in cam_dirs)
+            if trial_csv and trial_has_cam1 and trial_has_cam2:
+                valid_trial_count += 1
+
+        if valid_trial_count > 0:
+            return True, ""
+
+        return (
+            False,
+            "Data Path must be either a single training folder with cam1/cam2 image folders and one CSV, "
+            "or a parent folder containing one or more such trial folders.",
+        )
+
+    def _count_valid_rows_in_points_csv(self, csv_path: Path) -> int:
+        # Prefer header-aware parse for truth-style CSVs; fallback to headerless mode for legacy files.
+        try:
+            df = pd.read_csv(csv_path)
+            numeric = df.apply(pd.to_numeric, errors="coerce")
+            if numeric.notna().sum().sum() > 0:
+                ncol = max(1, numeric.shape[1])
+                valid_rows = (~pd.isna(numeric)).sum(axis=1) >= ncol / 2
+                return int(valid_rows.sum())
+        except Exception:
+            pass
+
+        try:
+            raw = pd.read_csv(csv_path, sep=",", header=None)
+            if raw.empty or len(raw) < 2:
+                return 0
+            df_points = raw.loc[1:, :].reset_index(drop=True)
+            ncol = max(1, df_points.shape[1])
+            valid_rows = (~pd.isnull(df_points)).sum(axis=1) >= ncol / 2
+            return int(valid_rows.sum())
+        except Exception:
+            return 0
+
     def _estimate_available_frames(self, data_path: Path) -> tuple[int, dict[str, int]]:
         per_trial_counts: dict[str, int] = {}
         total_available = 0
 
+        # Case A: selected path is itself a training folder with CSV at root.
+        root_csv = sorted(data_path.glob("*.csv"))
+        if root_csv:
+            valid_count = self._count_valid_rows_in_points_csv(root_csv[0])
+            per_trial_counts[data_path.name] = valid_count
+            total_available += valid_count
+            return total_available, per_trial_counts
+
+        # Case B: selected path is a parent folder containing trial subfolders.
         trial_dirs = sorted([p for p in data_path.iterdir() if p.is_dir()])
         for trial_dir in trial_dirs:
             csv_candidates = sorted(trial_dir.glob("*.csv"))
             if not csv_candidates:
                 continue
 
-            # xrommtools reads the first CSV and treats row 0 as header-like labels.
-            df = pd.read_csv(csv_candidates[0], sep=",", header=None)
-            if df.empty or len(df) < 2:
-                per_trial_counts[trial_dir.name] = 0
-                continue
-
-            df_points = df.loc[1:, :].reset_index(drop=True)
-            ncol = df_points.shape[1]
-            valid_rows = (~pd.isnull(df_points)).sum(axis=1) >= ncol / 2
-            valid_count = int(valid_rows.sum())
-
+            valid_count = self._count_valid_rows_in_points_csv(csv_candidates[0])
             per_trial_counts[trial_dir.name] = valid_count
             total_available += valid_count
 
@@ -3310,80 +3551,7 @@ class ProjectSetupUI:
         }
 
     def _populate_first_image_preview(self, config_path: Path) -> None:
-        if self.image_preview_label is None or self.image_info_label is None:
-            return
-
-        image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-        labeled_dir = Path(config_path).parent / "labeled-data"
-        image_paths = sorted(
-            [p for p in labeled_dir.rglob("*") if p.is_file() and p.suffix.lower() in image_exts]
-        )
-
-        if not image_paths:
-            self.image_preview_label.configure(text="No training image found.", image="")
-            self.image_info_label.configure(text="")
-            self._preview_photo = None
-            return
-
-        first_image = image_paths[0]
-        first_points: pd.DataFrame | None = None
-
-        csv_candidates = sorted(labeled_dir.rglob("CollectedData_*.csv"))
-        if csv_candidates:
-            try:
-                first_csv = csv_candidates[0]
-                df = pd.read_csv(first_csv, header=[0, 1, 2], index_col=0)
-                if not df.empty and isinstance(df.columns, pd.MultiIndex):
-                    row_id = str(df.index[0])
-                    resolved = self._resolve_labeled_image_from_row_id(labeled_dir, row_id)
-                    if resolved is not None and resolved.exists():
-                        first_image = resolved
-
-                    first_points = self._extract_first_row_points(df)
-            except Exception:
-                first_points = None
-
-        self.image_info_label.configure(
-            text=f"Path: {first_image}\nRelative: {first_image.relative_to(labeled_dir).as_posix()}"
-        )
-
-        if Image is None or ImageDraw is None or ImageTk is None:
-            self.image_preview_label.configure(text="Pillow is not available for image preview.", image="")
-            self._preview_photo = None
-            return
-
-        pil_img = Image.open(first_image)
-
-        if first_points is not None and not first_points.empty:
-            draw = ImageDraw.Draw(pil_img)
-            color_map = self._bodypart_color_map(first_points["bodypart"].tolist())
-            radius = 4
-            border_width = 2
-
-            for _, row in first_points.iterrows():
-                x = row.get("x")
-                y = row.get("y")
-                bp = str(row.get("bodypart", ""))
-                if pd.isna(x) or pd.isna(y):
-                    continue
-
-                x_f = float(x)
-                y_f = float(y)
-                color = color_map.get(bp, (255, 0, 0))
-
-                draw.ellipse(
-                    [(x_f - radius, y_f - radius), (x_f + radius, y_f + radius)],
-                    outline=color,
-                    width=border_width,
-                    fill=None,
-                )
-
-                coord_text = f"{bp} ({int(round(x_f))}, {int(round(y_f))})"
-                draw.text((x_f + radius + 2, y_f + radius + 2), coord_text, fill=color)
-
-        pil_img.thumbnail((360, 360))
-        self._preview_photo = ImageTk.PhotoImage(pil_img)
-        self.image_preview_label.configure(image=self._preview_photo, text="")
+        self._load_step3_dataset_browser(config_path=config_path, dataset_name=None)
 
     def _populate_first_xy_long(self, config_path: Path) -> None:
         if self.xy_long_text is None:
@@ -3434,6 +3602,281 @@ class ProjectSetupUI:
         self.xy_long_text.insert(tk.END, f"CSV: {first_csv}\n")
         self.xy_long_text.insert(tk.END, f"Row ID: {df.index[0]}\n\n")
         self.xy_long_text.insert(tk.END, long_df.to_string(index=False))
+
+    def _load_step3_dataset_browser(self, config_path: Path, dataset_name: str | None) -> None:
+        """Load Step 3 browser data from CollectedData CSV and resolve matching frame images."""
+        labeled_dir = Path(config_path).parent / "labeled-data"
+        image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+        if dataset_name:
+            csv_candidates = sorted((labeled_dir / dataset_name).glob("CollectedData_*.csv"))
+        else:
+            csv_candidates = sorted(labeled_dir.rglob("CollectedData_*.csv"))
+
+        if not csv_candidates:
+            self._step3_df = None
+            self._step3_csv_path = None
+            self._step3_labeled_dir = labeled_dir
+            self._step3_dataset_dir = None
+            self._step3_all_images = []
+            self._step3_image_paths = []
+            self.step3_frame_value_var.set("Frame: 0/0")
+            if self.image_info_label is not None:
+                self.image_info_label.configure(text="No CollectedData CSV found under labeled-data.")
+            if self.xy_long_text is not None:
+                self.xy_long_text.delete("1.0", tk.END)
+                self.xy_long_text.insert(tk.END, "No CollectedData CSV found under labeled-data.")
+            return
+
+        csv_path = csv_candidates[0]
+        df = pd.read_csv(csv_path, header=[0, 1, 2], index_col=0)
+        dataset_dir = csv_path.parent
+        dataset_images = sorted(
+            [p for p in dataset_dir.rglob("*") if p.is_file() and p.suffix.lower() in image_exts]
+        )
+        self._step3_df = df
+        self._step3_csv_path = csv_path
+        self._step3_labeled_dir = labeled_dir
+        self._step3_dataset_dir = dataset_dir
+        self._step3_all_images = dataset_images
+        self._step3_image_paths = []
+        for row_idx, row_id in enumerate(df.index):
+            resolved = self._resolve_labeled_image_from_row_id(labeled_dir, str(row_id))
+            if resolved is not None and resolved.exists():
+                self._step3_image_paths.append(resolved)
+            elif 0 <= row_idx < len(dataset_images):
+                self._step3_image_paths.append(dataset_images[row_idx])
+            else:
+                self._step3_image_paths.append(None)
+
+        if self.step3_frame_slider is not None:
+            upper = max(0, len(df) - 1)
+            self.step3_frame_slider.configure(from_=0, to=upper)
+            self.step3_frame_slider.set(0)
+
+        self._render_step3_frame()
+
+    def _ensure_step3_canvas(self) -> bool:
+        if FigureCanvasTkAgg is None or self.step3_plot_host is None:
+            if self.image_info_label is not None:
+                self.image_info_label.configure(text="Matplotlib Tk backend unavailable for embedded viewer.")
+            return False
+
+        if self._step3_canvas is not None:
+            return True
+
+        for child in self.step3_plot_host.winfo_children():
+            child.destroy()
+
+        self._step3_fig, self._step3_ax = plt.subplots(figsize=(8.8, 6.2))
+
+        canvas_host = ttk.Frame(self.step3_plot_host)
+        canvas_host.grid(row=0, column=0, sticky="nsew")
+        canvas_host.columnconfigure(0, weight=1)
+        canvas_host.rowconfigure(0, weight=1)
+
+        self._step3_canvas = FigureCanvasTkAgg(self._step3_fig, master=canvas_host)
+        widget = self._step3_canvas.get_tk_widget()
+        widget.grid(row=0, column=0, sticky="nsew")
+
+        if NavigationToolbar2Tk is not None:
+            toolbar_host = ttk.Frame(self.step3_plot_host)
+            toolbar_host.grid(row=1, column=0, sticky="we", pady=(4, 0))
+            self._step3_toolbar = NavigationToolbar2Tk(self._step3_canvas, toolbar_host, pack_toolbar=False)
+            self._step3_toolbar.update()
+            self._step3_toolbar.pack(side=tk.LEFT, fill=tk.X)
+
+        widget.bind("<MouseWheel>", self._on_step3_tk_mousewheel)
+        widget.bind("<Button-4>", self._on_step3_tk_mousewheel)
+        widget.bind("<Button-5>", self._on_step3_tk_mousewheel)
+
+        self._step3_fig.canvas.mpl_connect("scroll_event", self._on_step3_scroll_zoom)
+        return True
+
+    def _zoom_step3_at(self, xdata: float, ydata: float, direction: int) -> None:
+        ax = self._step3_ax
+        fig = self._step3_fig
+        if ax is None or fig is None:
+            return
+
+        cur_xlim = ax.get_xlim()
+        cur_ylim = ax.get_ylim()
+        scale_base = 1.2
+        scale = 1.0 / scale_base if direction > 0 else scale_base
+
+        width = (cur_xlim[1] - cur_xlim[0]) * scale
+        height = (cur_ylim[1] - cur_ylim[0]) * scale
+        relx = (cur_xlim[1] - xdata) / max(cur_xlim[1] - cur_xlim[0], 1e-9)
+        rely = (cur_ylim[1] - ydata) / max(cur_ylim[1] - cur_ylim[0], 1e-9)
+
+        ax.set_xlim([xdata - width * (1 - relx), xdata + width * relx])
+        ax.set_ylim([ydata - height * (1 - rely), ydata + height * rely])
+        fig.canvas.draw_idle()
+
+    def _on_step3_tk_mousewheel(self, event: object) -> None:
+        ax = self._step3_ax
+        if ax is None:
+            return
+
+        xpix = float(getattr(event, "x", 0.0))
+        ypix = float(getattr(event, "y", 0.0))
+        xdata, ydata = ax.transData.inverted().transform((xpix, ypix))
+
+        try:
+            num = int(getattr(event, "num", 0))
+        except Exception:
+            num = 0
+        try:
+            delta = int(getattr(event, "delta", 0))
+        except Exception:
+            delta = 0
+
+        if delta == 0 and num == 0:
+            return
+        direction = 1 if (delta > 0 or num == 4) else -1
+        self._zoom_step3_at(float(xdata), float(ydata), direction)
+
+    def _on_step3_scroll_zoom(self, event: object) -> None:
+        ax = self._step3_ax
+        if ax is None or getattr(event, "inaxes", None) != ax:
+            return
+
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if xdata is None or ydata is None:
+            return
+
+        button = getattr(event, "button", "up")
+        if button == "up":
+            direction = 1
+        elif button == "down":
+            direction = -1
+        else:
+            step = float(getattr(event, "step", 0.0) or 0.0)
+            if step == 0:
+                return
+            direction = 1 if step > 0 else -1
+
+        self._zoom_step3_at(float(xdata), float(ydata), direction)
+
+    def _extract_row_points(self, df: pd.DataFrame, row_idx: int) -> pd.DataFrame:
+        row = df.iloc[row_idx]
+        points: list[dict[str, float | str | None]] = []
+
+        if isinstance(df.columns, pd.MultiIndex):
+            bp_level = 1 if df.columns.nlevels >= 2 else 0
+            coord_level = df.columns.nlevels - 1
+            bodyparts = [str(bp) for bp in df.columns.get_level_values(bp_level).unique()]
+
+            for bp in bodyparts:
+                x_val = None
+                y_val = None
+                for col in df.columns:
+                    if str(col[bp_level]) != bp:
+                        continue
+                    coord = str(col[coord_level]).lower()
+                    value = row[col]
+                    if coord == "x":
+                        x_val = value
+                    elif coord == "y":
+                        y_val = value
+                points.append({"bodypart": bp, "x": x_val, "y": y_val})
+        else:
+            for col in df.columns:
+                points.append({"bodypart": str(col), "x": row[col], "y": None})
+
+        return pd.DataFrame(points)
+
+    def _render_step3_frame(self, delta: int = 0) -> None:
+        """Render the selected Step 3 frame with keypoints and synchronized XY long table."""
+        df = self._step3_df
+        if df is None or df.empty or self.step3_frame_slider is None:
+            self.step3_frame_value_var.set("Frame: 0/0")
+            return
+        if not self._ensure_step3_canvas():
+            return
+
+        if delta:
+            cur = int(self.step3_frame_slider.get()) + int(delta)
+            cur = max(0, min(cur, max(0, len(df) - 1)))
+            self.step3_frame_slider.set(cur)
+
+        row_idx = int(self.step3_frame_slider.get())
+        row_id = str(df.index[row_idx])
+        image_path = self._step3_image_paths[row_idx] if row_idx < len(self._step3_image_paths) else None
+        points_df = self._extract_row_points(df, row_idx)
+
+        ax = self._step3_ax
+        fig = self._step3_fig
+        if ax is None or fig is None:
+            return
+
+        for art in self._step3_scatter_artists:
+            with contextlib.suppress(Exception):
+                art.remove()
+        for art in self._step3_text_artists:
+            with contextlib.suppress(Exception):
+                art.remove()
+        self._step3_scatter_artists = []
+        self._step3_text_artists = []
+
+        if image_path is not None and image_path.exists():
+            img = self._cached_examine_image(str(image_path))
+            if self._step3_im_artist is None:
+                self._step3_im_artist = ax.imshow(img, cmap="gray", vmin=0, vmax=255)
+            else:
+                self._step3_im_artist.set_data(img)
+        else:
+            ax.clear()
+            self._step3_im_artist = None
+            ax.text(0.5, 0.5, "Image file not found for this row", ha="center", va="center")
+
+        cmap = plt.get_cmap("tab20")
+        point_size = float(self.step3_point_size_var.get())
+        show_labels = bool(self.step3_show_labels_var.get())
+        for i, (_, row) in enumerate(points_df.iterrows()):
+            x = row.get("x")
+            y = row.get("y")
+            bp = str(row.get("bodypart", ""))
+            if pd.isna(x) or pd.isna(y):
+                continue
+            color = cmap(i % cmap.N)
+            scat = ax.scatter(float(x), float(y), s=point_size, color=color, edgecolors="white", linewidths=0.6, alpha=0.95)
+            self._step3_scatter_artists.append(scat)
+            if show_labels:
+                txt = ax.text(
+                    float(x) + 2,
+                    float(y) + 2,
+                    bp,
+                    fontsize=8,
+                    color=color,
+                    bbox=dict(facecolor="white", alpha=0.45, edgecolor="none", pad=0.2),
+                )
+                self._step3_text_artists.append(txt)
+
+        ax.set_axis_off()
+        ax.set_title(f"Frame {row_idx + 1}/{len(df)}", fontsize=10)
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+        self.step3_frame_value_var.set(f"Frame: {row_idx + 1}/{len(df)}")
+        if self.image_info_label is not None:
+            if image_path is not None and self._step3_labeled_dir is not None and image_path.exists():
+                rel = image_path.relative_to(self._step3_labeled_dir).as_posix()
+                source_tag = "row-id"
+                if row_idx < len(self._step3_image_paths):
+                    row_resolved = self._resolve_labeled_image_from_row_id(self._step3_labeled_dir, row_id)
+                    if row_resolved is None or row_resolved != image_path:
+                        source_tag = "index fallback"
+                self.image_info_label.configure(text=f"CSV: {self._step3_csv_path}\nRow ID: {row_id}\nImage: {rel} ({source_tag})")
+            else:
+                self.image_info_label.configure(text=f"CSV: {self._step3_csv_path}\nRow ID: {row_id}\nImage: not found")
+
+        if self.xy_long_text is not None:
+            self.xy_long_text.delete("1.0", tk.END)
+            self.xy_long_text.insert(tk.END, f"CSV: {self._step3_csv_path}\n")
+            self.xy_long_text.insert(tk.END, f"Row ID: {row_id}\n\n")
+            self.xy_long_text.insert(tk.END, points_df.to_string(index=False))
 
     def _resolve_labeled_image_from_row_id(self, labeled_dir: Path, row_id: str) -> Path | None:
         row_id_norm = str(row_id).strip().replace("\\", "/")

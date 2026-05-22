@@ -65,6 +65,39 @@ def xma_to_dlc(path_config_file,data_path,dataset_name,scorer,nframes,nnetworks 
             return False
         return True
 
+    def _extract_requested_frames(source, requested_frames):
+        requested = sorted(set(int(f) for f in requested_frames if int(f) >= 0))
+        extracted = {}
+        image_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+        if os.path.isdir(source):
+            imgs = [
+                name for name in sorted(os.listdir(source))
+                if os.path.splitext(name)[1].lower() in image_exts
+            ]
+            for frame_idx in requested:
+                if frame_idx >= len(imgs):
+                    continue
+                image_path = os.path.join(source, imgs[frame_idx])
+                image = cv2.imread(image_path)
+                if image is None or image.size == 0:
+                    continue
+                extracted[frame_idx] = image
+            return extracted
+
+        requested_set = set(requested)
+        cap = cv2.VideoCapture(source)
+        success,image = cap.read()
+        frame_idx = 0
+        while success and requested_set:
+            if frame_idx in requested_set and image is not None and image.size > 0:
+                extracted[frame_idx] = image
+                requested_set.remove(frame_idx)
+            success,image = cap.read()
+            frame_idx += 1
+        cap.release()
+        return extracted
+
     data_path = os.path.abspath(data_path)
     candidate_dirs = [
         os.path.join(data_path, folder)
@@ -154,30 +187,23 @@ def xma_to_dlc(path_config_file,data_path,dataset_name,scorer,nframes,nnetworks 
                 frames = sorted(picked_frames[trialnum])
                 relpath = "labeled-data/"+dataset_name+"_cam"+str(camera)+"/"
 
-                if os.path.isdir(source):
-                    imgs = sorted(os.listdir(source))
-                    for frame_idx,img in enumerate(imgs):
-                        if frame_idx in frames:
-                            image = cv2.imread(source+"/"+img)
-                            relname = relpath + trial + "_%s.png" % str(frame_idx+1).zfill(4)
-                            relnames.append(relname)
-                            cv2.imwrite(newpath + "/" + trial + "_%s.png" % str(frame_idx+1).zfill(4), image)
-                else:
-                    cap = cv2.VideoCapture(source)
-                    success,image = cap.read()
-                    frame_idx = 0
-                    while success:
-                        if frame_idx in frames:
-                            relname = relpath + trial + "_%s.png" % str(frame_idx+1).zfill(4)
-                            relnames.append(relname)
-                            cv2.imwrite(newpath + "/" + trial + "_%s.png" % str(frame_idx+1).zfill(4), image)
-                        success,image = cap.read()
-                        frame_idx += 1
-                    cap.release()
+                frame_images = _extract_requested_frames(source, frames)
+                valid_frames = sorted(frame_images)
+                if not valid_frames:
+                    raise ValueError('No readable frames found for %s camera %d in %s' %(trial, camera, source))
+
+                dropped_count = len(frames) - len(valid_frames)
+                if dropped_count > 0:
+                    print('Warning: skipped %d unreadable/out-of-range frames for %s camera %d' %(dropped_count, trial, camera))
+
+                for frame_idx in valid_frames:
+                    relname = relpath + trial + "_%s.png" % str(frame_idx+1).zfill(4)
+                    relnames.append(relname)
+                    cv2.imwrite(newpath + "/" + trial + "_%s.png" % str(frame_idx+1).zfill(4), frame_images[frame_idx])
 
                 df1 = dfs[trialnum]
-                xpos = df1.iloc[frames,0+(camera-1)*2::4]
-                ypos = df1.iloc[frames,1+(camera-1)*2::4]
+                xpos = df1.iloc[valid_frames,0+(camera-1)*2::4]
+                ypos = df1.iloc[valid_frames,1+(camera-1)*2::4]
                 temp_data = pd.concat([xpos,ypos],axis=1).sort_index(axis=1)
                 data = pd.concat([data,temp_data])
 
@@ -225,30 +251,23 @@ def xma_to_dlc(path_config_file,data_path,dataset_name,scorer,nframes,nnetworks 
                 frames = sorted(picked_frames[trialnum])
                 relpath = "labeled-data/"+dataset_name+"/"
 
-                if os.path.isdir(source):
-                    imgs = sorted(os.listdir(source))
-                    for frame_idx,img in enumerate(imgs):
-                        if frame_idx in frames:
-                            image = cv2.imread(source+"/"+img)
-                            relname = relpath + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4)
-                            relnames.append(relname)
-                            cv2.imwrite(newpath + "/" + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4), image)
-                else:
-                    cap = cv2.VideoCapture(source)
-                    success,image = cap.read()
-                    frame_idx = 0
-                    while success:
-                        if frame_idx in frames:
-                            relname = relpath + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4)
-                            relnames.append(relname)
-                            cv2.imwrite(newpath + "/" + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4), image)
-                        success,image = cap.read()
-                        frame_idx += 1
-                    cap.release()
+                frame_images = _extract_requested_frames(source, frames)
+                valid_frames = sorted(frame_images)
+                if not valid_frames:
+                    raise ValueError('No readable frames found for %s camera %d in %s' %(trial, camera, source))
+
+                dropped_count = len(frames) - len(valid_frames)
+                if dropped_count > 0:
+                    print('Warning: skipped %d unreadable/out-of-range frames for %s camera %d' %(dropped_count, trial, camera))
+
+                for frame_idx in valid_frames:
+                    relname = relpath + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4)
+                    relnames.append(relname)
+                    cv2.imwrite(newpath + "/" + trial + "_cam"+str(camera)+ "_%s.png" % str(frame_idx+1).zfill(4), frame_images[frame_idx])
 
                 df1 = dfs[trialnum]
-                xpos = df1.iloc[frames,0+(camera-1)*2::4]
-                ypos = df1.iloc[frames,1+(camera-1)*2::4]
+                xpos = df1.iloc[valid_frames,0+(camera-1)*2::4]
+                ypos = df1.iloc[valid_frames,1+(camera-1)*2::4]
                 temp_data = pd.concat([xpos,ypos],axis=1).sort_index(axis=1)
                 temp_data.columns = range(temp_data.shape[1])
                 data = pd.concat([data,temp_data])
