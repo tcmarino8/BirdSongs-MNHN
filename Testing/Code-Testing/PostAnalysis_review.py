@@ -60,8 +60,8 @@ def _find_first_dir(root: Path, pattern: str) -> Path:
 def _resolve_cam_dirs(root: Path) -> dict[str, Path]:
 	"""Resolve Cam1_Img00UND* and Cam2_Img00UND* directories."""
 	return {
-		"cam1": _find_first_dir(root, "*cam1_img00und*"),
-		"cam2": _find_first_dir(root, "*cam2_img00und*"),
+		"cam1": _find_first_dir(root, "*cam1*"),
+		"cam2": _find_first_dir(root, "*cam2*"),
 	}
 
 
