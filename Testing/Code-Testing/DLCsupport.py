@@ -1068,6 +1068,92 @@ def run_combined_experiment(
     )
 
 
+# ----------------------------
+# Evaluation Helpers: Truth + Prediction Parsing
+# ----------------------------
+
+
+def infer_camera_from_name(name: str) -> str:
+    low = name.lower()
+    if "cam2" in low:
+        return "cam2"
+    return "cam1"
+
+
+def truth_csv_to_long(truth_csv_path: Path) -> pd.DataFrame:
+    truth_df = pd.read_csv(truth_csv_path)
+    rows = []
+    for col in truth_df.columns:
+        m = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", col)
+        if m is None:
+            continue
+        rows.append((m.group("bodypart"), f"cam{m.group('cam')}", m.group("coord").lower(), col))
+
+    if not rows:
+        raise ValueError(f"Could not parse truth columns in {truth_csv_path}")
+
+    meta = pd.DataFrame(rows, columns=["bodypart", "camera", "coord", "column"])
+    xmeta = meta[meta["coord"] == "x"].rename(columns={"column": "xcol"})
+    ymeta = meta[meta["coord"] == "y"].rename(columns={"column": "ycol"})
+    pairs = xmeta.merge(ymeta[["bodypart", "camera", "ycol"]], on=["bodypart", "camera"], how="inner")
+
+    frame_ids = np.arange(1, len(truth_df) + 1)
+    parts = []
+    for _, r in pairs.iterrows():
+        parts.append(
+            pd.DataFrame(
+                {
+                    "frame_id": frame_ids,
+                    "bodypart": r["bodypart"],
+                    "camera": r["camera"],
+                    "x_true": pd.to_numeric(truth_df[r["xcol"]], errors="coerce"),
+                    "y_true": pd.to_numeric(truth_df[r["ycol"]], errors="coerce"),
+                }
+            )
+        )
+    return pd.concat(parts, ignore_index=True)
+
+
+def prediction_csv_to_long(pred_csv_path: Path, frame_lookup: list[int]) -> pd.DataFrame:
+    wide = pd.read_csv(pred_csv_path, header=[0, 1, 2], index_col=0)
+    camera = infer_camera_from_name(pred_csv_path.name)
+
+    bodyparts = pd.Index(wide.columns.get_level_values(1)).unique()
+    out = []
+    for bp in bodyparts:
+        bp_cols = wide.xs(bp, axis=1, level=1, drop_level=False)
+        coords = bp_cols.columns.get_level_values(2).astype(str).str.lower().tolist()
+        if "x" not in coords or "y" not in coords:
+            continue
+
+        xcol = bp_cols.columns[coords.index("x")]
+        ycol = bp_cols.columns[coords.index("y")]
+        if "likelihood" in coords:
+            lcol = bp_cols.columns[coords.index("likelihood")]
+            like = pd.to_numeric(bp_cols[lcol], errors="coerce").to_numpy(dtype=float)
+        else:
+            like = np.full(bp_cols.shape[0], np.nan)
+
+        subset_idx = pd.to_numeric(pd.Index(wide.index), errors="coerce").astype("Int64")
+        frame_ids = [frame_lookup[int(i)] if pd.notna(i) and 0 <= int(i) < len(frame_lookup) else np.nan for i in subset_idx]
+
+        out.append(
+            pd.DataFrame(
+                {
+                    "frame_id": frame_ids,
+                    "bodypart": str(bp),
+                    "camera": camera,
+                    "x_pred": pd.to_numeric(bp_cols[xcol], errors="coerce").to_numpy(dtype=float),
+                    "y_pred": pd.to_numeric(bp_cols[ycol], errors="coerce").to_numpy(dtype=float),
+                    "likelihood": like,
+                }
+            )
+        )
+
+    if not out:
+        raise ValueError(f"No usable prediction columns in {pred_csv_path}")
+    return pd.concat(out, ignore_index=True)
+
 # ===========================================================================
 # Command-line interface
 # ===========================================================================
