@@ -288,36 +288,71 @@ def _auto_find_truth_csv(root: Path) -> Path | None:
 	return None
 
 
-def _choose_prediction_path_gui() -> Path:
-	"""Show onboarding message, then open folder picker for prediction input."""
+def _choose_directory_gui(title: str, prompt: str) -> Path:
+	"""Show an informational prompt, then open a directory picker."""
 	try:
 		import tkinter as tk
 		from tkinter import filedialog, messagebox
 	except Exception as exc:
 		raise RuntimeError(
-			"GUI file picker is unavailable. Provide prediction_path on the command line instead."
+			"GUI file picker is unavailable. Provide folder paths on the command line instead."
 		) from exc
 
 	root = tk.Tk()
 	root.withdraw()
 	root.attributes("-topmost", True)
-	messagebox.showinfo(
-		title="Prediction Viewer Setup",
-		message=(
-			"you now have predicted points on a video, select the folder where those predictions lie. "
-			"after you do so we will generate a way to view the success!"
-		),
-	)
+	messagebox.showinfo(title=title, message=prompt)
 
-	folder_path = filedialog.askdirectory(
-		title="Select folder containing cam1_img00und, cam2_img00und, and post_processed_data_*",
-	)
+	folder_path = filedialog.askdirectory(title=title)
 	root.destroy()
 
 	if not folder_path:
-		raise RuntimeError("No folder selected.")
-
+		raise RuntimeError(f"No folder selected for: {title}")
 	return Path(folder_path)
+
+
+def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
+	"""Prompt user for same-folder mode, then collect required folder paths."""
+	try:
+		import tkinter as tk
+		from tkinter import messagebox
+	except Exception as exc:
+		raise RuntimeError(
+			"GUI prompts are unavailable. Provide folder paths on the command line instead."
+		) from exc
+
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+	same_root = messagebox.askyesno(
+		title="Prediction Viewer Setup",
+		message="Are your images and predictions in the same folder?",
+	)
+	root.destroy()
+
+	if same_root:
+		shared_root = _choose_directory_gui(
+			title="Select Shared Root Folder",
+			prompt=(
+				"Select the folder containing prediction CSVs and both camera image folders "
+				"(for example cam1 and cam2 folders)."
+			),
+		)
+		return shared_root, None, None
+
+	pred_root = _choose_directory_gui(
+		title="Select Predictions Folder",
+		prompt="Select the folder containing prediction CSV files.",
+	)
+	cam1_dir = _choose_directory_gui(
+		title="Select Cam1 Image Folder",
+		prompt="Select the folder containing Cam1 images.",
+	)
+	cam2_dir = _choose_directory_gui(
+		title="Select Cam2 Image Folder",
+		prompt="Select the folder containing Cam2 images.",
+	)
+	return pred_root, cam1_dir, cam2_dir
 
 
 @dataclass
@@ -338,6 +373,8 @@ def make_postanalysis_overlay_popout(
 	truth_csv_path: str | Path | None = None,
 	default_camera: str = "cam1",
 	default_frame_pos: int = 1,
+	cam1_image_dir: str | Path | None = None,
+	cam2_image_dir: str | Path | None = None,
 ) -> None:
 	"""Launch an interactive matplotlib popout to inspect predictions on image stacks."""
 	root = Path(prediction_path)
@@ -346,7 +383,19 @@ def make_postanalysis_overlay_popout(
 
 	pred_csv_by_cam = _resolve_prediction_csvs(root)
 
-	cam_dirs = _resolve_cam_dirs(root)
+	if cam1_image_dir is not None or cam2_image_dir is not None:
+		if cam1_image_dir is None or cam2_image_dir is None:
+			raise ValueError("Provide both cam1_image_dir and cam2_image_dir, or neither.")
+		cam_dirs = {
+			"cam1": Path(cam1_image_dir),
+			"cam2": Path(cam2_image_dir),
+		}
+		for camera_name, camera_dir in cam_dirs.items():
+			if not camera_dir.exists() or not camera_dir.is_dir():
+				raise FileNotFoundError(f"Image directory for {camera_name} does not exist: {camera_dir}")
+	else:
+		cam_dirs = _resolve_cam_dirs(root)
+
 	images_by_cam = {
 		"cam1": collect_images(cam_dirs["cam1"]),
 		"cam2": collect_images(cam_dirs["cam2"]),
@@ -1831,7 +1880,19 @@ def _build_parser() -> argparse.ArgumentParser:
 		nargs="?",
 		type=str,
 		default=None,
-		help="Folder path containing image stacks and post_processed_data_* predictions. If omitted, a picker opens.",
+		help="Folder path containing prediction CSVs (and optionally image stacks). If omitted, pickers open.",
+	)
+	parser.add_argument(
+		"--cam1-dir",
+		type=str,
+		default=None,
+		help="Optional explicit Cam1 image folder.",
+	)
+	parser.add_argument(
+		"--cam2-dir",
+		type=str,
+		default=None,
+		help="Optional explicit Cam2 image folder.",
 	)
 	parser.add_argument(
 		"--search-truth",
@@ -1860,7 +1921,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--browse",
 		action="store_true",
-		help="Force opening a file/folder picker even if prediction_path is provided.",
+		help="Open GUI prompts and ask whether predictions/images share one folder.",
 	)
 	return parser
 
@@ -1871,9 +1932,14 @@ def main() -> None:
 	args = parser.parse_args()
 
 	if args.browse or not args.prediction_path:
-		prediction_path = _choose_prediction_path_gui()
+		prediction_path, cam1_dir, cam2_dir = _choose_inputs_gui()
 	else:
 		prediction_path = Path(args.prediction_path)
+		cam1_dir = Path(args.cam1_dir) if args.cam1_dir else None
+		cam2_dir = Path(args.cam2_dir) if args.cam2_dir else None
+
+	if (cam1_dir is None) ^ (cam2_dir is None):
+		parser.error("Use both --cam1-dir and --cam2-dir together, or omit both.")
 
 	make_postanalysis_overlay_popout(
 		prediction_path=prediction_path,
@@ -1881,6 +1947,8 @@ def main() -> None:
 		truth_csv_path=args.truth_csv,
 		default_camera=args.camera,
 		default_frame_pos=int(args.frame_pos),
+		cam1_image_dir=cam1_dir,
+		cam2_image_dir=cam2_dir,
 	)
 
 
