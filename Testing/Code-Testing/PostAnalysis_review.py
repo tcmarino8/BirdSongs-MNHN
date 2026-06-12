@@ -18,6 +18,38 @@ from PIL import Image
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+def find_darkest_pixel(
+	img: np.ndarray,
+	row: float,
+	col: float,
+	occupied: set[tuple[int, int]] | None = None,
+	window_size: int = 5,
+) -> tuple[int, int]:
+	"""Find the darkest available pixel near (row, col) within a local window."""
+	half = int(window_size) // 2
+
+	r0 = max(0, int(row) - half)
+	r1 = min(img.shape[0], int(row) + half + 1)
+	c0 = max(0, int(col) - half)
+	c1 = min(img.shape[1], int(col) + half + 1)
+
+	window = img[r0:r1, c0:c1]
+	if window.size == 0:
+		return int(np.clip(int(row), 0, max(img.shape[0] - 1, 0))), int(np.clip(int(col), 0, max(img.shape[1] - 1, 0)))
+
+	flat = np.argsort(window, axis=None)
+	used = occupied if occupied is not None else set()
+
+	for idx in flat:
+		lr, lc = np.unravel_index(idx, window.shape)
+		rr, cc = int(r0 + lr), int(c0 + lc)
+		if (rr, cc) not in used:
+			used.add((rr, cc))
+			return rr, cc
+
+	return int(r0), int(c0)
+
+
 def parse_frame_number_from_stem(stem: str) -> int | None:
 	"""Extract the last integer token from a file stem."""
 	match = re.search(r"(\d+)(?!.*\d)", stem)
@@ -480,6 +512,8 @@ def make_postanalysis_overlay_popout(
 	ax_true_alpha = fig.add_axes([0.41, 0.11, 0.29, 0.03])
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
+	ax_window_start = fig.add_axes([0.82, 0.685, 0.075, 0.03])
+	ax_window_end = fig.add_axes([0.905, 0.685, 0.075, 0.03])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 	ax_selection_info = fig.add_axes([0.82, 0.005, 0.16, 0.035])
 
@@ -506,6 +540,8 @@ def make_postanalysis_overlay_popout(
 	slider_true_alpha = Slider(ax_true_alpha, "true_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
 	textbox_pred_color = TextBox(ax_pred_color, "pred_color", initial="deepskyblue")
 	textbox_true_color = TextBox(ax_true_color, "true_color", initial="orange")
+	textbox_window_start = TextBox(ax_window_start, "w0", initial="0")
+	textbox_window_end = TextBox(ax_window_end, "w1", initial="1")
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
 	ax_selection_info.set_axis_off()
 
@@ -534,6 +570,10 @@ def make_postanalysis_overlay_popout(
 			sld.valtext.set_fontsize(value_font)
 
 		for txtbox in (textbox_pred_color, textbox_true_color):
+			txtbox.label.set_fontsize(control_font)
+			txtbox.text_disp.set_fontsize(value_font)
+
+		for txtbox in (textbox_window_start, textbox_window_end):
 			txtbox.label.set_fontsize(control_font)
 			txtbox.text_disp.set_fontsize(value_font)
 
@@ -639,6 +679,38 @@ def make_postanalysis_overlay_popout(
 			return None
 		return float(np.mean(valid))
 
+	def _current_selection_window() -> tuple[int, int]:
+		frame_limit = _shared_frame_limit()
+		if frame_limit <= 0:
+			return 0, -1
+
+		default_start = 0
+		default_end = int(frame_limit - 1)
+
+		try:
+			window_start = int(float(str(textbox_window_start.text).strip()))
+		except Exception:
+			window_start = default_start
+		try:
+			window_end = int(float(str(textbox_window_end.text).strip()))
+		except Exception:
+			window_end = default_end
+
+		window_start = int(np.clip(window_start, 0, default_end))
+		window_end = int(np.clip(window_end, 0, default_end))
+		if window_start > window_end:
+			window_start, window_end = window_end, window_start
+
+		textbox_window_start.set_val(str(window_start))
+		textbox_window_end.set_val(str(window_end))
+		return window_start, window_end
+
+	def _window_frame_candidates() -> np.ndarray:
+		window_start, window_end = _current_selection_window()
+		if window_end < window_start:
+			return np.asarray([], dtype=int)
+		return np.arange(window_start, window_end + 1, dtype=int)
+
 	def _allocate_counts(weights: list[float], total_count: int) -> list[int]:
 		if total_count <= 0 or not weights:
 			return [0 for _ in weights]
@@ -665,30 +737,33 @@ def make_postanalysis_overlay_popout(
 		return zones[-1] if zones else None
 
 	def _build_random_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
-		frame_limit = _shared_frame_limit()
-		count = min(20, frame_limit)
+		candidates = _window_frame_candidates()
+		count = min(30, int(candidates.size))
 		if count <= 0:
-			return [], {}, ["Random", "No shared frames"]
+			return [], {}, ["Random", "No frames in window"]
 
-		frames = np.sort(rng.choice(np.arange(frame_limit, dtype=int), size=count, replace=False)).tolist()
+		window_start, window_end = _current_selection_window()
+		frames = np.sort(rng.choice(candidates, size=count, replace=False)).tolist()
 		meta = {int(frame): {"label": "Random sample", "color": "crimson"} for frame in frames}
-		return [int(frame) for frame in frames], meta, [f"Random {count} frames"]
+		return [int(frame) for frame in frames], meta, [f"Random {count} frames", f"Window {window_start}-{window_end}"]
 
 	def _build_displacement_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
-		frame_limit = _shared_frame_limit()
-		count = min(20, frame_limit)
+		window_start, window_end = _current_selection_window()
+		frame_limit = int(max(0, window_end - window_start + 1))
+		count = min(30, frame_limit)
 		zones = _build_zone_specs(frame_limit)
 		if count <= 0 or not zones:
-			return [], {}, ["Disp", "No shared frames"]
+			return [], {}, ["Disp", "No frames in window"]
 
 		zone_scores: list[float] = []
 		for zone in zones:
-			end_frame = zone["start"] + 400
+			start_frame = int(window_start + zone["start"])
+			end_frame = int(min(window_end, window_start + zone["start"] + 400))
 			camera_scores: list[float] = []
 			for camera_name in ("cam1", "cam2"):
-				if end_frame >= len(state.images_by_cam.get(camera_name, [])):
+				if end_frame >= len(state.images_by_cam.get(camera_name, [])) or start_frame >= len(state.images_by_cam.get(camera_name, [])):
 					continue
-				disp = _frame_displacement(camera_name, zone["start"], end_frame)
+				disp = _frame_displacement(camera_name, start_frame, end_frame)
 				if disp is not None and np.isfinite(disp):
 					camera_scores.append(float(disp))
 			zone_scores.append(float(np.mean(camera_scores)) if camera_scores else 0.0)
@@ -701,7 +776,7 @@ def make_postanalysis_overlay_popout(
 		selected: list[int] = []
 		meta: dict[int, dict[str, Any]] = {}
 		for zone, alloc_count, zone_weight, zone_score, color_idx in zip(zones, zone_counts, zone_weights, zone_scores, range(len(zones))):
-			zone_frames = np.arange(zone["start"], zone["end"], dtype=int)
+			zone_frames = np.arange(window_start + zone["start"], window_start + zone["end"], dtype=int)
 			if alloc_count <= 0 or zone_frames.size == 0:
 				continue
 			pick_count = min(int(alloc_count), int(zone_frames.size))
@@ -717,12 +792,12 @@ def make_postanalysis_overlay_popout(
 				}
 
 		if len(selected) < count:
-			remaining = np.setdiff1d(np.arange(frame_limit, dtype=int), np.asarray(selected, dtype=int), assume_unique=False)
+			remaining = np.setdiff1d(np.arange(window_start, window_end + 1, dtype=int), np.asarray(selected, dtype=int), assume_unique=False)
 			fill_count = min(int(count - len(selected)), int(remaining.size))
 			if fill_count > 0:
 				fill = np.sort(rng.choice(remaining, size=fill_count, replace=False))
 				for frame in fill.tolist():
-					zone = _zone_for_frame(int(frame), zones)
+					zone = _zone_for_frame(int(frame) - window_start, zones)
 					color = "gray"
 					label = "Fallback"
 					zone_weight = 0.0
@@ -741,7 +816,7 @@ def make_postanalysis_overlay_popout(
 					}
 
 		selected = sorted(set(int(frame) for frame in selected))[:count]
-		summary_lines = [f"Disp {count} frames"]
+		summary_lines = [f"Disp {count} frames", f"Window {window_start}-{window_end}"]
 		for zone, zone_weight, zone_count in zip(zones, zone_weights, zone_counts):
 			if zone_count > 0:
 				summary_lines.append(f"Z{zone['zone_index'] + 1} {zone_weight:.2f} ({zone_count})")
@@ -809,16 +884,25 @@ def make_postanalysis_overlay_popout(
 		return selected
 
 	def _build_dino_selection(camera: str) -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
-		frame_limit = _shared_frame_limit()
-		count = min(20, frame_limit)
+		candidates = _window_frame_candidates()
+		count = min(30, int(candidates.size))
 		if count <= 0:
-			return [], {}, ["DINO", "No shared frames"]
+			return [], {}, ["DINO", "No frames in window"]
 
 		embedding_tensor = _compute_dino_embeddings(camera)
 		if embedding_tensor is None:
 			return [], {}, ["DINO", f"No embeddings for {camera}"]
 
-		selected_idx = sorted(int(idx) for idx in _k_center_greedy(embedding_tensor, count))
+		components = _load_dino_components()
+		torch = components["torch"]
+		candidate_idx = [int(i) for i in candidates.tolist() if 0 <= int(i) < int(embedding_tensor.shape[0])]
+		if not candidate_idx:
+			return [], {}, ["DINO", "No embeddings in window"]
+		embeddings_subset = embedding_tensor[torch.as_tensor(candidate_idx, dtype=torch.long)]
+		count = min(count, int(embeddings_subset.shape[0]))
+		selected_local = sorted(int(idx) for idx in _k_center_greedy(embeddings_subset, count))
+		selected_idx = [int(candidate_idx[idx]) for idx in selected_local]
+		window_start, window_end = _current_selection_window()
 		meta: dict[int, dict[str, Any]] = {}
 		for frame in selected_idx:
 			meta[int(frame)] = {
@@ -826,7 +910,7 @@ def make_postanalysis_overlay_popout(
 				"source_camera": camera,
 				"color": "seagreen",
 			}
-		return selected_idx, meta, [f"DINO {count} frames", f"Source {camera}"]
+		return selected_idx, meta, [f"DINO {count} frames", f"Source {camera}", f"Window {window_start}-{window_end}"]
 
 	def _method_folder_name(method_name: str) -> str:
 		return {"random": "random", "displacement": "displacement", "dino": "dino"}.get(method_name, method_name)
@@ -964,6 +1048,11 @@ def make_postanalysis_overlay_popout(
 		frames_local = [int(frame) for frame in sorted(set(frames))]
 		if not frames_local:
 			raise RuntimeError("No selected frames are available for correction review.")
+		shared_frame_limit = _shared_frame_limit()
+		if shared_frame_limit <= 0:
+			raise RuntimeError("No shared frames available for correction review.")
+		max_review_frame = int(shared_frame_limit - 1)
+		start_review_frame = int(np.clip(frames_local[0], 0, max_review_frame))
 
 		review_fig, review_axes = plt.subplots(1, 2, figsize=(16.0, 9.0), dpi=100)
 		review_fig.subplots_adjust(left=0.04, right=0.98, bottom=0.24, top=0.90, wspace=0.05)
@@ -971,20 +1060,22 @@ def make_postanalysis_overlay_popout(
 			review_ax.set_axis_off()
 
 		ax_review_prev = review_fig.add_axes([0.12, 0.09, 0.05, 0.05])
-		ax_review_slider = review_fig.add_axes([0.18, 0.095, 0.28, 0.035])
-		ax_review_next = review_fig.add_axes([0.47, 0.09, 0.05, 0.05])
-		ax_review_pred_size = review_fig.add_axes([0.55, 0.095, 0.12, 0.03])
-		ax_review_true_size = review_fig.add_axes([0.69, 0.095, 0.12, 0.03])
-		ax_zoom_reset = review_fig.add_axes([0.84, 0.09, 0.12, 0.05])
+		ax_review_slider = review_fig.add_axes([0.18, 0.095, 0.34, 0.035])
+		ax_review_next = review_fig.add_axes([0.53, 0.09, 0.05, 0.05])
+		ax_review_current = review_fig.add_axes([0.59, 0.09, 0.11, 0.05])
+		ax_review_pred_size = review_fig.add_axes([0.72, 0.095, 0.11, 0.03])
+		ax_review_true_size = review_fig.add_axes([0.84, 0.095, 0.11, 0.03])
+		ax_zoom_reset = review_fig.add_axes([0.84, 0.045, 0.12, 0.04])
 		btn_review_prev = Button(ax_review_prev, "<")
 		btn_review_next = Button(ax_review_next, ">")
+		btn_review_current = Button(ax_review_current, "Current Frame")
 		btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
 		slider_review = Slider(
 			ax_review_slider,
-			"selected_idx",
+			"frame_pos",
 			0,
-			float(max(len(frames_local) - 1, 0)),
-			valinit=0.0,
+			float(max_review_frame),
+			valinit=float(start_review_frame),
 			valstep=1,
 		)
 		slider_review_pred_size = Slider(
@@ -1013,28 +1104,89 @@ def make_postanalysis_overlay_popout(
 			zax.set_yticks([])
 
 		correction_cache: dict[tuple[int, str, str], tuple[float, float]] = {}
+		correction_pixel_index: dict[tuple[int, str, str], tuple[int, int]] = {}
+		likelihood_lookup: dict[tuple[int, str, str], float] = {}
 		active_marker: dict[str, Any] | None = None
+		active_selected_index = 0
 		drag_state: dict[str, Any] = {"active": False, "camera": None, "bodypart": None, "moved": False}
 		zoom_half_window: dict[str, float] = {"cam1": 15.0, "cam2": 15.0}
 		hit_threshold_px = 12.0
+		export_frames = sorted(set(int(frame) for frame in frames_local))
+
+		def _initialize_corrections_from_predictions() -> None:
+			for frame_pos in export_frames:
+				for camera_name in ("cam1", "cam2"):
+					pts = _pred_points(camera_name, int(frame_pos))
+					if pts.empty:
+						continue
+					for _, row in pts.iterrows():
+						bodypart = str(row["bodypart"])
+						x_val = float(pd.to_numeric(row["x"], errors="coerce"))
+						y_val = float(pd.to_numeric(row["y"], errors="coerce"))
+						if not (np.isfinite(x_val) and np.isfinite(y_val)):
+							continue
+						key = (int(frame_pos), str(camera_name), bodypart)
+						correction_cache[key] = (x_val, y_val)
+						row_int = int(round(y_val))
+						col_int = int(round(x_val))
+						correction_pixel_index[key] = (row_int, col_int)
+						likelihood_lookup[key] = float(pd.to_numeric(row["likelihood"], errors="coerce"))
+
+		def _image_name_for(camera_name: str, frame_pos: int) -> str:
+			images = state.images_by_cam.get(camera_name, [])
+			if 0 <= int(frame_pos) < len(images):
+				return str(images[int(frame_pos)].name)
+			return ""
 
 		def _autosave_corrections() -> None:
-			if not correction_cache:
+			if not correction_cache or not export_frames:
 				return
 			auto_path = export_dir / "data" / "corrections_autosave.csv"
 			auto_path.parent.mkdir(parents=True, exist_ok=True)
 			rows: list[dict[str, Any]] = []
 			for (frame_pos, camera_name, bodypart_name), (x_val, y_val) in sorted(correction_cache.items()):
+				if int(frame_pos) not in export_frames:
+					continue
+				key = (int(frame_pos), str(camera_name), str(bodypart_name))
 				rows.append(
 					{
+						"frame_pos": int(frame_pos),
+						"image_name": _image_name_for(str(camera_name), int(frame_pos)),
 						"frame_id": int(frame_pos),
 						"camera": str(camera_name),
 						"bodypart": str(bodypart_name),
 						"x_corrected": float(x_val),
 						"y_corrected": float(y_val),
+						"likelihood": float(likelihood_lookup.get(key, np.nan)),
 					}
 				)
-			pd.DataFrame(rows).to_csv(auto_path, index=False)
+			if not rows:
+				return
+			long_df = pd.DataFrame(rows).sort_values(["frame_pos", "camera", "bodypart"], kind="mergesort")
+
+			# Save only XMALab-style wide output with row order matching selected image frames.
+			xmalab_rows: list[dict[str, Any]] = []
+			bodyparts = sorted(pd.Index(long_df["bodypart"].astype(str)).unique().tolist())
+			for frame_pos in export_frames:
+				frame_row: dict[str, Any] = {}
+				for bodypart_name in bodyparts:
+					for camera_name, cam_id in (("cam1", "1"), ("cam2", "2")):
+						match = long_df[
+							(long_df["frame_pos"] == int(frame_pos))
+							& (long_df["camera"] == str(camera_name))
+							& (long_df["bodypart"] == str(bodypart_name))
+						]
+						x_col = f"{bodypart_name}_cam{cam_id}_X"
+						y_col = f"{bodypart_name}_cam{cam_id}_Y"
+						if match.empty:
+							frame_row[x_col] = np.nan
+							frame_row[y_col] = np.nan
+						else:
+							frame_row[x_col] = float(match.iloc[0]["x_corrected"])
+							frame_row[y_col] = float(match.iloc[0]["y_corrected"])
+				xmalab_rows.append(frame_row)
+
+			pd.DataFrame(xmalab_rows).to_csv(auto_path, index=False)
 
 		def _resolve_point_xy(camera_name: str, frame_pos: int, bodypart_name: str) -> tuple[float, float] | None:
 			pts = _pred_points(camera_name, frame_pos)
@@ -1103,6 +1255,39 @@ def make_postanalysis_overlay_popout(
 			correction_cache[(int(frame_pos), str(camera_name), str(bodypart_name))] = (float(x_val), float(y_val))
 			_autosave_corrections()
 
+		def _snap_to_dark_pixel(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> tuple[float, float]:
+			images = state.images_by_cam.get(camera_name, [])
+			if not (0 <= int(frame_pos) < len(images)):
+				return float(x_val), float(y_val)
+
+			with Image.open(images[int(frame_pos)]) as image_file:
+				gray_img = np.asarray(image_file.convert("L"))
+
+			key = (int(frame_pos), str(camera_name), str(bodypart_name))
+			occupied_pixels: set[tuple[int, int]] = {
+				(rr, cc)
+				for (fpos, cam_name, bp_name), (rr, cc) in correction_pixel_index.items()
+				if int(fpos) == int(frame_pos) and str(cam_name) == str(camera_name) and str(bp_name) != str(bodypart_name)
+			}
+
+			if key in correction_pixel_index:
+				old_rr, old_cc = correction_pixel_index[key]
+				occupied_pixels.discard((int(old_rr), int(old_cc)))
+
+			rr, cc = find_darkest_pixel(
+				gray_img,
+				row=float(y_val),
+				col=float(x_val),
+				occupied=occupied_pixels,
+				window_size=5,
+			)
+			correction_pixel_index[key] = (int(rr), int(cc))
+			return float(cc), float(rr)
+
+		def _apply_snapped_edit(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> None:
+			snapped_x, snapped_y = _snap_to_dark_pixel(frame_pos, camera_name, bodypart_name, x_val, y_val)
+			_apply_edit(frame_pos, camera_name, bodypart_name, snapped_x, snapped_y)
+
 		def _active_marker_xy(camera_name: str, frame_pos: int) -> tuple[float, float] | None:
 			if active_marker is None:
 				return None
@@ -1110,12 +1295,16 @@ def make_postanalysis_overlay_popout(
 				return None
 			return _resolve_point_xy(str(camera_name), int(frame_pos), str(active_marker["bodypart"]))
 
+		_initialize_corrections_from_predictions()
+		_autosave_corrections()
+
 		def _apply_review_widget_scaling(_event: Any = None) -> None:
 			button_font = _scaled_font(review_fig, base_size=10.0, ref_w=16.0, ref_h=9.0, min_size=8.0, max_size=16.0)
 			control_font = _scaled_font(review_fig, base_size=9.5, ref_w=16.0, ref_h=9.0, min_size=8.0, max_size=14.0)
 			value_font = _scaled_font(review_fig, base_size=9.0, ref_w=16.0, ref_h=9.0, min_size=7.0, max_size=13.0)
 			btn_review_prev.label.set_fontsize(button_font)
 			btn_review_next.label.set_fontsize(button_font)
+			btn_review_current.label.set_fontsize(control_font)
 			btn_zoom_reset.label.set_fontsize(control_font)
 			for sld in (slider_review, slider_review_pred_size, slider_review_true_size):
 				sld.label.set_fontsize(control_font)
@@ -1140,8 +1329,10 @@ def make_postanalysis_overlay_popout(
 			return [state.bodypart_color_map.get(str(bp), fallback) for bp in bodyparts]
 
 		def _redraw_review(*_args: Any) -> None:
-			frame_idx = int(slider_review.val)
-			frame_pos = frames_local[frame_idx]
+			nonlocal active_selected_index
+			frame_pos = int(slider_review.val)
+			if frame_pos in frames_local:
+				active_selected_index = int(frames_local.index(frame_pos))
 			if active_marker is not None and int(active_marker.get("frame_pos", -1)) != int(frame_pos):
 				drag_state["active"] = False
 			show_true = bool(check.get_status()[1]) and state.truth_found
@@ -1242,7 +1433,7 @@ def make_postanalysis_overlay_popout(
 				review_ax.set_aspect("equal")
 
 			review_fig.suptitle(
-				f"Correction Review | {method_name.title()} | {frame_idx + 1}/{len(frames_local)} | frame {frame_pos} | edits {len(correction_cache)}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate.",
+				f"Correction Review | {method_name.title()} | frame {frame_pos} of 0-{max_review_frame} | selected {active_selected_index + 1}/{len(frames_local)} (frame {frames_local[active_selected_index]}) | edits {len(correction_cache)}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate (snaps to local dark center).",
 				fontsize=_scaled_font(review_fig, base_size=11.0, ref_w=16.0, ref_h=9.0, min_size=9.0, max_size=16.0),
 			)
 			review_fig.canvas.draw_idle()
@@ -1302,13 +1493,14 @@ def make_postanalysis_overlay_popout(
 				return
 			if event.xdata is None or event.ydata is None:
 				return
-			frame_pos = frames_local[int(slider_review.val)]
+			frame_pos = int(slider_review.val)
 			camera_name = "cam1" if event.inaxes == review_axes[0] else "cam2"
 			min_like = float(slider_like.val)
 			nearest = _nearest_marker_in_axes(event, camera_name, frame_pos, min_like)
 
 			if nearest is not None:
-				bodypart_name, _, _, _ = nearest
+				bodypart_name, x_near, y_near, _ = nearest
+				_apply_snapped_edit(frame_pos, camera_name, bodypart_name, float(x_near), float(y_near))
 				_set_active_marker(frame_pos, camera_name, bodypart_name)
 				drag_state["active"] = True
 				drag_state["camera"] = camera_name
@@ -1322,7 +1514,7 @@ def make_postanalysis_overlay_popout(
 			if int(active_marker.get("frame_pos", -1)) != int(frame_pos):
 				return
 			bodypart_name = str(active_marker["bodypart"])
-			_apply_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
+			_apply_snapped_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
 			_set_active_marker(frame_pos, camera_name, bodypart_name)
 			_redraw_review()
 
@@ -1338,8 +1530,8 @@ def make_postanalysis_overlay_popout(
 			expected_ax = review_axes[0] if camera_name == "cam1" else review_axes[1]
 			if event.inaxes != expected_ax:
 				return
-			frame_pos = frames_local[int(slider_review.val)]
-			_apply_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
+			frame_pos = int(slider_review.val)
+			_apply_snapped_edit(frame_pos, camera_name, bodypart_name, float(event.xdata), float(event.ydata))
 			drag_state["moved"] = True
 			_set_active_marker(frame_pos, camera_name, bodypart_name)
 			_redraw_review()
@@ -1356,13 +1548,21 @@ def make_postanalysis_overlay_popout(
 			_redraw_review()
 
 		def _on_review_prev(_event: Any) -> None:
-			slider_review.set_val((int(slider_review.val) - 1) % len(frames_local))
+			nonlocal active_selected_index
+			active_selected_index = int((active_selected_index - 1) % len(frames_local))
+			slider_review.set_val(float(frames_local[active_selected_index]))
 
 		def _on_review_next(_event: Any) -> None:
-			slider_review.set_val((int(slider_review.val) + 1) % len(frames_local))
+			nonlocal active_selected_index
+			active_selected_index = int((active_selected_index + 1) % len(frames_local))
+			slider_review.set_val(float(frames_local[active_selected_index]))
+
+		def _on_review_current(_event: Any) -> None:
+			slider_review.set_val(float(frames_local[active_selected_index]))
 
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
+		btn_review_current.on_clicked(_on_review_current)
 		btn_zoom_reset.on_clicked(_on_zoom_reset)
 		slider_review.on_changed(_redraw_review)
 		slider_review_pred_size.on_changed(_redraw_review)
@@ -1379,6 +1579,7 @@ def make_postanalysis_overlay_popout(
 			{
 				"btn_prev": btn_review_prev,
 				"btn_next": btn_review_next,
+				"btn_current": btn_review_current,
 				"btn_zoom_reset": btn_zoom_reset,
 				"slider": slider_review,
 				"pred_size": slider_review_pred_size,
