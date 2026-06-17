@@ -188,6 +188,33 @@ BIRD_BODYPARTS: dict[str, list[str]] = {
         "Keel_Dorsal_Middle",
         "Keel_Dorsal_Inferior",
         "Keel_Inferior"
+    ],
+
+    "Tulio" : [
+        "CraniumRightPosterior",
+        "CraniumLeftPosterior",
+        "CraniumRightMiddle",
+        "CraniumRightAnterior",
+        "CraniumLeftAnterior",
+        "MaxillaRightPosterior",
+        "MaxillaRightAnterior",
+        "MaxillaLeftAnterior",
+        "MaxillaLeftPosterior",
+        "MandibleRightAnterior",
+        "MandibleRightPosterior",
+        "MandibleLeftPosterior",
+        "MandibleLeftAnterior",
+        "NeckSuperior",
+        "NeckCentral",
+        "NeckInferior",
+        "KeelMiddleDeep",
+        "KeelMiddleSuperficial",
+        "KeelCranial",
+        "KeelCaudal",
+        "PelvisLeftMiddle",
+        "PelvisPosterior",
+        "PelvisAnterior",
+        "PelvisRightMiddle"
     ]
 }
 
@@ -432,7 +459,6 @@ def find_latest_snapshot(config_path: Path | str) -> str:
         / "iteration-0"
         / "*"
         / "train"
-        / "snapshots"
         / "snapshot-*.pt"
     )
     snapshots = sorted(_glob.glob(as_posix_str(pattern)))
