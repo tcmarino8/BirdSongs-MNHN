@@ -50,6 +50,211 @@ def find_darkest_pixel(
 	return int(r0), int(c0)
 
 
+def find_dark_blob_centroid(
+	img: np.ndarray,
+	row: float,
+	col: float,
+	occupied: set[tuple[int, int]] | None = None,
+	window_size: int = 9,
+	camera: str = "cam1",
+	background_sigma: float | None = None,
+	min_sigma: float | None = None,
+	max_sigma: float | None = None,
+	sigma_ratio: float | None = None,
+	threshold: float | None = None,
+	overlap: float | None = None,
+	max_match_dist: float = 15.0,
+) -> tuple[int, int]:
+	"""Find nearest DoG blob center to (row, col), with occupied and darkest-pixel fallback."""
+	gray = _to_gray_float(img)
+	blobs = _detect_dark_blobs_blobdog(
+		gray,
+		camera=camera,
+		background_sigma=background_sigma,
+		min_sigma=min_sigma,
+		max_sigma=max_sigma,
+		sigma_ratio=sigma_ratio,
+		threshold=threshold,
+		overlap=overlap,
+	)
+	if blobs.size == 0:
+		return find_darkest_pixel(img, row=row, col=col, occupied=occupied, window_size=window_size)
+
+	used = occupied if occupied is not None else set()
+	target = np.asarray([float(row), float(col)], dtype=float)
+	centers = blobs[:, :2]
+	dists = np.linalg.norm(centers - target[None, :], axis=1)
+	order = np.argsort(dists)
+
+	for idx in order:
+		dist = float(dists[int(idx)])
+		if dist > float(max_match_dist):
+			continue
+		rr = int(round(float(blobs[int(idx), 0])))
+		cc = int(round(float(blobs[int(idx), 1])))
+		if (rr, cc) in used:
+			continue
+		used.add((rr, cc))
+		return rr, cc
+
+	return find_darkest_pixel(img, row=row, col=col, occupied=occupied, window_size=window_size)
+
+
+def _blobdog_camera_defaults(camera: str) -> dict[str, float]:
+	cam = _cam_norm(camera)
+	base = {
+		"background_sigma": 20.0,
+		"min_sigma": 1.0,
+		"max_sigma": 2.0,
+		"sigma_ratio": 1.3,
+		"threshold": 0.03,
+		"overlap": 0.5,
+	}
+	if cam == "cam2":
+		base["min_sigma"] = 1.5
+		base["overlap"] = 0.8
+	return base
+
+
+def _to_gray_float(image: np.ndarray) -> np.ndarray:
+	if image.ndim == 2:
+		return np.asarray(image, dtype=np.float64)
+	if image.ndim >= 3:
+		return np.asarray(image[..., :3], dtype=np.float64).mean(axis=2)
+	raise ValueError("image must be 2D grayscale or 3D RGB-like array")
+
+
+def _detect_dark_blobs_blobdog(
+	gray: np.ndarray,
+	camera: str,
+	background_sigma: float | None = None,
+	min_sigma: float | None = None,
+	max_sigma: float | None = None,
+	sigma_ratio: float | None = None,
+	threshold: float | None = None,
+	overlap: float | None = None,
+) -> np.ndarray:
+	"""Detect dark blobs using the same DoG flow tested in Bead_Segmentation."""
+	try:
+		from scipy.ndimage import gaussian_filter
+		from skimage.feature import blob_dog
+	except Exception:
+		return np.empty((0, 3), dtype=float)
+
+	defaults = _blobdog_camera_defaults(camera)
+	params = {
+		"background_sigma": float(defaults["background_sigma"] if background_sigma is None else background_sigma),
+		"min_sigma": float(defaults["min_sigma"] if min_sigma is None else min_sigma),
+		"max_sigma": float(defaults["max_sigma"] if max_sigma is None else max_sigma),
+		"sigma_ratio": float(defaults["sigma_ratio"] if sigma_ratio is None else sigma_ratio),
+		"threshold": float(defaults["threshold"] if threshold is None else threshold),
+		"overlap": float(defaults["overlap"] if overlap is None else overlap),
+	}
+
+	bg = gaussian_filter(gray, sigma=float(params["background_sigma"]))
+	hp = bg - gray
+	rng = float(hp.max() - hp.min())
+	if not np.isfinite(rng) or rng <= 1e-12:
+		return np.empty((0, 3), dtype=float)
+	hp = (hp - float(hp.min())) / rng
+
+	blobs = blob_dog(
+		hp,
+		min_sigma=float(params["min_sigma"]),
+		max_sigma=float(params["max_sigma"]),
+		sigma_ratio=float(params["sigma_ratio"]),
+		threshold=float(params["threshold"]),
+		overlap=float(params["overlap"]),
+	)
+	if blobs is None or len(blobs) == 0:
+		return np.empty((0, 3), dtype=float)
+	return np.asarray(blobs, dtype=float)
+
+
+def _extract_camera_predictions(row: pd.Series, camera: str) -> tuple[np.ndarray, list[str]]:
+	"""Extract camera-specific predicted coordinates as [y, x] and bodypart prefixes."""
+	pred_points: list[list[float]] = []
+	bodyparts: list[str] = []
+	x_suffix = f"_{_cam_norm(camera)}_X"
+
+	for col in row.index:
+		col_str = str(col)
+		if not col_str.endswith(x_suffix):
+			continue
+		prefix = col_str[:-2]
+		x_val = float(pd.to_numeric(row.get(f"{prefix}_X"), errors="coerce"))
+		y_val = float(pd.to_numeric(row.get(f"{prefix}_Y"), errors="coerce"))
+		if not (np.isfinite(x_val) and np.isfinite(y_val)):
+			continue
+		pred_points.append([y_val, x_val])
+		bodyparts.append(prefix)
+
+	if not pred_points:
+		return np.empty((0, 2), dtype=float), []
+	return np.asarray(pred_points, dtype=float), bodyparts
+
+
+def _correct_camera_frame(
+	image: np.ndarray,
+	row: pd.Series,
+	camera: str = "cam1",
+	background_sigma: float | None = None,
+	min_sigma: float | None = None,
+	max_sigma: float | None = None,
+	sigma_ratio: float | None = None,
+	threshold: float | None = None,
+	overlap: float | None = None,
+	max_match_dist: float = 15.0,
+) -> dict[str, float]:
+	"""Correct one camera row using DoG blobs + Hungarian assignment (Cell 47-54 flow)."""
+	try:
+		from scipy.optimize import linear_sum_assignment
+		from scipy.spatial.distance import cdist
+	except Exception:
+		return {}
+
+	gray = _to_gray_float(image)
+	blobs = _detect_dark_blobs_blobdog(
+		gray,
+		camera=camera,
+		background_sigma=background_sigma,
+		min_sigma=min_sigma,
+		max_sigma=max_sigma,
+		sigma_ratio=sigma_ratio,
+		threshold=threshold,
+		overlap=overlap,
+	)
+	if blobs.size == 0:
+		return {}
+
+	pred_points, bodyparts = _extract_camera_predictions(row, camera)
+	if pred_points.size == 0:
+		return {}
+
+	blob_centers = blobs[:, :2]
+	D = cdist(pred_points, blob_centers)
+	D[D > float(max_match_dist)] = 1e6
+
+	pred_idx, blob_idx = linear_sum_assignment(D)
+	valid = D[pred_idx, blob_idx] < float(max_match_dist)
+
+	updates: dict[str, float] = {}
+	for p, b in zip(pred_idx[valid], blob_idx[valid]):
+		py, px = pred_points[int(p)]
+		by, bx, sigma = blobs[int(b)]
+		radius = float(sigma) * float(np.sqrt(2.0))
+		dist = float(np.hypot(py - by, px - bx))
+		if dist > radius:
+			py = float(by)
+			px = float(bx)
+
+		bp = str(bodyparts[int(p)])
+		updates[f"{bp}_X"] = float(px)
+		updates[f"{bp}_Y"] = float(py)
+
+	return updates
+
+
 def parse_frame_number_from_stem(stem: str) -> int | None:
 	"""Extract the last integer token from a file stem."""
 	match = re.search(r"(\d+)(?!.*\d)", stem)
@@ -621,17 +826,109 @@ def make_postanalysis_overlay_popout(
 		)
 		return dino_components
 
-	def _pred_points(camera: str, frame_id: int) -> pd.DataFrame:
+	def _build_frame_alignment(ids_series: pd.Series, image_paths: list[Path]) -> dict[str, Any]:
+		ids = {
+			int(v)
+			for v in pd.to_numeric(ids_series, errors="coerce").dropna().astype(int).tolist()
+		}
+		tokens = [parse_frame_number_from_stem(p.stem) for p in image_paths]
+		if not ids:
+			return {"name": "pos", "score": 0.0}
+
+		candidates: list[tuple[str, Any]] = [
+			("token", lambda pos, token: int(token) if token is not None else None),
+			("token+1", lambda pos, token: int(token) + 1 if token is not None else None),
+			("token-1", lambda pos, token: int(token) - 1 if token is not None else None),
+			("pos", lambda pos, token: int(pos)),
+			("pos+1", lambda pos, token: int(pos) + 1),
+		]
+
+		best_name = "pos"
+		best_score = -1.0
+		for name, fn in candidates:
+			valid = 0
+			hits = 0
+			for pos, token in enumerate(tokens):
+				mapped = fn(int(pos), token)
+				if mapped is None:
+					continue
+				valid += 1
+				if int(mapped) in ids:
+					hits += 1
+			score = float(hits) / float(valid) if valid > 0 else 0.0
+			if score > best_score:
+				best_score = score
+				best_name = name
+
+		return {"name": str(best_name), "score": float(best_score)}
+
+	def _apply_frame_alignment(frame_pos: int, image_path: Path, alignment: dict[str, Any]) -> int:
+		token = parse_frame_number_from_stem(image_path.stem)
+		mode = str(alignment.get("name", "pos"))
+		if mode == "token" and token is not None:
+			return int(token)
+		if mode == "token+1" and token is not None:
+			return int(token) + 1
+		if mode == "token-1" and token is not None:
+			return int(token) - 1
+		if mode == "pos+1":
+			return int(frame_pos) + 1
+		return int(frame_pos)
+
+	pred_alignment_by_cam: dict[str, dict[str, Any]] = {}
+	truth_alignment_by_cam: dict[str, dict[str, Any]] = {}
+	for _camera_name in ("cam1", "cam2"):
+		cam_images = state.images_by_cam.get(_camera_name, [])
+		pred_cam = state.pred_long[state.pred_long["camera"] == _camera_name]
+		if pred_cam.empty:
+			pred_alignment_by_cam[_camera_name] = {"name": "pos", "score": 0.0}
+		else:
+			pred_alignment_by_cam[_camera_name] = _build_frame_alignment(pred_cam["frame_id"], cam_images)
+
+		if state.truth_long.empty:
+			truth_alignment_by_cam[_camera_name] = pred_alignment_by_cam[_camera_name]
+		else:
+			truth_cam = state.truth_long[state.truth_long["camera"] == _camera_name]
+			if truth_cam.empty:
+				truth_alignment_by_cam[_camera_name] = pred_alignment_by_cam[_camera_name]
+			else:
+				truth_alignment_by_cam[_camera_name] = _build_frame_alignment(truth_cam["frame_id"], cam_images)
+
+	for _camera_name in ("cam1", "cam2"):
+		_pred_mode = pred_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
+		_pred_score = pred_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
+		_truth_mode = truth_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
+		_truth_score = truth_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
+		print(
+			f"Frame alignment {_camera_name}: pred={_pred_mode} ({_pred_score:.3f}), "
+			f"truth={_truth_mode} ({_truth_score:.3f})"
+		)
+
+	def _frame_pos_to_pred_id(camera: str, frame_pos: int) -> int:
+		images = state.images_by_cam.get(camera, [])
+		if not (0 <= int(frame_pos) < len(images)):
+			return int(frame_pos)
+		return _apply_frame_alignment(int(frame_pos), images[int(frame_pos)], pred_alignment_by_cam.get(camera, {"name": "pos"}))
+
+	def _frame_pos_to_truth_id(camera: str, frame_pos: int) -> int:
+		images = state.images_by_cam.get(camera, [])
+		if not (0 <= int(frame_pos) < len(images)):
+			return int(frame_pos)
+		return _apply_frame_alignment(int(frame_pos), images[int(frame_pos)], truth_alignment_by_cam.get(camera, {"name": "pos"}))
+
+	def _pred_points(camera: str, frame_pos: int) -> pd.DataFrame:
+		mapped_frame_id = _frame_pos_to_pred_id(camera, int(frame_pos))
 		d = state.pred_long[
-			(state.pred_long["camera"] == camera) & (state.pred_long["frame_id"] == int(frame_id))
+			(state.pred_long["camera"] == camera) & (state.pred_long["frame_id"] == int(mapped_frame_id))
 		].copy()
 		return d[["bodypart", "x_pred", "y_pred", "likelihood"]].rename(columns={"x_pred": "x", "y_pred": "y"})
 
-	def _true_points(camera: str, frame_id: int) -> pd.DataFrame:
+	def _true_points(camera: str, frame_pos: int) -> pd.DataFrame:
 		if state.truth_long.empty:
 			return pd.DataFrame(columns=["bodypart", "x", "y"])
+		mapped_frame_id = _frame_pos_to_truth_id(camera, int(frame_pos))
 		d = state.truth_long[
-			(state.truth_long["camera"] == camera) & (state.truth_long["frame_id"] == int(frame_id))
+			(state.truth_long["camera"] == camera) & (state.truth_long["frame_id"] == int(mapped_frame_id))
 		].copy()
 		return d[["bodypart", "x_true", "y_true"]].rename(columns={"x_true": "x", "y_true": "y"})
 
@@ -1065,11 +1362,17 @@ def make_postanalysis_overlay_popout(
 		ax_review_current = review_fig.add_axes([0.59, 0.09, 0.11, 0.05])
 		ax_review_pred_size = review_fig.add_axes([0.72, 0.095, 0.11, 0.03])
 		ax_review_true_size = review_fig.add_axes([0.84, 0.095, 0.11, 0.03])
+		ax_bulk_snap = review_fig.add_axes([0.60, 0.03, 0.11, 0.065])
+		ax_snap_mode = review_fig.add_axes([0.72, 0.035, 0.11, 0.055])
 		ax_zoom_reset = review_fig.add_axes([0.84, 0.045, 0.12, 0.04])
+		ax_apply_frame = review_fig.add_axes([0.72, 0.005, 0.24, 0.025])
 		btn_review_prev = Button(ax_review_prev, "<")
 		btn_review_next = Button(ax_review_next, ">")
 		btn_review_current = Button(ax_review_current, "Current Frame")
 		btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
+		btn_apply_frame = Button(ax_apply_frame, "Apply Snap To Frame")
+		check_bulk_snap = CheckButtons(ax_bulk_snap, ["Auto snap frame"], [False])
+		radio_snap_mode = RadioButtons(ax_snap_mode, ["blob", "darkest"], active=0)
 		slider_review = Slider(
 			ax_review_slider,
 			"frame_pos",
@@ -1110,6 +1413,7 @@ def make_postanalysis_overlay_popout(
 		active_selected_index = 0
 		drag_state: dict[str, Any] = {"active": False, "camera": None, "bodypart": None, "moved": False}
 		zoom_half_window: dict[str, float] = {"cam1": 15.0, "cam2": 15.0}
+		last_bulk_apply_signature: tuple[int, str] | None = None
 		hit_threshold_px = 12.0
 		export_frames = sorted(set(int(frame) for frame in frames_local))
 
@@ -1251,9 +1555,10 @@ def make_postanalysis_overlay_popout(
 				"bodypart": str(bodypart_name),
 			}
 
-		def _apply_edit(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> None:
+		def _apply_edit(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float, autosave: bool = True) -> None:
 			correction_cache[(int(frame_pos), str(camera_name), str(bodypart_name))] = (float(x_val), float(y_val))
-			_autosave_corrections()
+			if bool(autosave):
+				_autosave_corrections()
 
 		def _snap_to_dark_pixel(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> tuple[float, float]:
 			images = state.images_by_cam.get(camera_name, [])
@@ -1274,19 +1579,117 @@ def make_postanalysis_overlay_popout(
 				old_rr, old_cc = correction_pixel_index[key]
 				occupied_pixels.discard((int(old_rr), int(old_cc)))
 
-			rr, cc = find_darkest_pixel(
-				gray_img,
-				row=float(y_val),
-				col=float(x_val),
-				occupied=occupied_pixels,
-				window_size=5,
-			)
+			snap_mode = str(radio_snap_mode.value_selected).lower().strip()
+			if snap_mode == "darkest":
+				rr, cc = find_darkest_pixel(
+					gray_img,
+					row=float(y_val),
+					col=float(x_val),
+					occupied=occupied_pixels,
+					window_size=5,
+				)
+			else:
+				rr, cc = find_dark_blob_centroid(
+					gray_img,
+					row=float(y_val),
+					col=float(x_val),
+					occupied=occupied_pixels,
+					window_size=9,
+					camera=str(camera_name),
+					background_sigma=20.0,
+					max_sigma=2.0,
+					sigma_ratio=1.3,
+					threshold=0.03,
+					max_match_dist=15.0,
+				)
 			correction_pixel_index[key] = (int(rr), int(cc))
 			return float(cc), float(rr)
 
 		def _apply_snapped_edit(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> None:
 			snapped_x, snapped_y = _snap_to_dark_pixel(frame_pos, camera_name, bodypart_name, x_val, y_val)
 			_apply_edit(frame_pos, camera_name, bodypart_name, snapped_x, snapped_y)
+
+		def _apply_snap_to_entire_frame(frame_pos: int) -> int:
+			snap_mode = str(radio_snap_mode.value_selected).lower().strip()
+			update_count = 0
+			for camera_name in ("cam1", "cam2"):
+				images = state.images_by_cam.get(camera_name, [])
+				if not (0 <= int(frame_pos) < len(images)):
+					continue
+
+				if snap_mode == "blob":
+					pts = _pred_points(camera_name, int(frame_pos))
+					if pts.empty:
+						continue
+
+					row_data: dict[str, float] = {}
+					for _, pred_row in pts.iterrows():
+						bodypart_name = str(pred_row["bodypart"])
+						key = (int(frame_pos), str(camera_name), bodypart_name)
+						if key in correction_cache:
+							x_src, y_src = correction_cache[key]
+						else:
+							x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
+							y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						if not (np.isfinite(x_src) and np.isfinite(y_src)):
+							continue
+						prefix = f"{bodypart_name}_{camera_name}"
+						row_data[f"{prefix}_X"] = float(x_src)
+						row_data[f"{prefix}_Y"] = float(y_src)
+
+					if not row_data:
+						continue
+
+					with Image.open(images[int(frame_pos)]) as image_file:
+						gray_img = np.asarray(image_file.convert("L"), dtype=np.float64)
+
+					updates = _correct_camera_frame(
+						image=gray_img,
+						row=pd.Series(row_data),
+						camera=str(camera_name),
+						background_sigma=20.0,
+						max_sigma=2.0,
+						sigma_ratio=1.3,
+						threshold=0.03,
+						overlap=0.5 if str(camera_name) == "cam1" else 0.8,
+						min_sigma=1.0 if str(camera_name) == "cam1" else 1.5,
+						max_match_dist=15.0,
+					)
+
+					for col, value in updates.items():
+						if not str(col).endswith(f"_{camera_name}_X"):
+							continue
+						bodypart_name = str(col)[: -len(f"_{camera_name}_X")]
+						y_col = f"{bodypart_name}_{camera_name}_Y"
+						if y_col not in updates:
+							continue
+						x_new = float(pd.to_numeric(value, errors="coerce"))
+						y_new = float(pd.to_numeric(updates[y_col], errors="coerce"))
+						if not (np.isfinite(x_new) and np.isfinite(y_new)):
+							continue
+						_apply_edit(int(frame_pos), str(camera_name), bodypart_name, x_new, y_new, autosave=False)
+						correction_pixel_index[(int(frame_pos), str(camera_name), bodypart_name)] = (int(round(y_new)), int(round(x_new)))
+						update_count += 1
+				else:
+					pts = _pred_points(camera_name, int(frame_pos))
+					if pts.empty:
+						continue
+					for _, pred_row in pts.iterrows():
+						bodypart_name = str(pred_row["bodypart"])
+						key = (int(frame_pos), str(camera_name), str(bodypart_name))
+						if key in correction_cache:
+							x_src, y_src = correction_cache[key]
+						else:
+							x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
+							y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						if not (np.isfinite(x_src) and np.isfinite(y_src)):
+							continue
+						snapped_x, snapped_y = _snap_to_dark_pixel(int(frame_pos), str(camera_name), bodypart_name, float(x_src), float(y_src))
+						_apply_edit(int(frame_pos), str(camera_name), bodypart_name, float(snapped_x), float(snapped_y), autosave=False)
+						update_count += 1
+			if update_count > 0:
+				_autosave_corrections()
+			return int(update_count)
 
 		def _active_marker_xy(camera_name: str, frame_pos: int) -> tuple[float, float] | None:
 			if active_marker is None:
@@ -1306,9 +1709,14 @@ def make_postanalysis_overlay_popout(
 			btn_review_next.label.set_fontsize(button_font)
 			btn_review_current.label.set_fontsize(control_font)
 			btn_zoom_reset.label.set_fontsize(control_font)
+			btn_apply_frame.label.set_fontsize(control_font)
 			for sld in (slider_review, slider_review_pred_size, slider_review_true_size):
 				sld.label.set_fontsize(control_font)
 				sld.valtext.set_fontsize(value_font)
+			for txt in radio_snap_mode.labels:
+				txt.set_fontsize(control_font)
+			for txt in check_bulk_snap.labels:
+				txt.set_fontsize(control_font)
 			review_fig.canvas.draw_idle()
 
 		manager = getattr(review_fig.canvas, "manager", None)
@@ -1330,7 +1738,17 @@ def make_postanalysis_overlay_popout(
 
 		def _redraw_review(*_args: Any) -> None:
 			nonlocal active_selected_index
+			nonlocal last_bulk_apply_signature
 			frame_pos = int(slider_review.val)
+			auto_bulk_enabled = bool(check_bulk_snap.get_status()[0])
+			snap_mode = str(radio_snap_mode.value_selected)
+			bulk_signature = (int(frame_pos), str(snap_mode))
+			if auto_bulk_enabled:
+				if last_bulk_apply_signature != bulk_signature:
+					_apply_snap_to_entire_frame(int(frame_pos))
+					last_bulk_apply_signature = bulk_signature
+			else:
+				last_bulk_apply_signature = None
 			if frame_pos in frames_local:
 				active_selected_index = int(frames_local.index(frame_pos))
 			if active_marker is not None and int(active_marker.get("frame_pos", -1)) != int(frame_pos):
@@ -1433,7 +1851,7 @@ def make_postanalysis_overlay_popout(
 				review_ax.set_aspect("equal")
 
 			review_fig.suptitle(
-				f"Correction Review | {method_name.title()} | frame {frame_pos} of 0-{max_review_frame} | selected {active_selected_index + 1}/{len(frames_local)} (frame {frames_local[active_selected_index]}) | edits {len(correction_cache)}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate (snaps to local dark center).",
+				f"Correction Review | {method_name.title()} | frame {frame_pos} of 0-{max_review_frame} | selected {active_selected_index + 1}/{len(frames_local)} (frame {frames_local[active_selected_index]}) | edits {len(correction_cache)} | snap={radio_snap_mode.value_selected} | auto_frame_snap={auto_bulk_enabled}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate.",
 				fontsize=_scaled_font(review_fig, base_size=11.0, ref_w=16.0, ref_h=9.0, min_size=9.0, max_size=16.0),
 			)
 			review_fig.canvas.draw_idle()
@@ -1560,13 +1978,30 @@ def make_postanalysis_overlay_popout(
 		def _on_review_current(_event: Any) -> None:
 			slider_review.set_val(float(frames_local[active_selected_index]))
 
+		def _on_apply_frame(_event: Any) -> None:
+			nonlocal last_bulk_apply_signature
+			frame_pos = int(slider_review.val)
+			updated = _apply_snap_to_entire_frame(frame_pos)
+			last_bulk_apply_signature = (int(frame_pos), str(radio_snap_mode.value_selected))
+			print(f"Bulk frame snap: updated {updated} points on frame {frame_pos}.")
+			_redraw_review()
+
+		def _on_bulk_toggle(_label: str) -> None:
+			nonlocal last_bulk_apply_signature
+			if not bool(check_bulk_snap.get_status()[0]):
+				last_bulk_apply_signature = None
+			_redraw_review()
+
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
 		btn_review_current.on_clicked(_on_review_current)
 		btn_zoom_reset.on_clicked(_on_zoom_reset)
+		btn_apply_frame.on_clicked(_on_apply_frame)
 		slider_review.on_changed(_redraw_review)
 		slider_review_pred_size.on_changed(_redraw_review)
 		slider_review_true_size.on_changed(_redraw_review)
+		check_bulk_snap.on_clicked(_on_bulk_toggle)
+		radio_snap_mode.on_clicked(_redraw_review)
 		review_fig.canvas.mpl_connect("scroll_event", _on_review_scroll)
 		review_fig.canvas.mpl_connect("button_press_event", _on_review_press)
 		review_fig.canvas.mpl_connect("motion_notify_event", _on_review_motion)
@@ -1581,9 +2016,12 @@ def make_postanalysis_overlay_popout(
 				"btn_next": btn_review_next,
 				"btn_current": btn_review_current,
 				"btn_zoom_reset": btn_zoom_reset,
+				"btn_apply_frame": btn_apply_frame,
 				"slider": slider_review,
 				"pred_size": slider_review_pred_size,
 				"true_size": slider_review_true_size,
+				"bulk_snap": check_bulk_snap,
+				"snap_mode": radio_snap_mode,
 				"zoom_axes": zoom_axes,
 			},
 		)
@@ -1823,18 +2261,16 @@ def make_postanalysis_overlay_popout(
 			return
 
 		image_path = imgs[frame_pos]
-		# Use stack position as the canonical frame id for overlay matching.
-		# This ensures the first image is always frame 0 regardless of filename token.
-		frame_id_img = int(frame_pos)
+		frame_id_pred = int(_frame_pos_to_pred_id(camera, frame_pos))
 		name_frame_token = parse_frame_number_from_stem(image_path.stem)
-		truth_frame_id = int(frame_id_img)
+		truth_frame_id = int(_frame_pos_to_truth_id(camera, frame_pos))
 
 		with Image.open(image_path) as im:
 			img = np.asarray(im.convert("RGB"))
 		ax.imshow(img)
 
 		if show_pred:
-			pred_pts = _pred_points(camera, frame_id_img)
+			pred_pts = _pred_points(camera, frame_pos)
 			if not pred_pts.empty:
 				pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
 			if not pred_pts.empty:
@@ -1898,8 +2334,8 @@ def make_postanalysis_overlay_popout(
 					)
 
 		ax.set_title(
-			f"{camera} | frame_pos={frame_pos} | image_frame_id={frame_id_img} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
-			f"pred_csv={state.pred_csv_by_cam[camera].name} | point_customizer={color_mode}"
+			f"{camera} | frame_pos={frame_pos} | pred_frame_id={frame_id_pred} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
+			f"pred_csv={state.pred_csv_by_cam[camera].name} | align_pred={pred_alignment_by_cam[camera]['name']} | align_truth={truth_alignment_by_cam[camera]['name']} | point_customizer={color_mode}"
 		)
 		_update_selection_info(frame_pos)
 		_draw_selection_markers()
@@ -2040,6 +2476,43 @@ def make_postanalysis_overlay_popout(
 		except Exception as exc:
 			print(f"Correction export failed: {exc}")
 
+	def _prompt_open_existing_active_updates() -> None:
+		available_sets = _list_active_update_sets()
+		if not available_sets:
+			return
+
+		message = (
+			f"Found {len(available_sets)} correction set(s) in active_updates under:\n"
+			f"{state.pred_root}\n\n"
+			"Open Correction Tab now?"
+		)
+
+		open_now = False
+		try:
+			import tkinter as tk
+			from tkinter import messagebox
+
+			prompt_root = tk.Tk()
+			prompt_root.withdraw()
+			prompt_root.attributes("-topmost", True)
+			open_now = bool(
+				messagebox.askyesno(
+					title="Existing Corrections Found",
+					message=message,
+				)
+			)
+			prompt_root.destroy()
+		except Exception:
+			print(message)
+			print("Tip: click 'Correction Tab' to open these sets.")
+			return
+
+		if open_now:
+			try:
+				_open_active_updates_browser()
+			except Exception as exc:
+				print(f"Could not open Correction Tab automatically: {exc}")
+
 	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
 	btn_correction_tab.on_clicked(_on_open_correction_tab)
@@ -2062,6 +2535,7 @@ def make_postanalysis_overlay_popout(
 	fig.canvas.mpl_connect("button_press_event", _on_click)
 	fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
+	_prompt_open_existing_active_updates()
 	_set_selection_controls_visible(False)
 	redraw()
 	print("Close the plot window to exit.")
