@@ -713,26 +713,24 @@ def make_postanalysis_overlay_popout(
 	ax_like = fig.add_axes([0.08, 0.21, 0.62, 0.03])
 	ax_pred_size = fig.add_axes([0.08, 0.16, 0.29, 0.03])
 	ax_pred_alpha = fig.add_axes([0.41, 0.16, 0.29, 0.03])
-	ax_true_size = fig.add_axes([0.08, 0.11, 0.29, 0.03])
-	ax_true_alpha = fig.add_axes([0.41, 0.11, 0.29, 0.03])
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
-	ax_true_color = fig.add_axes([0.82, 0.345, 0.16, 0.035])
-	ax_window_start = fig.add_axes([0.82, 0.685, 0.075, 0.03])
+	ax_nframes = fig.add_axes([0.82, 0.345, 0.16, 0.035])
+	ax_window_start = fig.add_axes([0.82, 0.685, 0.060, 0.03])
 	ax_window_end = fig.add_axes([0.905, 0.685, 0.075, 0.03])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 	ax_selection_info = fig.add_axes([0.82, 0.005, 0.16, 0.035])
+	ax_info_frame = fig.add_axes([0.045, 0.255, 0.022, 0.035])
+	ax_info_like = fig.add_axes([0.045, 0.205, 0.022, 0.035])
+	ax_info_nframes = fig.add_axes([0.79, 0.345, 0.022, 0.035])
+	ax_info_range = fig.add_axes([0.975, 0.708, 0.018, 0.026])
 
 	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
-	check = CheckButtons(ax_checks, ["Show pred", "Show true", "Annotate"], [True, False, False])
+	check = CheckButtons(ax_checks, ["Show pred", "Annotate"], [True, False])
 	btn_correction_tab = Button(ax_correction_tab, "Correction Tab")
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
 	btn_correction = Button(ax_correction, "Save Correction Frames")
-	if not state.truth_found:
-		labels = check.labels
-		if len(labels) >= 2:
-			labels[1].set_alpha(0.35)
 
 	btn_prev = Button(ax_prev, "<")
 	slider_frame = Slider(ax_frame, "frame_pos", 0, float(max_len), valinit=float(start_pos), valstep=1)
@@ -741,14 +739,80 @@ def make_postanalysis_overlay_popout(
 	slider_like = Slider(ax_like, "min_likelihood", 0.0, 1.0, valinit=0.0, valstep=0.01)
 	slider_pred_size = Slider(ax_pred_size, "pred_size", 10, 300, valinit=60, valstep=1)
 	slider_pred_alpha = Slider(ax_pred_alpha, "pred_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
-	slider_true_size = Slider(ax_true_size, "true_size", 10, 300, valinit=45, valstep=1)
-	slider_true_alpha = Slider(ax_true_alpha, "true_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
 	textbox_pred_color = TextBox(ax_pred_color, "pred_color", initial="deepskyblue")
-	textbox_true_color = TextBox(ax_true_color, "true_color", initial="orange")
-	textbox_window_start = TextBox(ax_window_start, "w0", initial="0")
-	textbox_window_end = TextBox(ax_window_end, "w1", initial="1")
+	textbox_nframes = TextBox(ax_nframes, "corr_frames", initial="30")
+	textbox_window_start = TextBox(ax_window_start, "Start", initial="0")
+	textbox_window_end = TextBox(ax_window_end, "Last", initial="1")
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
 	ax_selection_info.set_axis_off()
+	range_title_text = fig.text(0.82, 0.72, "Select Frame Range", fontsize=9, fontweight="bold")
+
+	info_buttons: list[Button] = []
+
+	def _add_info_bubble(info_ax: Any, message: str) -> Button:
+		btn = Button(info_ax, "i")
+		btn.color = "#f2f2f2"
+		btn.hovercolor = "#dceeff"
+		btn.label.set_fontsize(8)
+
+		def _on_info(_event: Any) -> None:
+			try:
+				import tkinter as tk
+				from tkinter import messagebox
+
+				popup_root = tk.Tk()
+				popup_root.withdraw()
+				popup_root.attributes("-topmost", True)
+				messagebox.showinfo(title="Information", message=message)
+				popup_root.destroy()
+			except Exception:
+				print(f"Info: {message}")
+
+		btn.on_clicked(_on_info)
+		info_buttons.append(btn)
+		return btn
+
+	_add_info_bubble(ax_info_frame, "Frame selector: move through synchronized image frames.")
+	_add_info_bubble(ax_info_like, "Min likelihood: hide points with lower confidence.")
+	_add_info_bubble(ax_info_nframes, "Correction set size: choose 30, 40, or 50 frames.")
+	_add_info_bubble(
+		ax_info_range,
+		"Many of the frames will be black, so select the range where they are colorred. This is usually around 2500 frames.",
+	)
+
+	def _layout_main_axes() -> None:
+		fig_w, _ = fig.get_size_inches()
+		if fig_w >= 12.0:
+			right_x = 0.82
+			right_w = 0.16
+			left_info_x = 0.045
+		else:
+			right_x = 0.78
+			right_w = 0.20
+			left_info_x = 0.03
+
+		fig.subplots_adjust(left=0.08, right=max(0.76, right_x - 0.02), bottom=0.35)
+
+		ax_correction_tab.set_position([right_x, 0.92, right_w, 0.05])
+		ax_cam.set_position([right_x, 0.72, right_w, 0.18])
+		ax_checks.set_position([right_x, 0.49, right_w, 0.19])
+		ax_select_random.set_position([right_x, 0.20, right_w, 0.04])
+		ax_select_displacement.set_position([right_x, 0.15, right_w, 0.04])
+		ax_select_dino.set_position([right_x, 0.10, right_w, 0.04])
+		ax_correction.set_position([right_x, 0.05, right_w, 0.04])
+		ax_pred_color.set_position([right_x, 0.40, right_w, 0.035])
+		ax_nframes.set_position([right_x, 0.345, right_w, 0.035])
+		ax_window_start.set_position([right_x, 0.685, right_w * 0.45, 0.03])
+		ax_window_end.set_position([right_x + right_w * 0.50, 0.685, right_w * 0.50, 0.03])
+		ax_color_mode.set_position([right_x, 0.25, right_w, 0.08])
+		ax_selection_info.set_position([right_x, 0.005, right_w, 0.035])
+
+		ax_info_frame.set_position([left_info_x, 0.255, 0.022, 0.035])
+		ax_info_like.set_position([left_info_x, 0.205, 0.022, 0.035])
+		ax_info_nframes.set_position([max(0.0, right_x - 0.028), 0.345, 0.022, 0.035])
+		ax_info_range.set_position([min(0.98, right_x + right_w + 0.004), 0.708, 0.018, 0.026])
+
+		range_title_text.set_position((right_x, 0.72))
 
 	def _scaled_font(figure_obj: Any, base_size: float, ref_w: float, ref_h: float, min_size: float, max_size: float) -> float:
 		fig_w, fig_h = figure_obj.get_size_inches()
@@ -756,6 +820,7 @@ def make_postanalysis_overlay_popout(
 		return float(np.clip(base_size * scale, min_size, max_size))
 
 	def _apply_main_widget_scaling(_event: Any = None) -> None:
+		_layout_main_axes()
 		button_font = _scaled_font(fig, base_size=9.5, ref_w=12.2, ref_h=8.4, min_size=8.0, max_size=16.0)
 		control_font = _scaled_font(fig, base_size=9.0, ref_w=12.2, ref_h=8.4, min_size=7.5, max_size=14.0)
 		value_font = _scaled_font(fig, base_size=8.5, ref_w=12.2, ref_h=8.4, min_size=7.0, max_size=13.0)
@@ -770,17 +835,19 @@ def make_postanalysis_overlay_popout(
 		for txt in radio_color_mode.labels:
 			txt.set_fontsize(control_font)
 
-		for sld in (slider_frame, slider_like, slider_pred_size, slider_pred_alpha, slider_true_size, slider_true_alpha):
+		for sld in (slider_frame, slider_like, slider_pred_size, slider_pred_alpha):
 			sld.label.set_fontsize(control_font)
 			sld.valtext.set_fontsize(value_font)
 
-		for txtbox in (textbox_pred_color, textbox_true_color):
+		for txtbox in (textbox_pred_color, textbox_nframes):
 			txtbox.label.set_fontsize(control_font)
 			txtbox.text_disp.set_fontsize(value_font)
 
 		for txtbox in (textbox_window_start, textbox_window_end):
 			txtbox.label.set_fontsize(control_font)
 			txtbox.text_disp.set_fontsize(value_font)
+
+		range_title_text.set_fontsize(control_font)
 
 		fig.canvas.draw_idle()
 
@@ -1008,6 +1075,17 @@ def make_postanalysis_overlay_popout(
 			return np.asarray([], dtype=int)
 		return np.arange(window_start, window_end + 1, dtype=int)
 
+	def _target_correction_count() -> int:
+		allowed = np.asarray([30, 40, 50], dtype=int)
+		try:
+			requested = int(float(str(textbox_nframes.text).strip()))
+		except Exception:
+			requested = 30
+		chosen = int(allowed[np.argmin(np.abs(allowed - requested))])
+		if str(textbox_nframes.text).strip() != str(chosen):
+			textbox_nframes.set_val(str(chosen))
+		return chosen
+
 	def _allocate_counts(weights: list[float], total_count: int) -> list[int]:
 		if total_count <= 0 or not weights:
 			return [0 for _ in weights]
@@ -1035,7 +1113,7 @@ def make_postanalysis_overlay_popout(
 
 	def _build_random_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
 		candidates = _window_frame_candidates()
-		count = min(30, int(candidates.size))
+		count = min(_target_correction_count(), int(candidates.size))
 		if count <= 0:
 			return [], {}, ["Random", "No frames in window"]
 
@@ -1047,7 +1125,7 @@ def make_postanalysis_overlay_popout(
 	def _build_displacement_selection() -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
 		window_start, window_end = _current_selection_window()
 		frame_limit = int(max(0, window_end - window_start + 1))
-		count = min(30, frame_limit)
+		count = min(_target_correction_count(), frame_limit)
 		zones = _build_zone_specs(frame_limit)
 		if count <= 0 or not zones:
 			return [], {}, ["Disp", "No frames in window"]
@@ -1182,7 +1260,7 @@ def make_postanalysis_overlay_popout(
 
 	def _build_dino_selection(camera: str) -> tuple[list[int], dict[int, dict[str, Any]], list[str]]:
 		candidates = _window_frame_candidates()
-		count = min(30, int(candidates.size))
+		count = min(_target_correction_count(), int(candidates.size))
 		if count <= 0:
 			return [], {}, ["DINO", "No frames in window"]
 
@@ -1361,7 +1439,6 @@ def make_postanalysis_overlay_popout(
 		ax_review_next = review_fig.add_axes([0.53, 0.09, 0.05, 0.05])
 		ax_review_current = review_fig.add_axes([0.59, 0.09, 0.11, 0.05])
 		ax_review_pred_size = review_fig.add_axes([0.72, 0.095, 0.11, 0.03])
-		ax_review_true_size = review_fig.add_axes([0.84, 0.095, 0.11, 0.03])
 		ax_bulk_snap = review_fig.add_axes([0.60, 0.03, 0.11, 0.065])
 		ax_snap_mode = review_fig.add_axes([0.72, 0.035, 0.11, 0.055])
 		ax_zoom_reset = review_fig.add_axes([0.84, 0.045, 0.12, 0.04])
@@ -1387,14 +1464,6 @@ def make_postanalysis_overlay_popout(
 			10,
 			300,
 			valinit=float(slider_pred_size.val),
-			valstep=1,
-		)
-		slider_review_true_size = Slider(
-			ax_review_true_size,
-			"true_size",
-			10,
-			300,
-			valinit=float(slider_true_size.val),
 			valstep=1,
 		)
 		zoom_axes = {
@@ -1710,7 +1779,7 @@ def make_postanalysis_overlay_popout(
 			btn_review_current.label.set_fontsize(control_font)
 			btn_zoom_reset.label.set_fontsize(control_font)
 			btn_apply_frame.label.set_fontsize(control_font)
-			for sld in (slider_review, slider_review_pred_size, slider_review_true_size):
+			for sld in (slider_review, slider_review_pred_size):
 				sld.label.set_fontsize(control_font)
 				sld.valtext.set_fontsize(value_font)
 			for txt in radio_snap_mode.labels:
@@ -1753,15 +1822,11 @@ def make_postanalysis_overlay_popout(
 				active_selected_index = int(frames_local.index(frame_pos))
 			if active_marker is not None and int(active_marker.get("frame_pos", -1)) != int(frame_pos):
 				drag_state["active"] = False
-			show_true = bool(check.get_status()[1]) and state.truth_found
-			annotate = bool(check.get_status()[2])
+			annotate = bool(check.get_status()[1])
 			min_like = float(slider_like.val)
 			pred_size = float(slider_review_pred_size.val)
 			pred_alpha = float(slider_pred_alpha.val)
-			true_size = float(slider_review_true_size.val)
-			true_alpha = float(slider_true_alpha.val)
 			pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
-			true_color = _safe_color(textbox_true_color.text.strip(), "orange")
 
 			for review_ax, camera_name in zip(review_axes, ("cam1", "cam2")):
 				review_ax.clear()
@@ -1805,22 +1870,6 @@ def make_postanalysis_overlay_popout(
 					review_ax.scatter([mx], [my], s=max(220.0, pred_size * 2.5), facecolors="none", edgecolors="lime", linewidths=2.0, zorder=5)
 					review_ax.text(mx + 4, my - 4, str(active_marker["bodypart"]), color="lime", fontsize=8)
 
-				if show_true:
-					true_pts = _true_points(camera_name, frame_pos)
-					if not true_pts.empty:
-						review_ax.scatter(
-							true_pts["x"],
-							true_pts["y"],
-							c=_review_colors(true_pts["bodypart"], true_color),
-							s=true_size,
-							alpha=true_alpha,
-							marker="x",
-							linewidths=1.8,
-						)
-						if annotate:
-							for _, row in true_pts.iterrows():
-								label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if str(radio_color_mode.value_selected) == "by_name" else true_color
-								review_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
 
 				if marker_xy is not None:
 					mx, my = marker_xy
@@ -1999,7 +2048,6 @@ def make_postanalysis_overlay_popout(
 		btn_apply_frame.on_clicked(_on_apply_frame)
 		slider_review.on_changed(_redraw_review)
 		slider_review_pred_size.on_changed(_redraw_review)
-		slider_review_true_size.on_changed(_redraw_review)
 		check_bulk_snap.on_clicked(_on_bulk_toggle)
 		radio_snap_mode.on_clicked(_redraw_review)
 		review_fig.canvas.mpl_connect("scroll_event", _on_review_scroll)
@@ -2019,7 +2067,6 @@ def make_postanalysis_overlay_popout(
 				"btn_apply_frame": btn_apply_frame,
 				"slider": slider_review,
 				"pred_size": slider_review_pred_size,
-				"true_size": slider_review_true_size,
 				"bulk_snap": check_bulk_snap,
 				"snap_mode": radio_snap_mode,
 				"zoom_axes": zoom_axes,
@@ -2232,15 +2279,11 @@ def make_postanalysis_overlay_popout(
 
 		frame_pos = int(slider_frame.val)
 		show_pred = bool(check.get_status()[0])
-		show_true = bool(check.get_status()[1]) and state.truth_found
-		annotate = bool(check.get_status()[2])
+		annotate = bool(check.get_status()[1])
 		min_like = float(slider_like.val)
 		pred_size = float(slider_pred_size.val)
 		pred_alpha = float(slider_pred_alpha.val)
-		true_size = float(slider_true_size.val)
-		true_alpha = float(slider_true_alpha.val)
 		pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
-		true_color = _safe_color(textbox_true_color.text.strip(), "orange")
 		color_mode = str(radio_color_mode.value_selected)
 
 		# Preserve current zoom/pan before redraw so interaction persists.
@@ -2263,7 +2306,6 @@ def make_postanalysis_overlay_popout(
 		image_path = imgs[frame_pos]
 		frame_id_pred = int(_frame_pos_to_pred_id(camera, frame_pos))
 		name_frame_token = parse_frame_number_from_stem(image_path.stem)
-		truth_frame_id = int(_frame_pos_to_truth_id(camera, frame_pos))
 
 		with Image.open(image_path) as im:
 			img = np.asarray(im.convert("RGB"))
@@ -2302,40 +2344,9 @@ def make_postanalysis_overlay_popout(
 						}
 					)
 
-		if show_true:
-			true_pts = _true_points(camera, truth_frame_id)
-			if not true_pts.empty:
-				if color_mode == "by_name":
-					true_colors = [state.bodypart_color_map.get(str(bp), true_color) for bp in true_pts["bodypart"]]
-				else:
-					true_colors = true_color
-				ax.scatter(
-					true_pts["x"],
-					true_pts["y"],
-					c=true_colors,
-					s=true_size,
-					alpha=true_alpha,
-					marker="x",
-					linewidths=1.8,
-					label="True",
-				)
-				if annotate:
-					for _, row in true_pts.iterrows():
-						label_color = state.bodypart_color_map.get(str(row["bodypart"]), true_color) if color_mode == "by_name" else true_color
-						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
-				for _, row in true_pts.iterrows():
-					current_points.append(
-						{
-							"x": float(row["x"]),
-							"y": float(row["y"]),
-							"bodypart": str(row["bodypart"]),
-							"kind": "True",
-						}
-					)
-
 		ax.set_title(
-			f"{camera} | frame_pos={frame_pos} | pred_frame_id={frame_id_pred} | truth_frame_id={truth_frame_id} | file_token={name_frame_token}\n"
-			f"pred_csv={state.pred_csv_by_cam[camera].name} | align_pred={pred_alignment_by_cam[camera]['name']} | align_truth={truth_alignment_by_cam[camera]['name']} | point_customizer={color_mode}"
+			f"{camera} | frame_pos={frame_pos} | pred_frame_id={frame_id_pred} | file_token={name_frame_token}\n"
+			f"pred_csv={state.pred_csv_by_cam[camera].name}"
 		)
 		_update_selection_info(frame_pos)
 		_draw_selection_markers()
@@ -2527,10 +2538,8 @@ def make_postanalysis_overlay_popout(
 	slider_like.on_changed(redraw)
 	slider_pred_size.on_changed(redraw)
 	slider_pred_alpha.on_changed(redraw)
-	slider_true_size.on_changed(redraw)
-	slider_true_alpha.on_changed(redraw)
 	textbox_pred_color.on_submit(redraw)
-	textbox_true_color.on_submit(redraw)
+	textbox_nframes.on_submit(redraw)
 	radio_color_mode.on_clicked(redraw)
 	fig.canvas.mpl_connect("button_press_event", _on_click)
 	fig.canvas.mpl_connect("scroll_event", _on_scroll)
