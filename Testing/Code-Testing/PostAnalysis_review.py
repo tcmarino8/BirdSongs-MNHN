@@ -731,6 +731,10 @@ def make_postanalysis_overlay_popout(
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
 	btn_correction = Button(ax_correction, "Save Correction Frames")
+	# button_use_previous = Button(
+	# 	description="Use Prior Frame",
+	# 	button_style="info",
+	# )
 
 	btn_prev = Button(ax_prev, "<")
 	slider_frame = Slider(ax_frame, "frame", 0, float(max_len), valinit=float(start_pos), valstep=1)
@@ -1435,23 +1439,27 @@ def make_postanalysis_overlay_popout(
 		for review_ax in review_axes:
 			review_ax.set_axis_off()
 
-		ax_review_prev = review_fig.add_axes([0.12, 0.09, 0.05, 0.05])
-		ax_review_slider = review_fig.add_axes([0.18, 0.095, 0.34, 0.035])
-		ax_review_next = review_fig.add_axes([0.53, 0.09, 0.05, 0.05])
-		ax_review_current = review_fig.add_axes([0.59, 0.09, 0.11, 0.05])
+		ax_review_prev = review_fig.add_axes([0.1, 0.09, 0.05, 0.05])
+		ax_review_slider = review_fig.add_axes([0.21, 0.095, 0.34, 0.035])
+		ax_review_next = review_fig.add_axes([0.57, 0.09, 0.05, 0.05])
+		# ax_review_current = review_fig.add_axes([0.59, 0.09, 0.11, 0.05])
 		ax_review_pred_size = review_fig.add_axes([0.72, 0.095, 0.11, 0.03])
-		ax_bulk_snap = review_fig.add_axes([0.60, 0.03, 0.11, 0.065])
-		ax_snap_mode = review_fig.add_axes([0.72, 0.035, 0.11, 0.055])
-		ax_zoom_reset = review_fig.add_axes([0.84, 0.045, 0.12, 0.04])
+		ax_bulk_snap = review_fig.add_axes([0.62, 0.03, 0.1, 0.055])
+		ax_snap_mode = review_fig.add_axes([0.72, 0.03, 0.11, 0.055])
+		# ax_zoom_reset = review_fig.add_axes([0.84, 0.045, 0.12, 0.04])
 		ax_apply_frame = review_fig.add_axes([0.72, 0.005, 0.24, 0.025])
+		ax_prediction_source = review_fig.add_axes([0.84, 0.03, 0.11, 0.055])
+		ax_camera_mode = review_fig.add_axes([0.55, 0.03, 0.075, 0.055])
+		radio_camera_mode = RadioButtons(ax_camera_mode, ["Both", "cam1", "cam2"], active=0,)
 		btn_review_prev = Button(ax_review_prev, "<")
 		btn_review_next = Button(ax_review_next, ">")
-		btn_review_current = Button(ax_review_current, "Current Frame")
-		btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
+		# btn_review_current = Button(ax_review_current, "Current Frame")
+		# btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
 		btn_apply_frame = Button(ax_apply_frame, "Apply Snap To Frame")
 		check_bulk_snap = CheckButtons(ax_bulk_snap, ["Auto snap frame"], [False])
 		radio_snap_mode = RadioButtons(ax_snap_mode, ["blob", "darkest"], active=0)
-		slider_review = Slider(
+		radio_prediction_source = RadioButtons(ax_prediction_source, ["Current", "Prior frame"], active=0)
+		slider_review = Slider( 
 			ax_review_slider,
 			"frame_pos",
 			0,
@@ -1771,7 +1779,63 @@ def make_postanalysis_overlay_popout(
 			if bool(autosave):
 				_autosave_corrections()
 
+			# New feature for similar frame corrections!
+		def _get_prediction(
+			frame_pos: int,
+			camera_name: str,
+			bodypart_name: str,
+			pred_row: pd.Series,
+		) -> tuple[float, float]:
+
+			use_previous = (
+				radio_prediction_source.value_selected == "Prior frame"
+			)
+
+			#
+			# PRIOR FRAME
+			#
+			if use_previous and frame_pos > 0:
+
+				prev_key = (
+					frame_pos - 1,
+					camera_name,
+					bodypart_name,
+				)
+				# print(prev_key)
+				if prev_key in correction_cache:
+					return correction_cache[prev_key]
+
+			#
+			# CURRENT FRAME (existing behaviour)
+			#
+			key = (
+				frame_pos,
+				camera_name,
+				bodypart_name,
+			)
+			# print(key)
+			if key in correction_cache:
+				return correction_cache[key]
+
+			return (
+				float(pd.to_numeric(pred_row["x"], errors="coerce")),
+				float(pd.to_numeric(pred_row["y"], errors="coerce")),
+			)
+		def _selected_cameras():
+			mode = str(radio_camera_mode.value_selected).lower()
+			if mode == "both":
+				return ("cam1", "cam2")
+			return (mode,)
+
 		def _snap_to_dark_pixel(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> tuple[float, float]:
+			use_previous = (
+				radio_prediction_source.value_selected == "Prior frame"
+			)
+			# PRIOR FRAME
+			if use_previous and frame_pos > 0:
+				frame_pos = frame_pos - 1
+			else:
+				frame_pos = frame_pos
 			images = state.images_by_cam.get(camera_name, [])
 			if not (0 <= int(frame_pos) < len(images)):
 				return float(x_val), float(y_val)
@@ -1823,10 +1887,8 @@ def make_postanalysis_overlay_popout(
 		def _apply_snap_to_entire_frame(frame_pos: int) -> int:
 			snap_mode = str(radio_snap_mode.value_selected).lower().strip()
 			update_count = 0
-			for camera_name in ("cam1", "cam2"):
+			for camera_name in _selected_cameras():
 				images = state.images_by_cam.get(camera_name, [])
-				if not (0 <= int(frame_pos) < len(images)):
-					continue
 
 				if snap_mode == "blob":
 					pts = _pred_points(camera_name, int(frame_pos))
@@ -1837,20 +1899,48 @@ def make_postanalysis_overlay_popout(
 					for _, pred_row in pts.iterrows():
 						bodypart_name = str(pred_row["bodypart"])
 						key = (int(frame_pos), str(camera_name), bodypart_name)
-						if key in correction_cache:
-							x_src, y_src = correction_cache[key]
-						else:
-							x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
-							y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						# if key in correction_cache:
+						# 	x_src, y_src = correction_cache[key]
+						# else:
+						# 	x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
+						# 	y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						x_src, y_src = _get_prediction(
+							frame_pos,
+							camera_name,
+							bodypart_name,
+							pred_row,
+						)
+						# # print(
+						# # 	frame_pos,
+						# # 	camera_name,
+						# # 	bodypart_name,
+						# # 	x_src,
+						# # 	y_src,
+						# # )
+						# prev_key = (frame_pos-1, camera_name, bodypart_name)
+						# # print(prev_key in correction_cache)
+						# # if prev_key in correction_cache:
+						# # 	print("FOUND", prev_key, correction_cache[prev_key])
+						# # else:
+						# # 	print("NOT FOUND", prev_key)
+						# # print(len(correction_cache))
+						# # print(correction_cache.keys())
 						if not (np.isfinite(x_src) and np.isfinite(y_src)):
 							continue
 						prefix = f"{bodypart_name}_{camera_name}"
 						row_data[f"{prefix}_X"] = float(x_src)
 						row_data[f"{prefix}_Y"] = float(y_src)
 
+
 					if not row_data:
 						continue
-
+					# Check for previous frame
+					use_previous = (radio_prediction_source.value_selected == "Prior frame")
+					# PRIOR FRAME
+					if use_previous and frame_pos > 0:
+						frame_pos = frame_pos - 1
+					else:
+						frame_pos = frame_pos
 					with Image.open(images[int(frame_pos)]) as image_file:
 						gray_img = np.asarray(image_file.convert("L"), dtype=np.float64)
 
@@ -1878,7 +1968,8 @@ def make_postanalysis_overlay_popout(
 						y_new = float(pd.to_numeric(updates[y_col], errors="coerce"))
 						if not (np.isfinite(x_new) and np.isfinite(y_new)):
 							continue
-						_apply_edit(int(frame_pos), str(camera_name), bodypart_name, x_new, y_new, autosave=False)
+						snapped_x, snapped_y = _snap_to_dark_pixel(int(frame_pos), str(camera_name), bodypart_name, float(x_new), float(y_new))  # Snapping built into blob
+						_apply_edit(int(frame_pos), str(camera_name), bodypart_name, snapped_x, snapped_y, autosave=False)
 						correction_pixel_index[(int(frame_pos), str(camera_name), bodypart_name)] = (int(round(y_new)), int(round(x_new)))
 						update_count += 1
 				else:
@@ -1888,11 +1979,18 @@ def make_postanalysis_overlay_popout(
 					for _, pred_row in pts.iterrows():
 						bodypart_name = str(pred_row["bodypart"])
 						key = (int(frame_pos), str(camera_name), str(bodypart_name))
-						if key in correction_cache:
-							x_src, y_src = correction_cache[key]
-						else:
-							x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
-							y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						# if key in correction_cache:
+						# 	x_src, y_src = correction_cache[key]
+						# else:
+						# 	x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
+						# 	y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						x_src, y_src = _get_prediction(
+							frame_pos,
+							camera_name,
+							bodypart_name,
+							pred_row,
+						)
+						
 						if not (np.isfinite(x_src) and np.isfinite(y_src)):
 							continue
 						snapped_x, snapped_y = _snap_to_dark_pixel(int(frame_pos), str(camera_name), bodypart_name, float(x_src), float(y_src))
@@ -1919,8 +2017,8 @@ def make_postanalysis_overlay_popout(
 			value_font = _scaled_font(review_fig, base_size=9.0, ref_w=16.0, ref_h=9.0, min_size=7.0, max_size=13.0)
 			btn_review_prev.label.set_fontsize(button_font)
 			btn_review_next.label.set_fontsize(button_font)
-			btn_review_current.label.set_fontsize(control_font)
-			btn_zoom_reset.label.set_fontsize(control_font)
+			# btn_review_current.label.set_fontsize(control_font)
+			# btn_zoom_reset.label.set_fontsize(control_font)
 			btn_apply_frame.label.set_fontsize(control_font)
 			for sld in (slider_review, slider_review_pred_size):
 				sld.label.set_fontsize(control_font)
@@ -2189,8 +2287,8 @@ def make_postanalysis_overlay_popout(
 
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
-		btn_review_current.on_clicked(_on_review_current)
-		btn_zoom_reset.on_clicked(_on_zoom_reset)
+		# btn_review_current.on_clicked(_on_review_current)
+		# btn_zoom_reset.on_clicked(_on_zoom_reset)
 		btn_apply_frame.on_clicked(_on_apply_frame)
 		slider_review.on_changed(_redraw_review)
 		slider_review_pred_size.on_changed(_redraw_review)
@@ -2208,8 +2306,8 @@ def make_postanalysis_overlay_popout(
 			{
 				"btn_prev": btn_review_prev,
 				"btn_next": btn_review_next,
-				"btn_current": btn_review_current,
-				"btn_zoom_reset": btn_zoom_reset,
+				# "btn_current": btn_review_current,
+				# "btn_zoom_reset": btn_zoom_reset,
 				"btn_apply_frame": btn_apply_frame,
 				"slider": slider_review,
 				"pred_size": slider_review_pred_size,
