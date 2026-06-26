@@ -18,7 +18,18 @@ import pandas as pd
 import numpy as np
 import cv2
 import random
-from deeplabcut.pose_estimation_tensorflow.predict_videos import analyze_videos 
+
+
+def _get_analyze_videos():
+    try:
+        from deeplabcut.pose_estimation_tensorflow.predict_videos import analyze_videos
+    except Exception as exc:
+        raise ImportError(
+            "DeepLabCut could not be imported when analyze_videos was requested. "
+            "This usually means the local TensorFlow/DeepLabCut install is broken or incompatible."
+        ) from exc
+
+    return analyze_videos
 
 #### 
 
@@ -352,6 +363,7 @@ def analyze_xromm_videos(path_config_file,path_data_to_analyze,iteration,nnetwor
 # convert jpg stacks?
 
 # analyze videos
+    analyze_videos = _get_analyze_videos()
     cameras = [1,2]
     config = path_config_file
     configs = [path_config_file, path_config_file_cam2]

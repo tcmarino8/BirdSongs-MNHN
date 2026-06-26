@@ -710,17 +710,17 @@ def make_postanalysis_overlay_popout(
 	ax_frame = fig.add_axes([0.08, 0.26, 0.62, 0.03])
 	ax_next = fig.add_axes([0.705, 0.252, 0.045, 0.05])
 	ax_resample = fig.add_axes([0.755, 0.252, 0.055, 0.05])
-	ax_like = fig.add_axes([0.08, 0.21, 0.62, 0.03])
+	# ax_like = fig.add_axes([0.08, 0.21, 0.62, 0.03])
 	ax_pred_size = fig.add_axes([0.08, 0.16, 0.29, 0.03])
-	ax_pred_alpha = fig.add_axes([0.41, 0.16, 0.29, 0.03])
+	ax_pred_alpha = fig.add_axes([0.46, 0.16, 0.29, 0.03])
 	ax_pred_color = fig.add_axes([0.82, 0.40, 0.16, 0.035])
 	ax_nframes = fig.add_axes([0.82, 0.345, 0.16, 0.035])
 	ax_window_start = fig.add_axes([0.82, 0.685, 0.060, 0.03])
 	ax_window_end = fig.add_axes([0.905, 0.685, 0.075, 0.03])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 	ax_selection_info = fig.add_axes([0.82, 0.005, 0.16, 0.035])
-	ax_info_frame = fig.add_axes([0.045, 0.255, 0.022, 0.035])
-	ax_info_like = fig.add_axes([0.045, 0.205, 0.022, 0.035])
+	ax_info_frame = fig.add_axes([0, 0.255, 0.022, 0.035])
+	# ax_info_like = fig.add_axes([0.045, 0.205, 0.022, 0.035])
 	ax_info_nframes = fig.add_axes([0.79, 0.345, 0.022, 0.035])
 	ax_info_range = fig.add_axes([0.975, 0.708, 0.018, 0.026])
 
@@ -733,16 +733,16 @@ def make_postanalysis_overlay_popout(
 	btn_correction = Button(ax_correction, "Save Correction Frames")
 
 	btn_prev = Button(ax_prev, "<")
-	slider_frame = Slider(ax_frame, "frame_pos", 0, float(max_len), valinit=float(start_pos), valstep=1)
+	slider_frame = Slider(ax_frame, "frame", 0, float(max_len), valinit=float(start_pos), valstep=1)
 	btn_next = Button(ax_next, ">")
 	btn_resample = Button(ax_resample, "R20")
-	slider_like = Slider(ax_like, "min_likelihood", 0.0, 1.0, valinit=0.0, valstep=0.01)
-	slider_pred_size = Slider(ax_pred_size, "pred_size", 10, 300, valinit=60, valstep=1)
-	slider_pred_alpha = Slider(ax_pred_alpha, "pred_alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
-	textbox_pred_color = TextBox(ax_pred_color, "pred_color", initial="deepskyblue")
-	textbox_nframes = TextBox(ax_nframes, "corr_frames", initial="30")
+	# slider_like = Slider(ax_like, "min_likelihood", 0.0, 1.0, valinit=0.0, valstep=0.01)
+	slider_pred_size = Slider(ax_pred_size, "Size", 10, 300, valinit=60, valstep=1)
+	slider_pred_alpha = Slider(ax_pred_alpha, "Alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
+	textbox_pred_color = TextBox(ax_pred_color, "Color", initial="deepskyblue")
+	textbox_nframes = TextBox(ax_nframes, "ToCorrect", initial="30")
 	textbox_window_start = TextBox(ax_window_start, "Start", initial="0")
-	textbox_window_end = TextBox(ax_window_end, "Last", initial="1")
+	textbox_window_end = TextBox(ax_window_end, "End", initial="1")
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
 	ax_selection_info.set_axis_off()
 	range_title_text = fig.text(0.82, 0.72, "Select Frame Range", fontsize=9, fontweight="bold")
@@ -773,7 +773,7 @@ def make_postanalysis_overlay_popout(
 		return btn
 
 	_add_info_bubble(ax_info_frame, "Frame selector: move through synchronized image frames.")
-	_add_info_bubble(ax_info_like, "Min likelihood: hide points with lower confidence.")
+	# _add_info_bubble(ax_info_like, "Min likelihood: hide points with lower confidence.")
 	_add_info_bubble(ax_info_nframes, "Correction set size: choose 30, 40, or 50 frames.")
 	_add_info_bubble(
 		ax_info_range,
@@ -803,13 +803,13 @@ def make_postanalysis_overlay_popout(
 		ax_pred_color.set_position([right_x, 0.40, right_w, 0.035])
 		ax_nframes.set_position([right_x, 0.345, right_w, 0.035])
 		ax_window_start.set_position([right_x, 0.685, right_w * 0.45, 0.03])
-		ax_window_end.set_position([right_x + right_w * 0.50, 0.685, right_w * 0.50, 0.03])
+		ax_window_end.set_position([right_x + right_w * 0.60, 0.685, right_w * 0.50, 0.03])
 		ax_color_mode.set_position([right_x, 0.25, right_w, 0.08])
 		ax_selection_info.set_position([right_x, 0.005, right_w, 0.035])
 
-		ax_info_frame.set_position([left_info_x, 0.255, 0.022, 0.035])
-		ax_info_like.set_position([left_info_x, 0.205, 0.022, 0.035])
-		ax_info_nframes.set_position([max(0.0, right_x - 0.028), 0.345, 0.022, 0.035])
+		ax_info_frame.set_position([0.0, 0.255, 0.022, 0.035])
+		# ax_info_like.set_position([left_info_x, 0.205, 0.022, 0.035])
+		ax_info_nframes.set_position([min(0.98, right_x + right_w + 0.004), 0.345, 0.022, 0.035])
 		ax_info_range.set_position([min(0.98, right_x + right_w + 0.004), 0.708, 0.018, 0.026])
 
 		range_title_text.set_position((right_x, 0.72))
@@ -835,7 +835,8 @@ def make_postanalysis_overlay_popout(
 		for txt in radio_color_mode.labels:
 			txt.set_fontsize(control_font)
 
-		for sld in (slider_frame, slider_like, slider_pred_size, slider_pred_alpha):
+		for sld in (slider_frame, slider_pred_size, slider_pred_alpha):
+			# slider_like
 			sld.label.set_fontsize(control_font)
 			sld.valtext.set_fontsize(value_font)
 
@@ -1477,7 +1478,7 @@ def make_postanalysis_overlay_popout(
 
 		correction_cache: dict[tuple[int, str, str], tuple[float, float]] = {}
 		correction_pixel_index: dict[tuple[int, str, str], tuple[int, int]] = {}
-		likelihood_lookup: dict[tuple[int, str, str], float] = {}
+		# likelihood_lookup: dict[tuple[int, str, str], float] = {}
 		active_marker: dict[str, Any] | None = None
 		active_selected_index = 0
 		drag_state: dict[str, Any] = {"active": False, "camera": None, "bodypart": None, "moved": False}
@@ -1485,6 +1486,139 @@ def make_postanalysis_overlay_popout(
 		last_bulk_apply_signature: tuple[int, str] | None = None
 		hit_threshold_px = 12.0
 		export_frames = sorted(set(int(frame) for frame in frames_local))
+		image_pos_by_cam_name: dict[str, dict[str, int]] = {
+			"cam1": {p.name: int(i) for i, p in enumerate(state.images_by_cam.get("cam1", []))},
+			"cam2": {p.name: int(i) for i, p in enumerate(state.images_by_cam.get("cam2", []))},
+		}
+
+		def _resolve_frame_pos_for_saved_row(camera_name: str, row: pd.Series, row_idx: int) -> int | None:
+			camera_name = _cam_norm(str(camera_name))
+			if camera_name not in ("cam1", "cam2"):
+				return None
+
+			# 1) Explicit frame_pos from autosave.
+			if "frame_pos" in row.index:
+				frame_pos_val = pd.to_numeric(row.get("frame_pos"), errors="coerce")
+				if np.isfinite(frame_pos_val):
+					frame_pos = int(frame_pos_val)
+					if frame_pos in export_frames:
+						return frame_pos
+
+			# 2) Direct image-name match.
+			image_name_candidates = [
+				"image_name",
+				f"image_{camera_name}",
+				"image_cam1" if camera_name == "cam1" else "image_cam2",
+			]
+			for image_col in image_name_candidates:
+				if image_col not in row.index:
+					continue
+				name = str(row.get(image_col, "")).strip()
+				if not name:
+					continue
+				frame_pos = image_pos_by_cam_name.get(camera_name, {}).get(name)
+				if frame_pos is not None and int(frame_pos) in export_frames:
+					return int(frame_pos)
+
+			# 3) Frame-id columns, handling either raw frame_pos ids or aligned prediction ids.
+			frame_id_candidates = [
+				"frame_id",
+				f"frame_id_{camera_name}",
+				"frame_id_cam1" if camera_name == "cam1" else "frame_id_cam2",
+			]
+			for frame_col in frame_id_candidates:
+				if frame_col not in row.index:
+					continue
+				frame_id_val = pd.to_numeric(row.get(frame_col), errors="coerce")
+				if not np.isfinite(frame_id_val):
+					continue
+				frame_id = int(frame_id_val)
+
+				if frame_id in export_frames:
+					return int(frame_id)
+
+				matched = [
+					int(fp)
+					for fp in export_frames
+					if int(_frame_pos_to_pred_id(camera_name, int(fp))) == int(frame_id)
+				]
+				if len(matched) == 1:
+					return int(matched[0])
+				if len(matched) > 1:
+					return int(min(matched, key=lambda v: abs(int(v) - int(frame_id))))
+
+			# 4) Legacy wide-file fallback: row order corresponds to export frame order.
+			if 0 <= int(row_idx) < len(export_frames):
+				return int(export_frames[int(row_idx)])
+
+			return None
+
+		def _load_existing_corrections() -> None:
+			auto_path = export_dir / "data" / "corrections_autosave.csv"
+			if not auto_path.exists():
+				return
+			try:
+				saved_df = pd.read_csv(auto_path)
+			except Exception as exc:
+				print(f"Warning: could not read existing corrections at {auto_path}: {exc}")
+				return
+			if saved_df.empty:
+				return
+
+			loaded_count = 0
+			required_long = {"camera", "bodypart", "x_corrected", "y_corrected"}
+			if required_long.issubset(set(saved_df.columns)):
+				for row_idx, (_, row) in enumerate(saved_df.iterrows()):
+					camera_name = _cam_norm(str(row.get("camera", "")))
+					if camera_name not in ("cam1", "cam2"):
+						continue
+					bodypart_name = str(row.get("bodypart", "")).strip()
+					if not bodypart_name:
+						continue
+					x_val = float(pd.to_numeric(row.get("x_corrected"), errors="coerce"))
+					y_val = float(pd.to_numeric(row.get("y_corrected"), errors="coerce"))
+					if not (np.isfinite(x_val) and np.isfinite(y_val)):
+						continue
+					frame_pos = _resolve_frame_pos_for_saved_row(camera_name, row, row_idx)
+					if frame_pos is None:
+						continue
+					key = (int(frame_pos), str(camera_name), str(bodypart_name))
+					correction_cache[key] = (float(x_val), float(y_val))
+					correction_pixel_index[key] = (int(round(y_val)), int(round(x_val)))
+					loaded_count += 1
+			else:
+				col_map: dict[tuple[str, str, str], str] = {}
+				for col in saved_df.columns:
+					m = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
+					if m is None:
+						continue
+					bodypart_name = str(m.group("bodypart"))
+					camera_name = f"cam{m.group('cam')}"
+					coord = str(m.group("coord")).upper()
+					col_map[(bodypart_name, camera_name, coord)] = str(col)
+
+				bodyparts = sorted({bp for (bp, _, _coord) in col_map.keys()})
+				for row_idx, (_, row) in enumerate(saved_df.iterrows()):
+					for camera_name in ("cam1", "cam2"):
+						frame_pos = _resolve_frame_pos_for_saved_row(camera_name, row, row_idx)
+						if frame_pos is None:
+							continue
+						for bodypart_name in bodyparts:
+							x_col = col_map.get((bodypart_name, camera_name, "X"))
+							y_col = col_map.get((bodypart_name, camera_name, "Y"))
+							if x_col is None or y_col is None:
+								continue
+							x_val = float(pd.to_numeric(row.get(x_col), errors="coerce"))
+							y_val = float(pd.to_numeric(row.get(y_col), errors="coerce"))
+							if not (np.isfinite(x_val) and np.isfinite(y_val)):
+								continue
+							key = (int(frame_pos), str(camera_name), str(bodypart_name))
+							correction_cache[key] = (float(x_val), float(y_val))
+							correction_pixel_index[key] = (int(round(y_val)), int(round(x_val)))
+							loaded_count += 1
+
+			if loaded_count > 0:
+				print(f"Loaded {loaded_count} saved corrections from {auto_path}")
 
 		def _initialize_corrections_from_predictions() -> None:
 			for frame_pos in export_frames:
@@ -1503,7 +1637,7 @@ def make_postanalysis_overlay_popout(
 						row_int = int(round(y_val))
 						col_int = int(round(x_val))
 						correction_pixel_index[key] = (row_int, col_int)
-						likelihood_lookup[key] = float(pd.to_numeric(row["likelihood"], errors="coerce"))
+						# likelihood_lookup[key] = float(pd.to_numeric(row["likelihood"], errors="coerce"))
 
 		def _image_name_for(camera_name: str, frame_pos: int) -> str:
 			images = state.images_by_cam.get(camera_name, [])
@@ -1530,7 +1664,7 @@ def make_postanalysis_overlay_popout(
 						"bodypart": str(bodypart_name),
 						"x_corrected": float(x_val),
 						"y_corrected": float(y_val),
-						"likelihood": float(likelihood_lookup.get(key, np.nan)),
+						# "likelihood": float(likelihood_lookup.get(key, np.nan)),
 					}
 				)
 			if not rows:
@@ -1542,6 +1676,11 @@ def make_postanalysis_overlay_popout(
 			bodyparts = sorted(pd.Index(long_df["bodypart"].astype(str)).unique().tolist())
 			for frame_pos in export_frames:
 				frame_row: dict[str, Any] = {}
+				frame_row["frame_pos"] = int(frame_pos)
+				frame_row["frame_id_cam1"] = int(_frame_pos_to_pred_id("cam1", int(frame_pos)))
+				frame_row["frame_id_cam2"] = int(_frame_pos_to_pred_id("cam2", int(frame_pos)))
+				frame_row["image_cam1"] = _image_name_for("cam1", int(frame_pos))
+				frame_row["image_cam2"] = _image_name_for("cam2", int(frame_pos))
 				for bodypart_name in bodyparts:
 					for camera_name, cam_id in (("cam1", "1"), ("cam2", "2")):
 						match = long_df[
@@ -1578,11 +1717,12 @@ def make_postanalysis_overlay_popout(
 				return x_val, y_val
 			return None
 
-		def _pred_points_with_corrections(camera_name: str, frame_pos: int, min_like: float) -> pd.DataFrame:
+		def _pred_points_with_corrections(camera_name: str, frame_pos: int) -> pd.DataFrame:
+			# min_like: float
 			pts = _pred_points(camera_name, frame_pos)
 			if pts.empty:
 				return pts
-			pts = pts[pts["likelihood"].fillna(0.0) >= min_like].copy()
+			# pts = pts[pts["likelihood"].fillna(0.0) >= min_like].copy()
 			if pts.empty:
 				return pts
 			for idx, row in pts.iterrows():
@@ -1593,10 +1733,12 @@ def make_postanalysis_overlay_popout(
 					pts.at[idx, "y"] = float(new_y)
 			return pts
 
-		def _nearest_marker_in_axes(event: Any, camera_name: str, frame_pos: int, min_like: float) -> tuple[str, float, float, float] | None:
+		def _nearest_marker_in_axes(event: Any, camera_name: str, frame_pos: int) -> tuple[str, float, float, float] | None:
+			# min_like: float
 			if event.x is None or event.y is None:
 				return None
-			pts = _pred_points_with_corrections(camera_name, frame_pos, min_like)
+			# min_like
+			pts = _pred_points_with_corrections(camera_name, frame_pos)
 			if pts.empty:
 				return None
 			click_px = np.array([event.x, event.y], dtype=float)
@@ -1768,6 +1910,7 @@ def make_postanalysis_overlay_popout(
 			return _resolve_point_xy(str(camera_name), int(frame_pos), str(active_marker["bodypart"]))
 
 		_initialize_corrections_from_predictions()
+		_load_existing_corrections()
 		_autosave_corrections()
 
 		def _apply_review_widget_scaling(_event: Any = None) -> None:
@@ -1823,7 +1966,7 @@ def make_postanalysis_overlay_popout(
 			if active_marker is not None and int(active_marker.get("frame_pos", -1)) != int(frame_pos):
 				drag_state["active"] = False
 			annotate = bool(check.get_status()[1])
-			min_like = float(slider_like.val)
+			# min_like = float(slider_like.val)
 			pred_size = float(slider_review_pred_size.val)
 			pred_alpha = float(slider_pred_alpha.val)
 			pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
@@ -1848,7 +1991,9 @@ def make_postanalysis_overlay_popout(
 					zoom_ax.imshow(img, interpolation="nearest")
 				img_h, img_w = int(img.shape[0]), int(img.shape[1])
 
-				pred_pts = _pred_points_with_corrections(camera_name, frame_pos, min_like)
+				pred_pts = _pred_points_with_corrections(camera_name, frame_pos)
+				# print(pred_pts)
+				# min_like
 				if not pred_pts.empty:
 					review_ax.scatter(
 						pred_pts["x"],
@@ -1900,7 +2045,7 @@ def make_postanalysis_overlay_popout(
 				review_ax.set_aspect("equal")
 
 			review_fig.suptitle(
-				f"Correction Review | {method_name.title()} | frame {frame_pos} of 0-{max_review_frame} | selected {active_selected_index + 1}/{len(frames_local)} (frame {frames_local[active_selected_index]}) | edits {len(correction_cache)} | snap={radio_snap_mode.value_selected} | auto_frame_snap={auto_bulk_enabled}\nClick marker to select. Drag to move or click elsewhere to set a new coordinate.",
+				f"Correction Review | {method_name.title()} | selected {active_selected_index + 1}/{len(frames_local)} (frame {frames_local[active_selected_index]}) | edits {len(correction_cache)} \n Click marker to select. Drag to move or click elsewhere to set a new coordinate.",
 				fontsize=_scaled_font(review_fig, base_size=11.0, ref_w=16.0, ref_h=9.0, min_size=9.0, max_size=16.0),
 			)
 			review_fig.canvas.draw_idle()
@@ -1962,8 +2107,9 @@ def make_postanalysis_overlay_popout(
 				return
 			frame_pos = int(slider_review.val)
 			camera_name = "cam1" if event.inaxes == review_axes[0] else "cam2"
-			min_like = float(slider_like.val)
-			nearest = _nearest_marker_in_axes(event, camera_name, frame_pos, min_like)
+			# min_like = float(slider_like.val)
+			nearest = _nearest_marker_in_axes(event, camera_name, frame_pos)
+			# min_like
 
 			if nearest is not None:
 				bodypart_name, x_near, y_near, _ = nearest
@@ -2280,7 +2426,7 @@ def make_postanalysis_overlay_popout(
 		frame_pos = int(slider_frame.val)
 		show_pred = bool(check.get_status()[0])
 		annotate = bool(check.get_status()[1])
-		min_like = float(slider_like.val)
+		# min_like = float(slider_like.val)
 		pred_size = float(slider_pred_size.val)
 		pred_alpha = float(slider_pred_alpha.val)
 		pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
@@ -2313,8 +2459,8 @@ def make_postanalysis_overlay_popout(
 
 		if show_pred:
 			pred_pts = _pred_points(camera, frame_pos)
-			if not pred_pts.empty:
-				pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
+			# if not pred_pts.empty:
+				# pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
 			if not pred_pts.empty:
 				if color_mode == "by_name":
 					pred_colors = [state.bodypart_color_map.get(str(bp), pred_color) for bp in pred_pts["bodypart"]]
@@ -2535,7 +2681,7 @@ def make_postanalysis_overlay_popout(
 	btn_next.on_clicked(_on_next)
 	btn_resample.on_clicked(_on_resample)
 	slider_frame.on_changed(redraw)
-	slider_like.on_changed(redraw)
+	# slider_like.on_changed(redraw)
 	slider_pred_size.on_changed(redraw)
 	slider_pred_alpha.on_changed(redraw)
 	textbox_pred_color.on_submit(redraw)

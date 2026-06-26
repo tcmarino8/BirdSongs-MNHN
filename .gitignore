@@ -17,4 +17,5 @@
 /abstracts/*.png
 /abstracts/*.jpg
 /Testing/ProcessingData
-
+/Testing/Canaries-Test
+/Testing/DeepLabCut2
