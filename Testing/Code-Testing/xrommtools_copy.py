@@ -339,7 +339,13 @@ def dlc_to_xma(cam1data,cam2data,trialname,savepath):
     post = ["_cam1_X", "_cam1_Y", "_cam2_X", "_cam2_Y"]*nvar
     cols = [m+str(n) for m,n in zip(pointnames,post)]
 
+        # Trying to save the likelihoods
+        # Extract likelihood columns
+    cam1_likelihood = cam1data.iloc[:, 2::3].copy()
+    cam2_likelihood = cam2data.iloc[:, 2::3].copy()
 
+    likelihood_cols = [f"{bp}_cam1_Likelihood" for bp in pointnames[:len(cam1_likelihood.columns)]]
+    likelihood_cols += [f"{bp}_cam2_Likelihood" for bp in pointnames[:len(cam2_likelihood.columns)]]
     # remove likelihood columns
     cam1data = cam1data.drop(cam1data.columns[2::3],axis=1)
     cam2data = cam2data.drop(cam2data.columns[2::3],axis=1)
@@ -354,8 +360,31 @@ def dlc_to_xma(cam1data,cam2data,trialname,savepath):
 
     df = pd.concat([cam1data,cam2data],axis=1).sort_index(axis=1)
     df.columns = cols
+        # Trying to save the likelihoods
+        # Rename likelihood columns
+    cam1_likelihood.columns = range(0, cam1_likelihood.shape[1] * 2, 2)
+    cam2_likelihood.columns = range(1, cam2_likelihood.shape[1] * 2, 2)
+
+    likelihood_df = (
+        pd.concat([cam1_likelihood, cam2_likelihood], axis=1)
+        .sort_index(axis=1)
+    )
+
+    likelihood_names = []
+    for bp in list(dict.fromkeys(pointnames)):  # unique bodyparts in original order
+        likelihood_names.extend([
+            f"{bp}_cam1_Likelihood",
+            f"{bp}_cam2_Likelihood"
+        ])
+
+    likelihood_df.columns = likelihood_names
+
     df.to_hdf(h5_save_path, key="df_with_missing", mode="w")
     df.to_csv(csv_save_path,na_rep='NaN',index=False)
+    likelihood_df.to_csv(
+        savepath + "/" + trialname + "-Likelihoods.csv",
+        index=False
+    )
 
 def analyze_xromm_videos(path_config_file,path_data_to_analyze,iteration,nnetworks = 1, path_config_file_cam2 = []):
 # assumes you have cam1 and cam2 videos as .avi in their own seperate trial folders

@@ -753,22 +753,25 @@ def make_postanalysis_overlay_popout(
 
 	info_buttons: list[Button] = []
 
-	def _add_info_bubble(info_ax: Any, message: str) -> Button:
-		btn = Button(info_ax, "i")
-		btn.color = "#f2f2f2"
-		btn.hovercolor = "#dceeff"
-		btn.label.set_fontsize(8)
+	def _add_info_bubble(info_ax: Any, message: str, figure:str) -> Button:
+		btn = Button(info_ax, "(i)")
+		btn.color = "#6f54f4"
+		btn.hovercolor = "#3d8cd6"
+		btn.label.set_fontsize(10)
 
 		def _on_info(_event: Any) -> None:
 			try:
 				import tkinter as tk
 				from tkinter import messagebox
+				popup_root = figure.canvas.manager.window
 
-				popup_root = tk.Tk()
-				popup_root.withdraw()
-				popup_root.attributes("-topmost", True)
-				messagebox.showinfo(title="Information", message=message)
-				popup_root.destroy()
+				# popup_root = tk.Tk()
+				# popup_root.withdraw()
+				# popup_root.attributes("-topmost", True)
+				messagebox.showinfo(parent=popup_root,
+					title="Information",
+					message=message)
+				# popup_root.destroy()
 			except Exception:
 				print(f"Info: {message}")
 
@@ -776,13 +779,16 @@ def make_postanalysis_overlay_popout(
 		info_buttons.append(btn)
 		return btn
 
-	_add_info_bubble(ax_info_frame, "Frame selector: move through synchronized image frames.")
+	_add_info_bubble(ax_info_frame, 
+				  "Frame selector: move through synchronized image frames.",
+				  figure = fig)
 	# _add_info_bubble(ax_info_like, "Min likelihood: hide points with lower confidence.")
-	_add_info_bubble(ax_info_nframes, "Correction set size: choose 30, 40, or 50 frames.")
+	_add_info_bubble(ax_info_nframes, "Correction set size: choose 30, 40, or 50 frames.",
+				  figure = fig)
 	_add_info_bubble(
 		ax_info_range,
 		"Many of the frames will be black, so select the range where they are colorred. This is usually around 2500 frames.",
-	)
+		figure = fig)
 
 	def _layout_main_axes() -> None:
 		fig_w, _ = fig.get_size_inches()
@@ -1081,7 +1087,7 @@ def make_postanalysis_overlay_popout(
 		return np.arange(window_start, window_end + 1, dtype=int)
 
 	def _target_correction_count() -> int:
-		allowed = np.asarray([30, 40, 50], dtype=int)
+		allowed = np.asarray([30, 40, 50, 100,  300], dtype=int)
 		try:
 			requested = int(float(str(textbox_nframes.text).strip()))
 		except Exception:
@@ -1450,6 +1456,8 @@ def make_postanalysis_overlay_popout(
 		ax_apply_frame = review_fig.add_axes([0.72, 0.005, 0.24, 0.025])
 		ax_prediction_source = review_fig.add_axes([0.84, 0.03, 0.11, 0.055])
 		ax_camera_mode = review_fig.add_axes([0.55, 0.03, 0.075, 0.055])
+		ax_info_updating = review_fig.add_axes([0.67, 0.005, 0.03, 0.025])
+		
 		radio_camera_mode = RadioButtons(ax_camera_mode, ["Both", "cam1", "cam2"], active=0,)
 		btn_review_prev = Button(ax_review_prev, "<")
 		btn_review_next = Button(ax_review_next, ">")
@@ -1459,6 +1467,10 @@ def make_postanalysis_overlay_popout(
 		check_bulk_snap = CheckButtons(ax_bulk_snap, ["Auto snap frame"], [False])
 		radio_snap_mode = RadioButtons(ax_snap_mode, ["blob", "darkest"], active=0)
 		radio_prediction_source = RadioButtons(ax_prediction_source, ["Current", "Prior frame"], active=0)
+		_add_info_bubble(ax_info_updating, 
+				   "Correct and Update the Training Data: \n--The Buttons above allow for rapid labeling.\n--Selecting snap to darkest pixel or closest blob will help existing predictions arrive at the center of the marker.\n--Pulling information from the previous frame will allow you to carry over locational information from the previous frame to help you label the current frame.",
+				   figure=review_fig)
+		ax_info_updating.set_position([0.67, 0.005, 0.03, 0.025])
 		slider_review = Slider( 
 			ax_review_slider,
 			"frame_pos",
