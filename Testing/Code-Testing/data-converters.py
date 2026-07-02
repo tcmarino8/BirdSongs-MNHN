@@ -239,6 +239,8 @@ def jpg_stack_to_avi(
     fps: int = 500,
     fourcc: str = "MJPG",
     sort_numeric: bool = True,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
 ) -> dict[str, object]:
     """Convert a folder of JPG/JPEG frames into an AVI file."""
     if not input_folder.is_dir():
@@ -262,6 +264,22 @@ def jpg_stack_to_avi(
         jpg_files = sorted(jpg_files, key=sort_key)
     else:
         jpg_files = sorted(jpg_files)
+
+    # Restrict to a subset of frames IF requested.
+    n_frames = len(jpg_files)
+
+    if start_frame is not None or end_frame is not None:
+        start = 0 if start_frame is None else int(start_frame)
+        end = n_frames - 1 if end_frame is None else int(end_frame)
+
+        if start < 0 or end < start or end >= n_frames:
+            raise ValueError(
+                f"Requested frame range [{start}, {end}] is invalid for "
+                f"{n_frames} available frames."
+            )
+
+        # end is inclusive
+        jpg_files = jpg_files[start:end + 1]
 
     first_frame = _to_uint8_bgr(cv2.imread(str(jpg_files[0]), cv2.IMREAD_COLOR))
     height, width = first_frame.shape[:2]
