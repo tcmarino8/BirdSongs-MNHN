@@ -40,6 +40,7 @@ import re
 
 import cv2
 from PIL import Image
+from pathlib import Path
 
 
 def convert_folder(input_dir: pathlib.Path, target_format: str = "auto") -> pathlib.Path:
@@ -265,7 +266,7 @@ def jpg_stack_to_avi(
     else:
         jpg_files = sorted(jpg_files)
 
-    # Restrict to a subset of frames IF requested.
+    # Restrict to a subset of frames if requested.
     n_frames = len(jpg_files)
 
     if start_frame is not None or end_frame is not None:
@@ -320,11 +321,6 @@ def jpg_stack_to_avi(
         "height": height,
     }
 
-from pathlib import Path
-import cv2
-
-from pathlib import Path
-import cv2
 
 
 def avi_to_jpg_stack(
