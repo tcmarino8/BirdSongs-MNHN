@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
 import re
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +20,84 @@ from PIL import Image
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
+
+# Default snapshots associated with each bird for fine-tuning.
+BIRD_SNAPSHOT_PATHS: dict[str, str] = {
+	"DavidBowie": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCut2\DavidBowie\Model519\n400_T17\Canari-Tyler-2026-05-22\dlc-models-pytorch\iteration-0\CanariMay22-trainset95shuffle1\train\snapshot-100.pt",
+	"Tulio": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\ProcessingData\Tulio\Trial10\active_updates\dino\Model\Tulio-Tyler-2026-06-30\dlc-models-pytorch\iteration-0\TulioJun30-trainset95shuffle1\train\snapshot-100.pt",
+}
+
+# Default inference configs associated with each bird.
+# Keep this map editable as birds/models change.
+BIRD_CONFIG_PATHS: dict[str, str] = {
+	"DavidBowie": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCut2\DavidBowie\Model519\n400_T17\Canari-Tyler-2026-05-22\config.yaml",
+	"Tulio": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\ProcessingData\Tulio\Trial10\active_updates\dino\Model\Tulio-Tyler-2026-06-30\config.yaml",
+}
+
+
+def _load_data_converter_module() -> Any:
+	"""Load data-converters.py as module dc (used for jpg stack to avi conversion)."""
+	module_path = Path(__file__).with_name("data-converters.py")
+	if not module_path.exists():
+		raise FileNotFoundError(f"Could not find converter module: {module_path}")
+	spec = importlib.util.spec_from_file_location("dc", str(module_path))
+	if spec is None or spec.loader is None:
+		raise RuntimeError(f"Could not load module spec for: {module_path}")
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+	return module
+
+
+def _workflow_state_path(trial_dir: str | Path) -> Path:
+	return Path(trial_dir) / WORKFLOW_STATE_FILE
+
+
+def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
+	state_path = _workflow_state_path(trial_dir)
+	if not state_path.exists():
+		return None
+	try:
+		data = json.loads(state_path.read_text(encoding="utf-8"))
+	except Exception:
+		return None
+
+	frame_range = data.get("frame_range", {}) if isinstance(data, dict) else {}
+	start = frame_range.get("start")
+	end = frame_range.get("end")
+	try:
+		start_i = int(start)
+		end_i = int(end)
+	except Exception:
+		return None
+
+	if end_i < start_i:
+		start_i, end_i = end_i, start_i
+	return start_i, end_i
+
+
+def _save_frame_range(trial_dir: str | Path, start_frame: int, end_frame: int, source: str = "") -> None:
+	state_path = _workflow_state_path(trial_dir)
+	state_path.parent.mkdir(parents=True, exist_ok=True)
+
+	start_i = int(start_frame)
+	end_i = int(end_frame)
+	if end_i < start_i:
+		start_i, end_i = end_i, start_i
+
+	data: dict[str, Any] = {}
+	if state_path.exists():
+		try:
+			loaded = json.loads(state_path.read_text(encoding="utf-8"))
+			if isinstance(loaded, dict):
+				data = loaded
+		except Exception:
+			data = {}
+
+	data["frame_range"] = {"start": start_i, "end": end_i}
+	data["last_source"] = str(source)
+	data["updated_unix"] = int(time.time())
+	state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def find_darkest_pixel(
@@ -552,11 +634,153 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 	"""Prompt user for same-folder mode, then collect required folder paths."""
 	try:
 		import tkinter as tk
-		from tkinter import messagebox
+		from tkinter import filedialog, messagebox, simpledialog
 	except Exception as exc:
 		raise RuntimeError(
 			"GUI prompts are unavailable. Provide folder paths on the command line instead."
 		) from exc
+
+	def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
+		if not _looks_like_image_only_selection(shared_root):
+			return shared_root, None, None
+
+		prompt_root = tk.Tk()
+		prompt_root.withdraw()
+		prompt_root.attributes("-topmost", True)
+
+		should_predict = bool(
+			messagebox.askyesno(
+				title="Images Detected",
+				message=(
+					"The selected folder appears to contain images but no predictions.\n\n"
+					"Do you want to run prediction now?"
+				),
+				parent=prompt_root,
+			)
+		)
+		if not should_predict:
+			prompt_root.destroy()
+			raise RuntimeError("No prediction files found in selected folder. Prediction was cancelled.")
+
+		trial_dir = _infer_trial_dir_from_selected_folder(shared_root)
+		base_dir = trial_dir.parent.parent if trial_dir.parent.parent.exists() else trial_dir.parent
+		try:
+			context = _extract_trial_context_from_path(trial_dir)
+			bird = str(context["bird"])
+		except Exception:
+			bird_input = simpledialog.askstring(
+				"Bird Name",
+				"Could not infer bird from path. Enter bird name:",
+				initialvalue=str(trial_dir.parent.name),
+				parent=prompt_root,
+			)
+			if bird_input is None or str(bird_input).strip() == "":
+				prompt_root.destroy()
+				raise RuntimeError("Prediction cancelled: no bird name provided.")
+			bird = str(bird_input).strip()
+
+			trial_input = simpledialog.askinteger(
+				"Trial Number",
+				"Could not infer trial from path. Enter trial number:",
+				initialvalue=1,
+				minvalue=1,
+				parent=prompt_root,
+			)
+			if trial_input is None:
+				prompt_root.destroy()
+				raise RuntimeError("Prediction cancelled: no trial number provided.")
+
+			trial_num = int(trial_input)
+			trial_dir = Path(base_dir) / bird / f"Trial{trial_num}"
+			if not trial_dir.exists():
+				prompt_root.destroy()
+				raise FileNotFoundError(
+					f"The provided bird/trial path does not exist: {trial_dir}"
+				)
+
+		saved_range = _load_saved_frame_range(trial_dir)
+		default_start = int(saved_range[0]) if saved_range is not None else 0
+		default_end = int(saved_range[1]) if saved_range is not None else int(default_start + 1000)
+
+		use_range = bool(
+			messagebox.askyesno(
+				title="Frame Range",
+				message=(
+					"Do you want to set a frame range for prediction/correction?"
+					+ (
+						f"\n\nSaved range found: {default_start} to {default_end}."
+						if saved_range is not None
+						else ""
+					)
+				),
+				parent=prompt_root,
+			)
+		)
+		frame_range = None
+		if use_range:
+			start_frame = simpledialog.askinteger(
+				"Start Frame",
+				"Start frame:",
+				initialvalue=int(default_start),
+				minvalue=0,
+				parent=prompt_root,
+			)
+			if start_frame is None:
+				prompt_root.destroy()
+				raise RuntimeError("Prediction cancelled: no start frame provided.")
+
+			end_frame = simpledialog.askinteger(
+				"End Frame",
+				"End frame:",
+				initialvalue=int(default_end if saved_range is not None else int(start_frame) + 1000),
+				minvalue=0,
+				parent=prompt_root,
+			)
+			if end_frame is None:
+				prompt_root.destroy()
+				raise RuntimeError("Prediction cancelled: no end frame provided.")
+
+			frame_range = [int(start_frame), int(end_frame)]
+			_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="predict_trial_from_jpg_stacks")
+		elif saved_range is not None:
+			frame_range = [int(default_start), int(default_end)]
+
+		default_config = BIRD_CONFIG_PATHS.get(bird)
+		config_path = Path(default_config) if default_config else None
+		use_default = bool(config_path is not None and config_path.exists())
+
+		if use_default:
+			use_default = bool(
+				messagebox.askyesno(
+					title="Model Config",
+					message=(
+						f"Use default config for {bird}?\n\n"
+						f"{config_path}"
+					),
+					parent=prompt_root,
+				)
+			)
+
+		if not use_default:
+			picked = filedialog.askopenfilename(
+				title="Select DeepLabCut config.yaml",
+				filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
+				parent=prompt_root,
+			)
+			if not picked:
+				prompt_root.destroy()
+				raise RuntimeError("Prediction cancelled: no config file selected.")
+			config_path = Path(picked)
+
+		prompt_root.destroy()
+
+		result = predict_trial_from_jpg_stacks(
+			trial_dir=trial_dir,
+			config_path=config_path,
+			frame_range=frame_range,
+			xma_base_name="NoUpdateModel",
+		)
+		return Path(result["trial_dir"]), None, None
 
 	root = tk.Tk()
 	root.withdraw()
@@ -575,7 +799,7 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 				"(for example cam1 and cam2 folders)."
 			),
 		)
-		return shared_root, None, None
+		return _maybe_predict_if_images_only(shared_root)
 
 	pred_root = _choose_directory_gui(
 		title="Select Predictions Folder",
@@ -590,6 +814,594 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 		prompt="Select the folder containing Cam2 images.",
 	)
 	return pred_root, cam1_dir, cam2_dir
+
+
+def _active_update_roots(base_dir: str | Path, bird: str, trial_num: int) -> list[Path]:
+	base_dir = Path(base_dir)
+	return [
+		base_dir / bird / "active_updates" / f"Trial{trial_num}",
+		base_dir / bird / f"Trial{trial_num}" / "active_updates",
+	]
+
+
+def _extract_trial_context_from_path(path_like: str | Path) -> dict[str, Any]:
+	"""Infer bird/trial/base/trial_dir from any path containing .../<bird>/TrialN/..."""
+	path_obj = Path(path_like).resolve()
+	parts = list(path_obj.parts)
+	trial_idx = None
+	trial_name = ""
+	for idx, token in enumerate(parts):
+		if re.fullmatch(r"Trial\d+", str(token), flags=re.IGNORECASE):
+			trial_idx = idx
+			trial_name = str(token)
+			break
+	if trial_idx is None or trial_idx <= 0:
+		raise ValueError(f"Could not infer bird/trial from path: {path_obj}")
+
+	bird = str(parts[trial_idx - 1])
+	trial_num = int(re.search(r"(\d+)", trial_name).group(1))
+	base_dir = Path(*parts[:trial_idx - 1])
+	trial_dir = Path(*parts[:trial_idx + 1])
+	return {
+		"bird": bird,
+		"trial_num": trial_num,
+		"base_dir": base_dir,
+		"trial_dir": trial_dir,
+	}
+
+
+def _looks_like_image_only_selection(selected_dir: Path) -> bool:
+	"""Return True when a folder appears to have JPG stacks but no prediction CSVs yet."""
+	if not selected_dir.exists() or not selected_dir.is_dir():
+		return False
+
+	files = [p for p in selected_dir.iterdir() if p.is_file()]
+	has_images_here = any(p.suffix.lower() in IMAGE_EXTS for p in files)
+	has_csv_here = any(p.suffix.lower() == ".csv" for p in files)
+
+	if has_images_here and not has_csv_here:
+		return True
+
+	cam1_dir = selected_dir / "Cam1"
+	cam2_dir = selected_dir / "Cam2"
+	if cam1_dir.is_dir() and cam2_dir.is_dir():
+		cam1_images = any(p.is_file() and p.suffix.lower() in IMAGE_EXTS for p in cam1_dir.iterdir())
+		cam2_images = any(p.is_file() and p.suffix.lower() in IMAGE_EXTS for p in cam2_dir.iterdir())
+		if cam1_images and cam2_images:
+			try:
+				_resolve_prediction_csvs(selected_dir)
+			except Exception:
+				return True
+
+	return False
+
+
+def _infer_trial_dir_from_selected_folder(selected_dir: Path) -> Path:
+	"""Map a selected folder to trial_dir containing Cam1/Cam2 image folders."""
+	selected_dir = Path(selected_dir)
+	if (selected_dir / "Cam1").is_dir() and (selected_dir / "Cam2").is_dir():
+		return selected_dir
+
+	name_low = selected_dir.name.lower()
+	if name_low in {"cam1", "cam2"}:
+		trial_dir = selected_dir.parent
+		if (trial_dir / "Cam1").is_dir() and (trial_dir / "Cam2").is_dir():
+			return trial_dir
+
+	raise FileNotFoundError(
+		"Could not infer trial directory with Cam1/Cam2 from selected folder. "
+		f"Selected: {selected_dir}"
+	)
+
+
+def predict_trial_from_jpg_stacks(
+	trial_dir: str | Path,
+	config_path: str | Path,
+	fps: int = 500,
+	batchsize: int = 16,
+	save_as_csv: bool = True,
+	xma_base_name: str = "NoUpdateModel",
+	frame_range: list[int] | tuple[int, int] | None = None,
+) -> dict[str, Any]:
+	"""Predict from Cam1/Cam2 JPG stacks for a selected trial directory and save combined output."""
+	import deeplabcut as dlc
+	import xrommtools_copy as xt
+
+	dc = _load_data_converter_module()
+	trial_dir = Path(trial_dir)
+	config_path = Path(config_path)
+
+	cam1_dir = trial_dir / "Cam1"
+	cam2_dir = trial_dir / "Cam2"
+	cam1_avi = trial_dir / "Cam1.avi"
+	cam2_avi = trial_dir / "Cam2.avi"
+	total_frames = len(list(cam1_dir.glob("*.jpg")))
+
+	if not cam1_dir.exists() or not cam2_dir.exists():
+		raise FileNotFoundError(
+			f"Expected Cam1/Cam2 folders in {trial_dir}, but one or both are missing."
+		)
+
+	if frame_range is None:
+		start_frame = 0
+		end_frame = int(total_frames)
+	else:
+		start_frame, end_frame = map(int, frame_range)
+		if end_frame < start_frame:
+			start_frame, end_frame = end_frame, start_frame
+
+	if not cam1_avi.exists():
+		dc.jpg_stack_to_avi(
+			input_folder=cam1_dir,
+			output_path=cam1_avi,
+			fps=int(fps),
+			start_frame=int(start_frame),
+			end_frame=int(end_frame),
+		)
+	if not cam2_avi.exists():
+		dc.jpg_stack_to_avi(
+			input_folder=cam2_dir,
+			output_path=cam2_avi,
+			fps=int(fps),
+			start_frame=int(start_frame),
+			end_frame=int(end_frame),
+		)
+
+	if not sorted(trial_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime):
+		dlc.analyze_videos(
+			str(config_path),
+			[str(cam1_avi), str(cam2_avi)],
+			save_as_csv=bool(save_as_csv),
+			destfolder=str(trial_dir),
+			batchsize=int(batchsize),
+		)
+
+	cam1_candidates = sorted(trial_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime)
+	cam2_candidates = sorted(trial_dir.glob("Cam2DLC*.csv"), key=lambda path: path.stat().st_mtime)
+	if not cam1_candidates or not cam2_candidates:
+		raise FileNotFoundError(
+			f"Could not find Cam1DLC*.csv / Cam2DLC*.csv in {trial_dir} after prediction."
+		)
+
+	cam1_dlc_csv = cam1_candidates[-1]
+	cam2_dlc_csv = cam2_candidates[-1]
+	pred_df = xt.dlc_to_xma(str(cam1_dlc_csv), str(cam2_dlc_csv), str(xma_base_name), str(trial_dir))
+
+	nan_padded_df = pad_df_to_trial_length(pred_df, total_frames=total_frames, start_frame=int(start_frame))
+	corrected_df = correct_frames_from_df_fast(
+		trial_dir=trial_dir,
+		pred_df=nan_padded_df,
+		frames_to_correct=list(range(int(start_frame), int(end_frame))),
+		max_match_dist=15.0,
+	)
+
+	pred_csv = trial_dir / f"{xma_base_name}-Predicted2DPoints.csv"
+	corrected_df.to_csv(pred_csv, na_rep="NaN", index=False)
+
+	return {
+		"trial_dir": trial_dir,
+		"cam1_avi": cam1_avi,
+		"cam2_avi": cam2_avi,
+		"cam1_dlc_csv": cam1_dlc_csv,
+		"cam2_dlc_csv": cam2_dlc_csv,
+		"pred_csv": pred_csv,
+	}
+
+
+def _list_active_update_dirs(base_dir: str | Path, bird: str, trial_num: int) -> list[Path]:
+	active_dirs: list[Path] = []
+	seen: set[str] = set()
+
+	for root in _active_update_roots(base_dir, bird, trial_num):
+		if not root.exists():
+			continue
+		for path in sorted(p for p in root.iterdir() if p.is_dir()):
+			resolved = str(path.resolve()).lower()
+			if resolved in seen:
+				continue
+			seen.add(resolved)
+			active_dirs.append(path)
+
+	return active_dirs
+
+
+def _resolve_active_update_dir(
+	base_dir: str | Path,
+	bird: str,
+	trial_num: int,
+	update_set: str | None = None,
+) -> Path:
+	active_dirs = _list_active_update_dirs(base_dir, bird, trial_num)
+
+	if len(active_dirs) == 0:
+		searched = "\n".join(str(path) for path in _active_update_roots(base_dir, bird, trial_num))
+		raise FileNotFoundError(
+			"No active update folders found. Checked:\n"
+			f"{searched}"
+		)
+
+	if update_set is not None:
+		matches = [path for path in active_dirs if path.name.lower() == update_set.lower()]
+		if len(matches) == 0:
+			options = ", ".join(path.name for path in active_dirs)
+			raise FileNotFoundError(
+				f"Update set '{update_set}' not found for {bird} Trial{trial_num}. "
+				f"Available: {options}"
+			)
+		return matches[0]
+
+	if len(active_dirs) == 1:
+		return active_dirs[0]
+
+	unified_matches = [path for path in active_dirs if path.name.lower() == "unified"]
+	if len(unified_matches) == 1:
+		return unified_matches[0]
+
+	options = ", ".join(path.name for path in active_dirs)
+	raise ValueError(
+		f"Multiple active update folders found for {bird} Trial{trial_num}: {options}. "
+		"Pass update_set=... to choose one explicitly."
+	)
+
+
+def pad_df_to_trial_length(df: pd.DataFrame, total_frames: int, start_frame: int) -> pd.DataFrame:
+	"""Pad a subset prediction dataframe to full trial length using NaN rows."""
+	full_df = pd.DataFrame(np.nan, index=range(int(total_frames)), columns=df.columns)
+	start = int(start_frame)
+	stop = int(start + len(df))
+	full_df.iloc[start:stop] = df.to_numpy()
+	return full_df
+
+
+def correct_frames_from_df_fast(
+	trial_dir: Path,
+	frames_to_correct: list[int] | tuple[int, int],
+	pred_df: pd.DataFrame,
+	max_match_dist: float = 15.0,
+	cam_names: tuple[str, str] = ("Cam1", "Cam2"),
+	verbose: bool = True,
+) -> pd.DataFrame:
+	"""Apply blob-based camera correction over selected frame indices."""
+	trial_dir = Path(trial_dir)
+	df_corrected = pred_df.copy(deep=True)
+
+	cam_dirs = {cam: trial_dir / cam for cam in cam_names}
+	image_paths = {cam: collect_images(folder) for cam, folder in cam_dirs.items()}
+	cams = list(image_paths.keys())
+
+	if len(cams) >= 2:
+		n0 = len(image_paths[cams[0]])
+		for c in cams[1:]:
+			if len(image_paths[c]) != n0:
+				print(f"Cam mismatch: {cams[0]}={n0}, {c}={len(image_paths[c])}")
+
+	frames = sorted(set(int(x) for x in frames_to_correct))
+	valid_frames = [
+		i
+		for i in frames
+		if 0 <= i < len(df_corrected)
+		and all(i < len(image_paths[c]) for c in cams)
+	]
+
+	if not valid_frames:
+		raise ValueError("No valid frames after filtering.")
+
+	t0 = time.perf_counter()
+
+	def process_frame(frame_idx: int) -> tuple[int, dict[str, float]]:
+		row = df_corrected.iloc[frame_idx]
+		frame_updates: dict[str, float] = {}
+		for camera in cams:
+			img_path = image_paths[camera][frame_idx]
+			with Image.open(img_path) as image_file:
+				gray = np.asarray(image_file.convert("L"), dtype=np.float64)
+			updates = _correct_camera_frame(
+				image=gray,
+				row=row,
+				camera=camera.lower(),
+				max_match_dist=max_match_dist,
+			)
+			if updates:
+				frame_updates.update(updates)
+		return frame_idx, frame_updates
+
+	with ThreadPoolExecutor() as executor:
+		futures = {executor.submit(process_frame, frame_idx): frame_idx for frame_idx in valid_frames}
+		for n, future in enumerate(as_completed(futures), start=1):
+			frame_idx, updates = future.result()
+			if updates:
+				df_corrected.loc[df_corrected.index[frame_idx], list(updates.keys())] = list(updates.values())
+			if verbose and (n % 250 == 0 or n == len(valid_frames)):
+				print(f"Corrected {n}/{len(valid_frames)} frames")
+
+	elapsed = time.perf_counter() - t0
+	if verbose:
+		print(f"Done {len(valid_frames)} frames in {elapsed:.1f}s")
+
+	return df_corrected
+
+
+def train_update_model(
+	bird: str,
+	trial_num: int,
+	snapshot_path: str | Path | None = None,
+	epochs: int = 100,
+	nframes: int = 30,
+	frame_selection_seed: int = 42,
+	task: str = "Canari",
+	experimenter: str = "Tyler",
+	finetune_experimenter: str = "FineTuner",
+	base_dir: str | Path = (
+		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
+		r"\BirdSongs-MNHN\Testing\ProcessingData"
+	),
+	update_set: str | None = None,
+) -> dict[str, Any]:
+	"""Create/update a DLC training dataset for an active-update set and train the model."""
+	import DLCsupport as dlcs
+
+	src_trial = _resolve_active_update_dir(
+		base_dir=base_dir,
+		bird=bird,
+		trial_num=trial_num,
+		update_set=update_set,
+	)
+
+	if snapshot_path is None:
+		snapshot_path = BIRD_SNAPSHOT_PATHS.get(str(bird))
+
+	if snapshot_path is not None and not Path(snapshot_path).exists():
+		raise FileNotFoundError(f"Snapshot path does not exist:\n{snapshot_path}")
+
+	if not src_trial.exists():
+		raise FileNotFoundError(f"Trial folder not found:\n{src_trial}")
+
+	models_dir = src_trial / "ModelsToTune"
+	models_dir.mkdir(exist_ok=True)
+
+	dummy_video = Path(base_dir) / bird / f"Trial{trial_num}" / "Cam1.avi"
+	combined_config = dlcs.create_combined_project_if_missing(
+		task=task,
+		experimenter=finetune_experimenter,
+		combined_project_root=models_dir,
+		dummy_video=dummy_video,
+	)
+
+	dlcs.apply_bird_bodyparts_to_configs({bird: [combined_config]}, strict=True)
+
+	clean_trial = src_trial / "ModelTraining"
+	clean_trial.mkdir(parents=True, exist_ok=True)
+
+	for cam_folder in ["cam1", "cam2", "Cam1", "Cam2"]:
+		src = src_trial / cam_folder
+		if not src.exists() or not src.is_dir():
+			continue
+		dst_name = "Cam1" if cam_folder.lower() == "cam1" else "Cam2"
+		dst = clean_trial / dst_name
+		if dst.exists():
+			shutil.rmtree(dst)
+		shutil.copytree(src, dst)
+
+	truth_csv = src_trial / "data" / "corrections_autosave.csv"
+	if not truth_csv.exists():
+		raise FileNotFoundError(f"Missing label file:\n{truth_csv}")
+
+	df = pd.read_csv(truth_csv)
+	coord_cols = [c for c in df.columns if re.search(r"_cam[12]_[XY]$", str(c))]
+	if len(coord_cols) == 0:
+		raise ValueError("No coordinate columns matching *_cam[12]_[XY] found.")
+
+	clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
+	df[coord_cols].to_csv(clean_points_csv, index=False)
+
+	dataset_name = f"UpdateModelForTrial{trial_num}"
+	dlcs.build_combined_dataset(
+		combined_config=combined_config,
+		data_path=clean_trial,
+		dataset_name=dataset_name,
+		experimenter=experimenter,
+		nframes=nframes,
+		frame_selection_seed=frame_selection_seed,
+	)
+
+	t0 = time.perf_counter()
+	if snapshot_path is not None:
+		dlcs.create_and_train(
+			config_path=combined_config,
+			epochs=epochs,
+			snapshot_path=str(snapshot_path),
+		)
+	else:
+		dlcs.create_and_train(
+			config_path=combined_config,
+			epochs=epochs,
+		)
+	elapsed = time.perf_counter() - t0
+
+	models_base = combined_config.parent
+	for train_dir in models_base.glob("dlc-models-pytorch/iteration-*/*/train"):
+		for file in train_dir.glob("*best*.pt"):
+			file.unlink()
+
+	print(
+		f"\nTraining complete"
+		f"\nBird: {bird}"
+		f"\nTrial: {trial_num}"
+		f"\nUpdate set: {src_trial.name}"
+		f"\nElapsed: {elapsed:.1f} sec ({elapsed / 60:.1f} min)"
+	)
+
+	return {
+		"bird": bird,
+		"trial": trial_num,
+		"update_set": src_trial.name,
+		"config": combined_config,
+		"elapsed_seconds": elapsed,
+	}
+
+
+def _predict_with_updated_model(
+	bird: str,
+	trial_num: int,
+	frame_boundary: list[int],
+	model_name: str = "ModelUpdateMonday",
+	batchsize: int = 16,
+	base_dir: str | Path = (
+		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
+		r"\BirdSongs-MNHN\Testing\ProcessingData"
+	),
+	update_set: str | None = None,
+) -> dict[str, Any]:
+	"""Run DLC inference with newest trained model and write corrected full-length predictions."""
+	import deeplabcut as dlc
+	import xrommtools_copy as xt
+
+	base = Path(base_dir)
+	trial_dir = base / bird / f"Trial{trial_num}"
+	src_trial = _resolve_active_update_dir(base_dir=base, bird=bird, trial_num=trial_num, update_set=update_set)
+
+	models_dir = src_trial / "ModelsToTune"
+	configs = list(models_dir.rglob("config.yaml"))
+	if len(configs) == 0:
+		raise FileNotFoundError(f"No config.yaml found in:\n{models_dir}")
+
+	config_path = max(configs, key=lambda p: p.stat().st_mtime)
+
+	cam1 = trial_dir / "Cam1.avi"
+	cam2 = trial_dir / "Cam2.avi"
+	cam1_dir = trial_dir / "Cam1"
+	total_frames = len(list(cam1_dir.glob("*.jpg")))
+
+	if not cam1.exists() or not cam2.exists():
+		raise FileNotFoundError("Cam1.avi and Cam2.avi are required for updated model prediction.")
+
+	updated_dir = trial_dir / "Updated"
+	updated_dir.mkdir(exist_ok=True)
+
+	if not sorted(updated_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime):
+		dlc.analyze_videos(
+			str(config_path),
+			[str(cam1), str(cam2)],
+			save_as_csv=True,
+			destfolder=str(updated_dir),
+			batchsize=int(batchsize),
+		)
+
+	cam1_candidates = sorted(updated_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime)
+	cam2_candidates = sorted(updated_dir.glob("Cam2DLC*.csv"), key=lambda path: path.stat().st_mtime)
+	if not cam1_candidates or not cam2_candidates:
+		raise FileNotFoundError(f"Could not find Cam1DLC*.csv / Cam2DLC*.csv in {updated_dir} after prediction.")
+
+	cam1_dlc_csv = cam1_candidates[-1]
+	cam2_dlc_csv = cam2_candidates[-1]
+	pred_df = xt.dlc_to_xma(str(cam1_dlc_csv), str(cam2_dlc_csv), model_name, str(updated_dir))
+
+	start_frame = int(frame_boundary[0])
+	end_frame = int(frame_boundary[1])
+	nan_padded_df = pad_df_to_trial_length(pred_df, total_frames=total_frames, start_frame=start_frame)
+
+	corrected_df = correct_frames_from_df_fast(
+		trial_dir=trial_dir,
+		pred_df=nan_padded_df,
+		frames_to_correct=list(range(start_frame, end_frame)),
+		max_match_dist=15.0,
+	)
+
+	pred_csv = trial_dir / "Updated_Predictions.csv"
+	corrected_df.to_csv(pred_csv, na_rep="NaN", index=False)
+
+	return {
+		"config": config_path,
+		"update_set": src_trial.name,
+		"Updated Csv": pred_csv,
+		"output_dir": updated_dir,
+	}
+
+
+def train_and_predict_from_corrections(
+	bird: str,
+	trial_num: int,
+	frame_boundary: list[int],
+	orig_snapshot_path: str | Path | None = None,
+	epochs: int = 100,
+	nframes: int = 30,
+	frame_selection_seed: int = 42,
+	task: str = "Canari",
+	experimenter: str = "Tyler",
+	finetune_experimenter: str = "FineTuner",
+	base_path: str | Path = (
+		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
+		r"\BirdSongs-MNHN\Testing\ProcessingData"
+	),
+	update_set: str | None = None,
+	model_name: str = "ModelUpdateMonday",
+	batchsize: int = 16,
+) -> dict[str, Any]:
+	"""Train on corrected subset and run updated prediction pipeline."""
+	train_result = train_update_model(
+		bird=bird,
+		trial_num=trial_num,
+		snapshot_path=orig_snapshot_path,
+		epochs=epochs,
+		nframes=nframes,
+		frame_selection_seed=frame_selection_seed,
+		task=task,
+		experimenter=experimenter,
+		finetune_experimenter=finetune_experimenter,
+		base_dir=base_path,
+		update_set=update_set,
+	)
+	predict_result = _predict_with_updated_model(
+		bird=bird,
+		trial_num=trial_num,
+		frame_boundary=frame_boundary,
+		model_name=model_name,
+		batchsize=batchsize,
+		base_dir=base_path,
+		update_set=update_set,
+	)
+	return {
+		"train": train_result,
+		"predict": predict_result,
+	}
+
+# MAYBE EXCESSIVE! LOOK AT PREVIOUS ONE
+def _Train_and_Predict(
+	bird: str,
+	trial_num: int,
+	frame_boundary: list[int],
+	orig_snapshot_path: str | Path | None = None,
+	epochs: int = 100,
+	nframes: int = 30,
+	frame_selection_seed: int = 42,
+	task: str = "Canari",
+	experimenter: str = "Tyler",
+	finetune_experimenter: str = "FineTuner",
+	base_path: str | Path = (
+		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
+		r"\BirdSongs-MNHN\Testing\ProcessingData"
+	),
+	update_set: str | None = None,
+	model_name: str = "ModelUpdateMonday",
+	batchsize: int = 16,
+) -> dict[str, Any]:
+	"""Notebook-compatible alias for training then predicting updated points."""
+	return train_and_predict_from_corrections(
+		bird=bird,
+		trial_num=trial_num,
+		frame_boundary=frame_boundary,
+		orig_snapshot_path=orig_snapshot_path,
+		epochs=epochs,
+		nframes=nframes,
+		frame_selection_seed=frame_selection_seed,
+		task=task,
+		experimenter=experimenter,
+		finetune_experimenter=finetune_experimenter,
+		base_path=base_path,
+		update_set=update_set,
+		model_name=model_name,
+		batchsize=batchsize,
+	)
 
 
 @dataclass
@@ -955,32 +1767,40 @@ def make_postanalysis_overlay_popout(
 
 	pred_alignment_by_cam: dict[str, dict[str, Any]] = {}
 	truth_alignment_by_cam: dict[str, dict[str, Any]] = {}
-	for _camera_name in ("cam1", "cam2"):
-		cam_images = state.images_by_cam.get(_camera_name, [])
-		pred_cam = state.pred_long[state.pred_long["camera"] == _camera_name]
-		if pred_cam.empty:
-			pred_alignment_by_cam[_camera_name] = {"name": "pos", "score": 0.0}
-		else:
-			pred_alignment_by_cam[_camera_name] = _build_frame_alignment(pred_cam["frame_id"], cam_images)
 
-		if state.truth_long.empty:
-			truth_alignment_by_cam[_camera_name] = pred_alignment_by_cam[_camera_name]
-		else:
-			truth_cam = state.truth_long[state.truth_long["camera"] == _camera_name]
-			if truth_cam.empty:
+	def _recompute_alignments(verbose: bool = True) -> None:
+		pred_alignment_by_cam.clear()
+		truth_alignment_by_cam.clear()
+
+		for _camera_name in ("cam1", "cam2"):
+			cam_images = state.images_by_cam.get(_camera_name, [])
+			pred_cam = state.pred_long[state.pred_long["camera"] == _camera_name]
+			if pred_cam.empty:
+				pred_alignment_by_cam[_camera_name] = {"name": "pos", "score": 0.0}
+			else:
+				pred_alignment_by_cam[_camera_name] = _build_frame_alignment(pred_cam["frame_id"], cam_images)
+
+			if state.truth_long.empty:
 				truth_alignment_by_cam[_camera_name] = pred_alignment_by_cam[_camera_name]
 			else:
-				truth_alignment_by_cam[_camera_name] = _build_frame_alignment(truth_cam["frame_id"], cam_images)
+				truth_cam = state.truth_long[state.truth_long["camera"] == _camera_name]
+				if truth_cam.empty:
+					truth_alignment_by_cam[_camera_name] = pred_alignment_by_cam[_camera_name]
+				else:
+					truth_alignment_by_cam[_camera_name] = _build_frame_alignment(truth_cam["frame_id"], cam_images)
 
-	for _camera_name in ("cam1", "cam2"):
-		_pred_mode = pred_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
-		_pred_score = pred_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
-		_truth_mode = truth_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
-		_truth_score = truth_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
-		print(
-			f"Frame alignment {_camera_name}: pred={_pred_mode} ({_pred_score:.3f}), "
-			f"truth={_truth_mode} ({_truth_score:.3f})"
-		)
+		if verbose:
+			for _camera_name in ("cam1", "cam2"):
+				_pred_mode = pred_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
+				_pred_score = pred_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
+				_truth_mode = truth_alignment_by_cam.get(_camera_name, {}).get("name", "pos")
+				_truth_score = truth_alignment_by_cam.get(_camera_name, {}).get("score", 0.0)
+				print(
+					f"Frame alignment {_camera_name}: pred={_pred_mode} ({_pred_score:.3f}), "
+					f"truth={_truth_mode} ({_truth_score:.3f})"
+				)
+
+	_recompute_alignments(verbose=True)
 
 	def _frame_pos_to_pred_id(camera: str, frame_pos: int) -> int:
 		images = state.images_by_cam.get(camera, [])
@@ -1430,6 +2250,161 @@ def make_postanalysis_overlay_popout(
 
 		return method_dir
 
+	def _extract_trial_context_from_export_dir(export_dir: Path) -> dict[str, Any]:
+		return _extract_trial_context_from_path(export_dir)
+
+	def _prompt_train_predict_inputs(
+		export_dir: Path,
+		frames_local: list[int],
+		default_update_set: str,
+	) -> dict[str, Any] | None:
+		try:
+			import tkinter as tk
+			from tkinter import filedialog, messagebox, simpledialog
+		except Exception as exc:
+			raise RuntimeError("Tkinter prompts are required for train-and-predict confirmation.") from exc
+
+		context = _extract_trial_context_from_export_dir(export_dir)
+		bird = str(context["bird"])
+		trial_num = int(context["trial_num"])
+		saved_range = _load_saved_frame_range(Path(context["trial_dir"]))
+		if saved_range is not None:
+			default_start, default_end = int(saved_range[0]), int(saved_range[1])
+		else:
+			default_start = int(min(frames_local)) if frames_local else 0
+			default_end = int(max(frames_local)) if frames_local else 0
+		snapshot_default = BIRD_SNAPSHOT_PATHS.get(bird)
+
+		root = tk.Tk()
+		root.withdraw()
+		root.attributes("-topmost", True)
+
+		proceed = bool(
+			messagebox.askyesno(
+				title="Train And Update Predictions",
+				message=(
+					f"Bird: {bird}\n"
+					f"Trial: {trial_num}\n"
+					f"Update set: {default_update_set}\n\n"
+					"Are you ready to train and update points?"
+				),
+			)
+		)
+		if not proceed:
+			root.destroy()
+			return None
+
+		start_frame = simpledialog.askinteger(
+			"Start Frame",
+			"Start frame for correction-aware update:",
+			initialvalue=default_start,
+			minvalue=0,
+			parent=root,
+		)
+		if start_frame is None:
+			root.destroy()
+			return None
+
+		end_frame = simpledialog.askinteger(
+			"End Frame",
+			"End frame for correction-aware update:",
+			initialvalue=default_end,
+			minvalue=0,
+			parent=root,
+		)
+		if end_frame is None:
+			root.destroy()
+			return None
+
+		epochs = simpledialog.askinteger(
+			"Epochs",
+			"Training epochs:",
+			initialvalue=30,
+			minvalue=1,
+			parent=root,
+		)
+		if epochs is None:
+			root.destroy()
+			return None
+
+		nframes = simpledialog.askinteger(
+			"Frames",
+			"Number of frames to sample for model update:",
+			initialvalue=30,
+			minvalue=1,
+			parent=root,
+		)
+		if nframes is None:
+			root.destroy()
+			return None
+
+		snapshot_path = snapshot_default
+		if snapshot_path is None or not Path(snapshot_path).exists():
+			messagebox.showinfo(
+				title="Snapshot Needed",
+				message=(
+					f"No valid default snapshot found for {bird}.\n"
+					"Please select a snapshot .pt file."
+				),
+			)
+			picked = filedialog.askopenfilename(
+				title="Select Snapshot File",
+				filetypes=[("PyTorch Snapshot", "*.pt"), ("All Files", "*.*")],
+			)
+			if not picked:
+				root.destroy()
+				return None
+			snapshot_path = picked
+
+		root.destroy()
+
+		if int(end_frame) < int(start_frame):
+			start_frame, end_frame = int(end_frame), int(start_frame)
+
+		_save_frame_range(
+			Path(context["trial_dir"]),
+			int(start_frame),
+			int(end_frame),
+			source="train_and_predict",
+		)
+
+		return {
+			"bird": bird,
+			"trial_num": trial_num,
+			"base_path": Path(context["base_dir"]),
+			"update_set": str(default_update_set),
+			"orig_snapshot_path": str(snapshot_path),
+			"frame_boundary": [int(start_frame), int(end_frame)],
+			"epochs": int(epochs),
+			"nframes": int(nframes),
+		}
+
+	def _run_train_and_predict_from_review(export_dir: Path, frames_local: list[int], method_name: str) -> bool:
+		params = _prompt_train_predict_inputs(export_dir, frames_local, default_update_set=method_name)
+		if params is None:
+			return False
+
+		result = _Train_and_Predict(
+			bird=str(params["bird"]),
+			trial_num=int(params["trial_num"]),
+			frame_boundary=list(params["frame_boundary"]),
+			orig_snapshot_path=str(params["orig_snapshot_path"]),
+			epochs=int(params["epochs"]),
+			nframes=int(params["nframes"]),
+			base_path=Path(params["base_path"]),
+			update_set=str(params["update_set"]),
+		)
+
+		pred_csv = Path(result["predict"]["Updated Csv"])
+		if not pred_csv.exists():
+			raise FileNotFoundError(f"Updated prediction CSV was not created: {pred_csv}")
+
+		state.pred_csv_by_cam = {"cam1": pred_csv, "cam2": pred_csv}
+		state.pred_long = _load_prediction_long(pred_csv)
+		_recompute_alignments(verbose=True)
+		redraw()
+		return True
+
 	def _open_correction_subset_view(method_name: str, frames: list[int], export_dir: Path) -> None:
 		frames_local = [int(frame) for frame in sorted(set(frames))]
 		if not frames_local:
@@ -1456,6 +2431,7 @@ def make_postanalysis_overlay_popout(
 		ax_apply_frame = review_fig.add_axes([0.72, 0.005, 0.24, 0.025])
 		ax_prediction_source = review_fig.add_axes([0.84, 0.03, 0.11, 0.055])
 		ax_camera_mode = review_fig.add_axes([0.55, 0.03, 0.075, 0.055])
+		ax_finish_corrections = review_fig.add_axes([0.10, 0.03, 0.35, 0.055])
 		ax_info_updating = review_fig.add_axes([0.67, 0.005, 0.03, 0.025])
 		
 		radio_camera_mode = RadioButtons(ax_camera_mode, ["Both", "cam1", "cam2"], active=0,)
@@ -1464,6 +2440,7 @@ def make_postanalysis_overlay_popout(
 		# btn_review_current = Button(ax_review_current, "Current Frame")
 		# btn_zoom_reset = Button(ax_zoom_reset, "Reset 30x30")
 		btn_apply_frame = Button(ax_apply_frame, "Apply Snap To Frame")
+		btn_finish_corrections = Button(ax_finish_corrections, "Are you finished correcting?")
 		check_bulk_snap = CheckButtons(ax_bulk_snap, ["Auto snap frame"], [False])
 		radio_snap_mode = RadioButtons(ax_snap_mode, ["blob", "darkest"], active=0)
 		radio_prediction_source = RadioButtons(ax_prediction_source, ["Current", "Prior frame"], active=0)
@@ -2029,6 +3006,7 @@ def make_postanalysis_overlay_popout(
 			value_font = _scaled_font(review_fig, base_size=9.0, ref_w=16.0, ref_h=9.0, min_size=7.0, max_size=13.0)
 			btn_review_prev.label.set_fontsize(button_font)
 			btn_review_next.label.set_fontsize(button_font)
+			btn_finish_corrections.label.set_fontsize(control_font)
 			# btn_review_current.label.set_fontsize(control_font)
 			# btn_zoom_reset.label.set_fontsize(control_font)
 			btn_apply_frame.label.set_fontsize(control_font)
@@ -2297,11 +3275,22 @@ def make_postanalysis_overlay_popout(
 				last_bulk_apply_signature = None
 			_redraw_review()
 
+		def _on_finish_corrections(_event: Any) -> None:
+			try:
+				_autosave_corrections()
+				success = _run_train_and_predict_from_review(export_dir=export_dir, frames_local=frames_local, method_name=method_name)
+				if success:
+					print("Train-and-predict complete. Main viewer refreshed with updated predictions.")
+					plt.close(review_fig)
+			except Exception as exc:
+				print(f"Train and update failed: {exc}")
+
 		btn_review_prev.on_clicked(_on_review_prev)
 		btn_review_next.on_clicked(_on_review_next)
 		# btn_review_current.on_clicked(_on_review_current)
 		# btn_zoom_reset.on_clicked(_on_zoom_reset)
 		btn_apply_frame.on_clicked(_on_apply_frame)
+		btn_finish_corrections.on_clicked(_on_finish_corrections)
 		slider_review.on_changed(_redraw_review)
 		slider_review_pred_size.on_changed(_redraw_review)
 		check_bulk_snap.on_clicked(_on_bulk_toggle)
@@ -2318,6 +3307,7 @@ def make_postanalysis_overlay_popout(
 			{
 				"btn_prev": btn_review_prev,
 				"btn_next": btn_review_next,
+				"btn_finish": btn_finish_corrections,
 				# "btn_current": btn_review_current,
 				# "btn_zoom_reset": btn_zoom_reset,
 				"btn_apply_frame": btn_apply_frame,
