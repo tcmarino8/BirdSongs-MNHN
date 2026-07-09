@@ -29,3 +29,7 @@ add this to readme, maybe that requires a rule so you dont forget
 
 5. Prompt 4: ok now the data has been prepared. I want to do a comparison of the data that has been selected. Using the logic and visualization of cell 67 from  test_updated_experiments(FrameSelectionForUpdate) i want to visualize the embeddings of all data images in a dark color with the frames selected by each training module in unique bright colors along with the testing data (that way we can visualize the splits of data being utilized in different components of the modeling process.)
 
+6. Prompt 5: add a cell that makes this run across all trials and plots that data. The dataset_build_metadata for dino models did not update so it reads that there was an error. Make sure these are updated.
+
+7. Prompt 6: I will work on the visualization myself as time goes, but now lets focus on running the training of all these models. Run it through a loop leveraging dlcs.create_and_train. Please inform me if there is a way to parallelize/optimize this training process. Currently it takes a significant amount of time.
+
