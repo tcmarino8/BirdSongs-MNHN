@@ -1157,6 +1157,22 @@ def train_update_model(
 		raise FileNotFoundError(f"Trial folder not found:\n{src_trial}")
 
 	models_dir = src_trial / "ModelsToTune"
+
+	# Check if the ModelsToTune directory exists
+	# FIXME: we need this below logic to apply before it prompts you model hyper params (num images, num epochs etc...)
+	if models_dir.exists():
+		
+		# Check if the combined config file exists
+		configs = list(models_dir.rglob("config.yaml"))
+		if len(configs) > 0:
+			return {
+				"bird": bird,
+				"trial": trial_num,
+				"update_set": src_trial.name,
+				"config": configs[0],
+				"elapsed_seconds": 0,
+			}
+
 	models_dir.mkdir(exist_ok=True)
 
 	dummy_video = Path(base_dir) / bird / f"Trial{trial_num}" / "Cam1.avi"
@@ -1251,10 +1267,14 @@ def _predict_with_updated_model(
 		r"\BirdSongs-MNHN\Testing\ProcessingData"
 	),
 	update_set: str | None = None,
+	# FIXME: fps needs to be added to the update inputs
+	fps = 500,
 ) -> dict[str, Any]:
 	"""Run DLC inference with newest trained model and write corrected full-length predictions."""
 	import deeplabcut as dlc
 	import xrommtools_copy as xt
+	dc = _load_data_converter_module()
+	import cv2 
 
 	base = Path(base_dir)
 	trial_dir = base / bird / f"Trial{trial_num}"
@@ -1267,13 +1287,36 @@ def _predict_with_updated_model(
 
 	config_path = max(configs, key=lambda p: p.stat().st_mtime)
 
+	start_frame, end_frame = frame_boundary
 	cam1 = trial_dir / "Cam1.avi"
 	cam2 = trial_dir / "Cam2.avi"
 	cam1_dir = trial_dir / "Cam1"
 	total_frames = len(list(cam1_dir.glob("*.jpg")))
+	cam2_dir = trial_dir / "Cam2"
 
-	if not cam1.exists() or not cam2.exists():
-		raise FileNotFoundError("Cam1.avi and Cam2.avi are required for updated model prediction.")
+	if not cam1.exists():
+		raise FileNotFoundError(cam1)
+
+	if not cam2.exists():
+		raise FileNotFoundError(cam2)
+	
+	cap = cv2.VideoCapture(cam1)
+	num_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+	if num_vid_frames > end_frame - start_frame:
+		print("remaking videos to fit the frame boundries defined")
+		dc.jpg_stack_to_avi(input_folder=cam1_dir, output_path=cam1, fps=int(fps), start_frame = start_frame, end_frame = end_frame)
+		dc.jpg_stack_to_avi(input_folder=cam2_dir, output_path=cam2, fps=int(fps), start_frame = start_frame, end_frame = end_frame)
+	else:
+		print("Cine Image Conversions Found")
+	print("Now To Analyze the videos with existing model!")
+
+	# cam1 = trial_dir / "Cam1.avi"
+	# cam2 = trial_dir / "Cam2.avi"
+	# cam1_dir = trial_dir / "Cam1"
+	# total_frames = len(list(cam1_dir.glob("*.jpg")))
+
+	# if not cam1.exists() or not cam2.exists():
+	# 	raise FileNotFoundError("Cam1.avi and Cam2.avi are required for updated model prediction.")
 
 	updated_dir = trial_dir / "Updated"
 	updated_dir.mkdir(exist_ok=True)
@@ -1493,9 +1536,12 @@ def make_postanalysis_overlay_popout(
 	cam = _cam_norm(default_camera)
 	max_len = max(1, len(state.images_by_cam.get(cam, []))) - 1
 	start_pos = min(max(0, int(default_frame_pos)), max_len)
-	current_points: list[dict[str, Any]] = []
-	selected_text = None
-	view_limits: dict[str, tuple[float, float] | None] = {"xlim": None, "ylim": None}
+	current_points_by_cam: dict[str, list[dict[str, Any]]] = {"cam1": [], "cam2": []}
+	selected_text_by_cam: dict[str, Any | None] = {"cam1": None, "cam2": None}
+	view_limits_by_cam: dict[str, dict[str, tuple[float, float] | None]] = {
+		"cam1": {"xlim": None, "ylim": None},
+		"cam2": {"xlim": None, "ylim": None},
+	}
 	rng = np.random.default_rng()
 	selected_frames: list[int] = []
 	selected_frame_index: int | None = None
@@ -1505,14 +1551,19 @@ def make_postanalysis_overlay_popout(
 	selection_mode = ""
 	selection_summary_lines: list[str] = []
 	selection_source_camera = cam
+	processing_root: Path | None = None
+	current_bird: str | None = None
+	current_trial_num: int | None = None
 	dino_components: dict[str, Any] = {}
 	dino_embeddings_by_cam: dict[str, Any] = {}
 
-	fig, ax = plt.subplots(figsize=(12.2, 8.4))
+	fig, main_axes = plt.subplots(1, 2, figsize=(13.8, 8.4))
+	main_axes_map = {"cam1": main_axes[0], "cam2": main_axes[1]}
 	fig.subplots_adjust(left=0.08, right=0.8, bottom=0.35)
 
 	ax_correction_tab = fig.add_axes([0.82, 0.92, 0.16, 0.05])
-	ax_cam = fig.add_axes([0.82, 0.72, 0.16, 0.18])
+	ax_switch_bird = fig.add_axes([0.01, 0.94, 0.09, 0.045])
+	ax_switch_trial = fig.add_axes([0.11, 0.94, 0.09, 0.045])
 	ax_checks = fig.add_axes([0.82, 0.49, 0.16, 0.19])
 	ax_select_random = fig.add_axes([0.82, 0.20, 0.16, 0.04])
 	ax_select_displacement = fig.add_axes([0.82, 0.15, 0.16, 0.04])
@@ -1536,9 +1587,10 @@ def make_postanalysis_overlay_popout(
 	ax_info_nframes = fig.add_axes([0.79, 0.345, 0.022, 0.035])
 	ax_info_range = fig.add_axes([0.975, 0.708, 0.018, 0.026])
 
-	radio_cam = RadioButtons(ax_cam, ["cam1", "cam2"], active=0 if cam == "cam1" else 1)
 	check = CheckButtons(ax_checks, ["Show pred", "Annotate"], [True, False])
 	btn_correction_tab = Button(ax_correction_tab, "Correction Tab")
+	btn_switch_bird = Button(ax_switch_bird, "Bird")
+	btn_switch_trial = Button(ax_switch_trial, "Trial")
 	btn_select_random = Button(ax_select_random, "Select Random Frames")
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
@@ -1616,7 +1668,8 @@ def make_postanalysis_overlay_popout(
 		fig.subplots_adjust(left=0.08, right=max(0.76, right_x - 0.02), bottom=0.35)
 
 		ax_correction_tab.set_position([right_x, 0.92, right_w, 0.05])
-		ax_cam.set_position([right_x, 0.72, right_w, 0.18])
+		ax_switch_bird.set_position([0.01, 0.94, 0.09, 0.045])
+		ax_switch_trial.set_position([0.11, 0.94, 0.09, 0.045])
 		ax_checks.set_position([right_x, 0.49, right_w, 0.19])
 		ax_select_random.set_position([right_x, 0.20, right_w, 0.04])
 		ax_select_displacement.set_position([right_x, 0.15, right_w, 0.04])
@@ -1647,11 +1700,9 @@ def make_postanalysis_overlay_popout(
 		control_font = _scaled_font(fig, base_size=9.0, ref_w=12.2, ref_h=8.4, min_size=7.5, max_size=14.0)
 		value_font = _scaled_font(fig, base_size=8.5, ref_w=12.2, ref_h=8.4, min_size=7.0, max_size=13.0)
 
-		for btn in (btn_correction_tab, btn_select_random, btn_select_displacement, btn_select_dino, btn_correction, btn_prev, btn_next, btn_resample):
+		for btn in (btn_correction_tab, btn_switch_bird, btn_switch_trial, btn_select_random, btn_select_displacement, btn_select_dino, btn_correction, btn_prev, btn_next, btn_resample):
 			btn.label.set_fontsize(button_font)
 
-		for txt in radio_cam.labels:
-			txt.set_fontsize(control_font)
 		for txt in check.labels:
 			txt.set_fontsize(control_font)
 		for txt in radio_color_mode.labels:
@@ -1801,6 +1852,192 @@ def make_postanalysis_overlay_popout(
 				)
 
 	_recompute_alignments(verbose=True)
+
+	def _init_context_from_state() -> None:
+		nonlocal processing_root
+		nonlocal current_bird
+		nonlocal current_trial_num
+		try:
+			ctx = _extract_trial_context_from_path(state.pred_root)
+			processing_root = Path(ctx["base_dir"])
+			current_bird = str(ctx["bird"])
+			current_trial_num = int(ctx["trial_num"])
+		except Exception:
+			processing_root = None
+			current_bird = None
+			current_trial_num = None
+
+	def _ensure_processing_root() -> Path | None:
+		nonlocal processing_root
+		if processing_root is not None and processing_root.exists():
+			return processing_root
+		try:
+			import tkinter as tk
+			from tkinter import filedialog, messagebox
+		except Exception:
+			return None
+		root_picker = tk.Tk()
+		root_picker.withdraw()
+		root_picker.attributes("-topmost", True)
+		messagebox.showinfo(
+			title="Select ProcessingData",
+			message="Select the parent ProcessingData folder containing bird folders.",
+			parent=root_picker,
+		)
+		picked = filedialog.askdirectory(title="Select ProcessingData folder", parent=root_picker)
+		root_picker.destroy()
+		if not picked:
+			return None
+		processing_root = Path(picked)
+		return processing_root
+
+	def _list_birds(base_dir: Path) -> list[str]:
+		birds: list[str] = []
+		for p in sorted([d for d in base_dir.iterdir() if d.is_dir()]):
+			if any(re.fullmatch(r"Trial\d+", t.name, flags=re.IGNORECASE) for t in p.iterdir() if t.is_dir()):
+				birds.append(p.name)
+		return birds
+
+	def _list_trials(base_dir: Path, bird_name: str) -> list[int]:
+		bird_dir = base_dir / bird_name
+		trials: list[int] = []
+		if not bird_dir.exists() or not bird_dir.is_dir():
+			return trials
+		for p in sorted([d for d in bird_dir.iterdir() if d.is_dir()]):
+			m = re.fullmatch(r"Trial(\d+)", p.name, flags=re.IGNORECASE)
+			if m is None:
+				continue
+			trials.append(int(m.group(1)))
+		return sorted(trials)
+
+	def _rebuild_bodypart_colors() -> None:
+		all_bodyparts_local = sorted(pd.Index(state.pred_long["bodypart"].dropna().astype(str)).unique().tolist())
+		if not state.truth_long.empty:
+			truth_parts = pd.Index(state.truth_long["bodypart"].dropna().astype(str)).unique().tolist()
+			all_bodyparts_local = sorted(set(all_bodyparts_local).union(set(truth_parts)))
+		palette_local = plt.cm.get_cmap("tab20", max(len(all_bodyparts_local), 1))
+		state.bodypart_color_map = {bp: mcolors.to_hex(palette_local(i)) for i, bp in enumerate(all_bodyparts_local)}
+
+	def _reload_trial_into_view(trial_dir: Path) -> None:
+		nonlocal selected_frames
+		nonlocal selected_frame_index
+		nonlocal selected_frame_meta
+		nonlocal selection_mode
+		nonlocal selection_summary_lines
+		nonlocal selection_source_camera
+		trial_dir = Path(trial_dir)
+		pred_csv_map = _resolve_prediction_csvs(trial_dir)
+		cam_dirs_local = _resolve_cam_dirs(trial_dir)
+		images_map = {
+			"cam1": collect_images(cam_dirs_local["cam1"]),
+			"cam2": collect_images(cam_dirs_local["cam2"]),
+		}
+		if pred_csv_map["cam1"] == pred_csv_map["cam2"]:
+			pred_long_local = _load_prediction_long(pred_csv_map["cam1"])
+		else:
+			pred_long_local = pd.concat(
+				[_load_prediction_long(pred_csv_map["cam1"]), _load_prediction_long(pred_csv_map["cam2"])],
+				ignore_index=True,
+			)
+
+		truth_local = pd.DataFrame(columns=["frame_id", "bodypart", "camera", "x_true", "y_true"])
+		truth_local_found = False
+		if truth_csv_path is not None and Path(truth_csv_path).exists():
+			truth_local = _truth_csv_to_long(Path(truth_csv_path))
+			truth_local_found = not truth_local.empty
+		elif search_truth:
+			tpath = _auto_find_truth_csv(trial_dir)
+			if tpath is not None:
+				truth_local = _truth_csv_to_long(tpath)
+				truth_local_found = not truth_local.empty
+
+		state.pred_root = trial_dir
+		state.pred_csv_by_cam = pred_csv_map
+		state.images_by_cam = images_map
+		state.pred_long = pred_long_local
+		state.truth_long = truth_local
+		state.truth_found = truth_local_found
+		_rebuild_bodypart_colors()
+		_recompute_alignments(verbose=True)
+
+		selected_frames = []
+		selected_frame_index = None
+		selected_frame_meta = {}
+		selection_mode = ""
+		selection_summary_lines = []
+		selection_source_camera = "cam1"
+		_set_selection_controls_visible(False)
+
+		shared_n = max(1, _shared_frame_limit()) - 1
+		slider_frame.valmax = float(shared_n)
+		if slider_frame.val > shared_n:
+			slider_frame.set_val(float(shared_n))
+		redraw()
+
+	def _choose_bird_dialog() -> str | None:
+		base_dir = _ensure_processing_root()
+		if base_dir is None:
+			return None
+		birds = _list_birds(base_dir)
+		if not birds:
+			print(f"No bird folders with Trial* found under: {base_dir}")
+			return None
+		try:
+			import tkinter as tk
+			from tkinter import simpledialog
+		except Exception:
+			return None
+		root_prompt = tk.Tk()
+		root_prompt.withdraw()
+		root_prompt.attributes("-topmost", True)
+		choice = simpledialog.askstring(
+			"Select Bird",
+			"Available birds:\n" + "\n".join(birds) + "\n\nEnter bird name:",
+			initialvalue=current_bird or birds[0],
+			parent=root_prompt,
+		)
+		root_prompt.destroy()
+		if choice is None:
+			return None
+		choice = str(choice).strip()
+		if choice not in birds:
+			print(f"Bird '{choice}' not found under {base_dir}")
+			return None
+		return choice
+
+	def _choose_trial_dialog(bird_name: str) -> int | None:
+		base_dir = _ensure_processing_root()
+		if base_dir is None:
+			return None
+		trials = _list_trials(base_dir, bird_name)
+		if not trials:
+			print(f"No Trial folders found for bird {bird_name} under {base_dir}")
+			return None
+		try:
+			import tkinter as tk
+			from tkinter import simpledialog
+		except Exception:
+			return None
+		root_prompt = tk.Tk()
+		root_prompt.withdraw()
+		root_prompt.attributes("-topmost", True)
+		choice = simpledialog.askinteger(
+			"Select Trial",
+			f"Available trials for {bird_name}:\n" + ", ".join(str(t) for t in trials) + "\n\nEnter trial number:",
+			initialvalue=current_trial_num or trials[0],
+			minvalue=min(trials),
+			maxvalue=max(trials),
+			parent=root_prompt,
+		)
+		root_prompt.destroy()
+		if choice is None:
+			return None
+		if int(choice) not in trials:
+			print(f"Trial {choice} is not available for bird {bird_name}")
+			return None
+		return int(choice)
+
+	_init_context_from_state()
 
 	def _frame_pos_to_pred_id(camera: str, frame_pos: int) -> int:
 		images = state.images_by_cam.get(camera, [])
@@ -2874,6 +3111,8 @@ def make_postanalysis_overlay_popout(
 			_apply_edit(frame_pos, camera_name, bodypart_name, snapped_x, snapped_y)
 
 		def _apply_snap_to_entire_frame(frame_pos: int) -> int:
+
+			# FIXME: Frame Position should be -1 for historical xy coords if previous is selected, and 0 for image...
 			snap_mode = str(radio_snap_mode.value_selected).lower().strip()
 			update_count = 0
 			for camera_name in _selected_cameras():
@@ -2887,33 +3126,15 @@ def make_postanalysis_overlay_popout(
 					row_data: dict[str, float] = {}
 					for _, pred_row in pts.iterrows():
 						bodypart_name = str(pred_row["bodypart"])
-						key = (int(frame_pos), str(camera_name), bodypart_name)
-						# if key in correction_cache:
-						# 	x_src, y_src = correction_cache[key]
-						# else:
-						# 	x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
-						# 	y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						# key = (int(frame_pos), str(camera_name), bodypart_name)
+						
 						x_src, y_src = _get_prediction(
 							frame_pos,
 							camera_name,
 							bodypart_name,
 							pred_row,
 						)
-						# # print(
-						# # 	frame_pos,
-						# # 	camera_name,
-						# # 	bodypart_name,
-						# # 	x_src,
-						# # 	y_src,
-						# # )
-						# prev_key = (frame_pos-1, camera_name, bodypart_name)
-						# # print(prev_key in correction_cache)
-						# # if prev_key in correction_cache:
-						# # 	print("FOUND", prev_key, correction_cache[prev_key])
-						# # else:
-						# # 	print("NOT FOUND", prev_key)
-						# # print(len(correction_cache))
-						# # print(correction_cache.keys())
+					
 						if not (np.isfinite(x_src) and np.isfinite(y_src)):
 							continue
 						prefix = f"{bodypart_name}_{camera_name}"
@@ -2925,11 +3146,7 @@ def make_postanalysis_overlay_popout(
 						continue
 					# Check for previous frame
 					use_previous = (radio_prediction_source.value_selected == "Prior frame")
-					# PRIOR FRAME
-					if use_previous and frame_pos > 0:
-						frame_pos = frame_pos - 1
-					else:
-						frame_pos = frame_pos
+					
 					with Image.open(images[int(frame_pos)]) as image_file:
 						gray_img = np.asarray(image_file.convert("L"), dtype=np.float64)
 
@@ -2967,12 +3184,8 @@ def make_postanalysis_overlay_popout(
 						continue
 					for _, pred_row in pts.iterrows():
 						bodypart_name = str(pred_row["bodypart"])
-						key = (int(frame_pos), str(camera_name), str(bodypart_name))
-						# if key in correction_cache:
-						# 	x_src, y_src = correction_cache[key]
-						# else:
-						# 	x_src = float(pd.to_numeric(pred_row["x"], errors="coerce"))
-						# 	y_src = float(pd.to_numeric(pred_row["y"], errors="coerce"))
+						# key = (int(frame_pos), str(camera_name), str(bodypart_name))
+					
 						x_src, y_src = _get_prediction(
 							frame_pos,
 							camera_name,
@@ -3513,12 +3726,8 @@ def make_postanalysis_overlay_popout(
 			_goto_selected_index(0)
 
 	def redraw(*_args: Any) -> None:
-		nonlocal selected_text
-		nonlocal view_limits
-		camera = _cam_norm(radio_cam.value_selected)
-		imgs = state.images_by_cam.get(camera, [])
-
-		n = max(1, len(imgs)) - 1
+		shared_count = _shared_frame_limit()
+		n = max(1, shared_count) - 1
 		slider_frame.valmax = float(n)
 		if slider_frame.val > n:
 			slider_frame.set_val(n)
@@ -3532,97 +3741,103 @@ def make_postanalysis_overlay_popout(
 		pred_color = _safe_color(textbox_pred_color.text.strip(), "deepskyblue")
 		color_mode = str(radio_color_mode.value_selected)
 
-		# Preserve current zoom/pan before redraw so interaction persists.
-		if ax.has_data():
-			view_limits["xlim"] = tuple(float(v) for v in ax.get_xlim())
-			view_limits["ylim"] = tuple(float(v) for v in ax.get_ylim())
+		for camera_name, camera_ax in main_axes_map.items():
+			imgs = state.images_by_cam.get(camera_name, [])
 
-		ax.clear()
-		current_points.clear()
-		selected_text = None
+			if camera_ax.has_data():
+				view_limits_by_cam[camera_name]["xlim"] = tuple(float(v) for v in camera_ax.get_xlim())
+				view_limits_by_cam[camera_name]["ylim"] = tuple(float(v) for v in camera_ax.get_ylim())
 
-		if not imgs:
-			_update_selection_info(0)
-			_draw_selection_markers()
-			ax.text(0.5, 0.5, f"No images for {camera}", ha="center", va="center", transform=ax.transAxes)
-			ax.set_axis_off()
-			fig.canvas.draw_idle()
-			return
+			camera_ax.clear()
+			current_points_by_cam[camera_name].clear()
+			if selected_text_by_cam.get(camera_name) is not None:
+				selected_text_by_cam[camera_name] = None
 
-		image_path = imgs[frame_pos]
-		frame_id_pred = int(_frame_pos_to_pred_id(camera, frame_pos))
-		name_frame_token = parse_frame_number_from_stem(image_path.stem)
+			if not imgs or not (0 <= frame_pos < len(imgs)):
+				camera_ax.text(0.5, 0.5, f"No image for {camera_name}", ha="center", va="center", transform=camera_ax.transAxes)
+				camera_ax.set_axis_off()
+				continue
 
-		with Image.open(image_path) as im:
-			img = np.asarray(im.convert("RGB"))
-		ax.imshow(img)
+			image_path = imgs[frame_pos]
+			frame_id_pred = int(_frame_pos_to_pred_id(camera_name, frame_pos))
+			name_frame_token = parse_frame_number_from_stem(image_path.stem)
 
-		if show_pred:
-			pred_pts = _pred_points(camera, frame_pos)
-			# if not pred_pts.empty:
-				# pred_pts = pred_pts[pred_pts["likelihood"].fillna(0.0) >= min_like].copy()
-			if not pred_pts.empty:
-				if color_mode == "by_name":
-					pred_colors = [state.bodypart_color_map.get(str(bp), pred_color) for bp in pred_pts["bodypart"]]
-				else:
-					pred_colors = pred_color
-				ax.scatter(
-					pred_pts["x"],
-					pred_pts["y"],
-					c=pred_colors,
-					s=pred_size,
-					alpha=pred_alpha,
-					edgecolors="white",
-					linewidths=1.0,
-					label="Predicted",
-				)
-				if annotate:
-					for _, row in pred_pts.iterrows():
-						label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if color_mode == "by_name" else pred_color
-						ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
-				for _, row in pred_pts.iterrows():
-					current_points.append(
-						{
-							"x": float(row["x"]),
-							"y": float(row["y"]),
-							"bodypart": str(row["bodypart"]),
-							"kind": "Predicted",
-						}
+			with Image.open(image_path) as im:
+				img = np.asarray(im.convert("RGB"))
+			camera_ax.imshow(img)
+
+			if show_pred:
+				pred_pts = _pred_points(camera_name, frame_pos)
+				if not pred_pts.empty:
+					if color_mode == "by_name":
+						pred_colors = [state.bodypart_color_map.get(str(bp), pred_color) for bp in pred_pts["bodypart"]]
+					else:
+						pred_colors = pred_color
+					camera_ax.scatter(
+						pred_pts["x"],
+						pred_pts["y"],
+						c=pred_colors,
+						s=pred_size,
+						alpha=pred_alpha,
+						edgecolors="white",
+						linewidths=1.0,
+						label="Predicted",
 					)
+					if annotate:
+						for _, row in pred_pts.iterrows():
+							label_color = state.bodypart_color_map.get(str(row["bodypart"]), pred_color) if color_mode == "by_name" else pred_color
+							camera_ax.text(row["x"] + 3, row["y"] + 3, str(row["bodypart"]), fontsize=8, color=label_color)
+					for _, row in pred_pts.iterrows():
+						current_points_by_cam[camera_name].append(
+							{
+								"x": float(row["x"]),
+								"y": float(row["y"]),
+								"bodypart": str(row["bodypart"]),
+								"kind": "Predicted",
+							}
+						)
 
-		ax.set_title(
-			f"{camera} | frame_pos={frame_pos} | pred_frame_id={frame_id_pred} | file_token={name_frame_token}\n"
-			f"pred_csv={state.pred_csv_by_cam[camera].name}"
-		)
+			camera_ax.set_title(
+				f"{camera_name} | frame_pos={frame_pos} | pred_frame_id={frame_id_pred} | file_token={name_frame_token}\n"
+				f"pred_csv={state.pred_csv_by_cam[camera_name].name}"
+			)
+			camera_ax.set_axis_off()
+
+			if view_limits_by_cam[camera_name]["xlim"] is not None and view_limits_by_cam[camera_name]["ylim"] is not None:
+				camera_ax.set_xlim(view_limits_by_cam[camera_name]["xlim"])
+				camera_ax.set_ylim(view_limits_by_cam[camera_name]["ylim"])
+
+			handles, labels = camera_ax.get_legend_handles_labels()
+			if handles:
+				camera_ax.legend(loc="upper right")
+
 		_update_selection_info(frame_pos)
 		_draw_selection_markers()
-		ax.set_axis_off()
-
-		# Reapply previous view limits when available.
-		if view_limits["xlim"] is not None and view_limits["ylim"] is not None:
-			ax.set_xlim(view_limits["xlim"])
-			ax.set_ylim(view_limits["ylim"])
-
-		handles, labels = ax.get_legend_handles_labels()
-		if handles:
-			ax.legend(loc="upper right")
+		title_left = f"{current_bird} Trial{current_trial_num}" if current_bird is not None and current_trial_num is not None else str(state.pred_root)
+		fig.suptitle(f"PostAnalysis Viewer | {title_left} | frame {frame_pos}", fontsize=11)
 
 		fig.canvas.draw_idle()
 
 	def _on_click(event: Any) -> None:
-		nonlocal selected_text
-		if event.inaxes != ax:
+		camera_name = None
+		for cam_name, camera_ax in main_axes_map.items():
+			if event.inaxes == camera_ax:
+				camera_name = cam_name
+				break
+		if camera_name is None:
 			return
 		if event.xdata is None or event.ydata is None:
 			return
-		if not current_points:
+		camera_ax = main_axes_map[camera_name]
+		points = current_points_by_cam.get(camera_name, [])
+		if not points:
 			return
 
 		click_px = np.array([event.x, event.y], dtype=float)
 		best = None
 		best_dist = float("inf")
-		for p in current_points:
-			pt_px = np.array(ax.transData.transform((p["x"], p["y"])), dtype=float)
+		for p in points:
+			pt_px = np.array(camera_ax.transData.transform((p["x"], p["y"])), dtype=float)
 			d = float(np.linalg.norm(click_px - pt_px))
 			if d < best_dist:
 				best_dist = d
@@ -3632,13 +3847,13 @@ def make_postanalysis_overlay_popout(
 		if best is None or best_dist > 12.0:
 			return
 
-		if selected_text is not None:
+		if selected_text_by_cam.get(camera_name) is not None:
 			try:
-				selected_text.remove()
+				selected_text_by_cam[camera_name].remove()
 			except Exception:
 				pass
 
-		selected_text = ax.text(
+		selected_text_by_cam[camera_name] = camera_ax.text(
 			best["x"] + 6,
 			best["y"] + 6,
 			f"{best['kind']} | {best['bodypart']}\n(x={best['x']:.1f}, y={best['y']:.1f})",
@@ -3650,14 +3865,19 @@ def make_postanalysis_overlay_popout(
 
 	def _on_scroll(event: Any) -> None:
 		"""Zoom in/out around cursor using mouse wheel."""
-		nonlocal view_limits
-		if event.inaxes != ax:
+		camera_name = None
+		for cam_name, camera_ax in main_axes_map.items():
+			if event.inaxes == camera_ax:
+				camera_name = cam_name
+				break
+		if camera_name is None:
 			return
 		if event.xdata is None or event.ydata is None:
 			return
+		camera_ax = main_axes_map[camera_name]
 
-		xlim = ax.get_xlim()
-		ylim = ax.get_ylim()
+		xlim = camera_ax.get_xlim()
+		ylim = camera_ax.get_ylim()
 		xdata = float(event.xdata)
 		ydata = float(event.ydata)
 
@@ -3677,10 +3897,10 @@ def make_postanalysis_overlay_popout(
 		rel_x = (xdata - xlim[0]) / (xlim[1] - xlim[0]) if (xlim[1] - xlim[0]) != 0 else 0.5
 		rel_y = (ydata - ylim[0]) / (ylim[1] - ylim[0]) if (ylim[1] - ylim[0]) != 0 else 0.5
 
-		ax.set_xlim([xdata - new_w * rel_x, xdata + new_w * (1 - rel_x)])
-		ax.set_ylim([ydata - new_h * rel_y, ydata + new_h * (1 - rel_y)])
-		view_limits["xlim"] = tuple(float(v) for v in ax.get_xlim())
-		view_limits["ylim"] = tuple(float(v) for v in ax.get_ylim())
+		camera_ax.set_xlim([xdata - new_w * rel_x, xdata + new_w * (1 - rel_x)])
+		camera_ax.set_ylim([ydata - new_h * rel_y, ydata + new_h * (1 - rel_y)])
+		view_limits_by_cam[camera_name]["xlim"] = tuple(float(v) for v in camera_ax.get_xlim())
+		view_limits_by_cam[camera_name]["ylim"] = tuple(float(v) for v in camera_ax.get_ylim())
 		fig.canvas.draw_idle()
 
 	def _on_prev(_event: Any) -> None:
@@ -3713,7 +3933,53 @@ def make_postanalysis_overlay_popout(
 		_activate_selection("displacement")
 
 	def _on_select_dino_frames(_event: Any) -> None:
-		_activate_selection("dino", source_camera=_cam_norm(radio_cam.value_selected))
+		_activate_selection("dino", source_camera=selection_source_camera)
+
+	def _on_switch_bird(_event: Any) -> None:
+		nonlocal current_bird
+		nonlocal current_trial_num
+		nonlocal processing_root
+		bird_choice = _choose_bird_dialog()
+		if bird_choice is None:
+			return
+		base_dir = _ensure_processing_root()
+		if base_dir is None:
+			return
+		trial_choice = _choose_trial_dialog(bird_choice)
+		if trial_choice is None:
+			return
+		trial_dir = Path(base_dir) / bird_choice / f"Trial{int(trial_choice)}"
+		if not trial_dir.exists():
+			print(f"Selected trial path does not exist: {trial_dir}")
+			return
+		_reload_trial_into_view(trial_dir)
+		processing_root = Path(base_dir)
+		current_bird = str(bird_choice)
+		current_trial_num = int(trial_choice)
+		print(f"Loaded: {current_bird} Trial{current_trial_num}")
+
+	def _on_switch_trial(_event: Any) -> None:
+		nonlocal current_trial_num
+		nonlocal current_bird
+		base_dir = _ensure_processing_root()
+		if base_dir is None:
+			return
+		bird_name = current_bird
+		if bird_name is None:
+			bird_name = _choose_bird_dialog()
+			if bird_name is None:
+				return
+		trial_choice = _choose_trial_dialog(str(bird_name))
+		if trial_choice is None:
+			return
+		trial_dir = Path(base_dir) / str(bird_name) / f"Trial{int(trial_choice)}"
+		if not trial_dir.exists():
+			print(f"Selected trial path does not exist: {trial_dir}")
+			return
+		_reload_trial_into_view(trial_dir)
+		current_bird = str(bird_name)
+		current_trial_num = int(trial_choice)
+		print(f"Loaded: {current_bird} Trial{current_trial_num}")
 
 	def _on_open_correction_tab(_event: Any) -> None:
 		try:
@@ -3770,9 +4036,10 @@ def make_postanalysis_overlay_popout(
 			except Exception as exc:
 				print(f"Could not open Correction Tab automatically: {exc}")
 
-	radio_cam.on_clicked(redraw)
 	check.on_clicked(redraw)
 	btn_correction_tab.on_clicked(_on_open_correction_tab)
+	btn_switch_bird.on_clicked(_on_switch_bird)
+	btn_switch_trial.on_clicked(_on_switch_trial)
 	btn_select_random.on_clicked(_on_select_random_frames)
 	btn_select_displacement.on_clicked(_on_select_displacement_frames)
 	btn_select_dino.on_clicked(_on_select_dino_frames)
