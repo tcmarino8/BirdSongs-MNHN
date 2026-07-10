@@ -33,3 +33,22 @@ add this to readme, maybe that requires a rule so you dont forget
 
 7. Prompt 6: I will work on the visualization myself as time goes, but now lets focus on running the training of all these models. Run it through a loop leveraging dlcs.create_and_train. Please inform me if there is a way to parallelize/optimize this training process. Currently it takes a significant amount of time.
 
+8. Prompt 7: There was a running error on all DB_T16. Lets solve that and train the models.
+
+
+9. Prompt 8: let us test the model performance now. We always want to test it on the same bird, and we want to test it within trial and across trial. this means we should use #sym:predict_trial_from_jpg_stacks  where trial_dir is the Test dir for each file and using the config path of each trained model (slection_of x Number_of frames). This saves them all as csvs but perhaps we should not do this and rather just immediately compute the metrics for scoring. Since they are already returned in XMA lab format, we can compare the true Test data vs the predictions simply. We should store one score results df per trial encompassing both within and cross trial predictions. Then I want to save a entire score results.
+
+Score metrics should be drawn from test_updated_experiments.ipynb cell 21 where we check RMSE, percent points within 5 pixels, and percent of frames with all points within 5 pixels, and average number +std of predictions across all frames that are within 5 pixels
+
+10. Prompt 9: make this a cell that I run in my notebook.
+
+11. Prompt 10: there is an error in the #sym:predict_trial_from_jpg_stacks  logic currently as it is pulling more frames than we have. It would be more wise to create a Predictions.py module that reformulates this and any dependent functions to fit it for our current experimentation. Then we can easily run our program for all birds in the notebook without this error.
+
+12. Prompt 11: there is an issue with the predictions not allowing more than once the video to be analyzed
+
+we are getting this error:Analyzing videos with [C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCutExperiments\Data\DB_T17\dino_train\nframes_100\ModelsToTune\Canari-FineTuner-2026-07-09\dlc-models-pytorch\iteration-0\CanariJul9-trainset95shuffle1\train\snapshot-125.pt]
+Using scorer: DLC_Resnet50_CanariJul9shuffle1_snapshot_125
+Video [C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCutExperiments\Data\DB_T15\test\Cam1.avi] already analyzed at [C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCutExperiments\Data\DB_T15\test\Cam1DLC_Resnet50_CanariJul9shuffle1_snapshot_125_full.pickle]!
+Video [C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCutExperiments\Data\DB_T15\test\Cam2.avi] already analyzed at [C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCutExperiments\Data\DB_T15\test\Cam2DLC_Resnet50_CanariJul9shuffle1_snapshot_125_full.pickle]!
+No .h5 files were created during video analysis. Please check your code and ensure that the video inference and output generation are correct.
+

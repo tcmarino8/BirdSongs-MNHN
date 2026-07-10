@@ -516,6 +516,84 @@ def get_available_scorers(config_path: Path | str) -> list[str]:
     return sorted(scorer_set)
 
 
+def get_available_bodyparts_from_data(config_path: Path | str) -> list[str]:
+    """Discover ordered bodyparts from labeled-data H5 files in a DLC project.
+
+    Reads ``CollectedData_*.h5`` files and extracts unique values from
+    MultiIndex column level 1 (the DLC bodypart level), preserving first-seen
+    order across files.
+    """
+    project_dir = get_project_dir_from_config(config_path)
+    bodyparts: list[str] = []
+    seen: set[str] = set()
+
+    for h5_path in sorted(project_dir.glob("labeled-data/*/CollectedData_*.h5")):
+        try:
+            df = pd.read_hdf(as_posix_str(h5_path))
+        except Exception:
+            continue
+
+        if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels < 2:
+            continue
+
+        for value in df.columns.get_level_values(1):
+            name = str(value).strip()
+            if not name or name.lower() == "nan":
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            bodyparts.append(name)
+
+    return bodyparts
+
+
+def ensure_config_bodyparts_match_data(config_path: Path | str) -> list[str] | None:
+    """Synchronise ``config.yaml`` bodyparts with bodyparts in labeled-data H5 files.
+
+    When bodyparts drift between config and labeled-data (for example naming
+    differences in one trial), DLC dataset creation/training can fail.
+    """
+    config_path = Path(config_path)
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+
+    available = get_available_bodyparts_from_data(config_path)
+    if not available:
+        logger.warning("No bodyparts found in labeled-data for %s", config_path)
+        return None
+
+    current = [str(v) for v in cfg.get("bodyparts", [])]
+    if current == available:
+        return current
+
+    cfg["bodyparts"] = list(available)
+
+    skeleton = cfg.get("skeleton", [])
+    if isinstance(skeleton, list):
+        valid_bodyparts = set(available)
+        filtered_skeleton: list[list[str]] = []
+        for edge in skeleton:
+            if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+                continue
+            a = str(edge[0])
+            b = str(edge[1])
+            if a in valid_bodyparts and b in valid_bodyparts:
+                filtered_skeleton.append([a, b])
+        cfg["skeleton"] = filtered_skeleton
+
+    with open(config_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
+
+    logger.warning(
+        "Updated bodyparts in %s from %d to %d entries based on labeled-data",
+        config_path,
+        len(current),
+        len(available),
+    )
+    return available
+
+
 def ensure_config_scorer_matches_data(config_path: Path | str) -> str | None:
     """Synchronise the ``scorer`` field in ``config.yaml`` with labeled-data.
 
@@ -933,6 +1011,7 @@ def create_and_train(
     import deeplabcut  # noqa: PLC0415
 
     config_path = Path(config_path)
+    ensure_config_bodyparts_match_data(config_path)
     ensure_config_scorer_matches_data(config_path)
     deeplabcut.create_training_dataset(as_posix_str(config_path))  
     if post_dataset_callback is not None:
