@@ -39,6 +39,22 @@ def _load_data_converter_module() -> Any:
         raise RuntimeError(f"Could not load converter module spec for: {module_path}")
 
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_post_analysis_module() -> Any:
+    module_path = _code_testing_dir() / "PostAnalysis_review.py"
+    if not module_path.exists():
+        raise FileNotFoundError(f"Could not find post-analysis module: {module_path}")
+
+    spec = importlib.util.spec_from_file_location("post_analysis", str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load post-analysis module spec for: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -208,9 +224,151 @@ def score_prediction_vs_truth(
     return error_df, summary
 
 
+def _blobdetect_csv_path(pred_csv: Path) -> Path:
+    return pred_csv.with_name(f"{pred_csv.stem}-blobDetect.csv")
+
+
+def _apply_blobdetect_correction_to_prediction(
+    *,
+    trial_dir: Path,
+    pred_csv: Path,
+    n_frames_to_correct: int,
+    max_match_dist: float = 15.0,
+    verbose: bool = False,
+) -> Path:
+    _ensure_code_testing_on_path()
+    post_analysis = _load_post_analysis_module()
+
+    pred_df = pd.read_csv(pred_csv)
+    n_use = int(min(len(pred_df), int(n_frames_to_correct)))
+    if n_use <= 0:
+        raise ValueError(f"No frames available to correct in {pred_csv}")
+
+    corrected_df = post_analysis.correct_frames_from_df_fast(
+        trial_dir=Path(trial_dir),
+        frames_to_correct=list(range(n_use)),
+        pred_df=pred_df,
+        max_match_dist=float(max_match_dist),
+        verbose=bool(verbose),
+    )
+
+    blob_csv = _blobdetect_csv_path(pred_csv)
+    corrected_df.to_csv(blob_csv, na_rep="NaN", index=False)
+    return blob_csv
+
+
+def _score_variant(
+    *,
+    pred_csv: Path,
+    truth_csv: Path,
+    threshold_px: float,
+    prediction_variant: str,
+    bird: str,
+    train_trial: int,
+    eval_trial: int,
+    pair_label: str,
+    pair_type: str,
+    method: str,
+    nframes: int,
+    model_label: str,
+    config_path: Path,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    err_df, summary = score_prediction_vs_truth(
+        pred_csv=pred_csv,
+        truth_csv=truth_csv,
+        threshold_px=float(threshold_px),
+    )
+
+    err_df = err_df.copy()
+    err_df["bird"] = bird
+    err_df["train_trial"] = int(train_trial)
+    err_df["eval_trial"] = int(eval_trial)
+    err_df["pair"] = pair_label
+    err_df["pair_type"] = pair_type
+    err_df["method"] = method
+    err_df["nframes"] = int(nframes)
+    err_df["model"] = model_label
+    err_df["prediction_variant"] = prediction_variant
+
+    score_row = {
+        "bird": bird,
+        "train_trial": int(train_trial),
+        "eval_trial": int(eval_trial),
+        "pair": pair_label,
+        "pair_type": pair_type,
+        "method": method,
+        "nframes": int(nframes),
+        "model": model_label,
+        "prediction_variant": prediction_variant,
+        **summary,
+        "config_path": str(config_path),
+        "pred_csv": str(pred_csv),
+        "status": "ok",
+        "error": "",
+    }
+    return score_row, err_df
+
+
+def _build_blobdetect_comparison(scores_df: pd.DataFrame) -> pd.DataFrame:
+    if scores_df.empty:
+        return pd.DataFrame()
+
+    key_cols = [
+        "bird",
+        "train_trial",
+        "eval_trial",
+        "pair",
+        "pair_type",
+        "method",
+        "nframes",
+        "model",
+        "threshold_px",
+    ]
+    metric_cols = [
+        "rmse_px",
+        "percent_points_within_threshold",
+        "percent_frames_all_points_within_threshold",
+        "mean_n_predictions_within_threshold_per_frame",
+        "std_n_predictions_within_threshold_per_frame",
+        "n_points_compared",
+        "n_frames_compared",
+    ]
+
+    ok_df = scores_df[(scores_df["status"] == "ok") & (scores_df["prediction_variant"].isin(["baseline", "blobDetect"]))].copy()
+    if ok_df.empty:
+        return pd.DataFrame()
+
+    base_df = ok_df[ok_df["prediction_variant"] == "baseline"][key_cols + metric_cols].copy()
+    blob_df = ok_df[ok_df["prediction_variant"] == "blobDetect"][key_cols + metric_cols].copy()
+
+    base_df = base_df.rename(columns={col: f"{col}_baseline" for col in metric_cols})
+    blob_df = blob_df.rename(columns={col: f"{col}_blobDetect" for col in metric_cols})
+
+    cmp_df = base_df.merge(blob_df, on=key_cols, how="outer")
+
+    if cmp_df.empty:
+        return cmp_df
+
+    cmp_df["delta_rmse_px_blob_minus_base"] = cmp_df["rmse_px_blobDetect"] - cmp_df["rmse_px_baseline"]
+    cmp_df["delta_percent_points_within_threshold_blob_minus_base"] = (
+        cmp_df["percent_points_within_threshold_blobDetect"] - cmp_df["percent_points_within_threshold_baseline"]
+    )
+    cmp_df["delta_percent_frames_all_points_within_threshold_blob_minus_base"] = (
+        cmp_df["percent_frames_all_points_within_threshold_blobDetect"]
+        - cmp_df["percent_frames_all_points_within_threshold_baseline"]
+    )
+    cmp_df["delta_mean_n_predictions_within_threshold_per_frame_blob_minus_base"] = (
+        cmp_df["mean_n_predictions_within_threshold_per_frame_blobDetect"]
+        - cmp_df["mean_n_predictions_within_threshold_per_frame_baseline"]
+    )
+
+    return cmp_df
+
+
 def predict_trial_from_jpg_stacks_safe(
     trial_dir: str | Path,
     config_path: str | Path,
+    outdir: str | Path,
     *,
     fps: int = 500,
     batchsize: int = 16,
@@ -219,7 +377,9 @@ def predict_trial_from_jpg_stacks_safe(
     frame_range: tuple[int, int] | list[int] | None = None,
     force_rebuild_avi: bool = True,
     cleanup_dlc_csv: bool = True,
+    
 ) -> dict[str, Any]:
+    # print("pre anything check")
     _ensure_code_testing_on_path()
 
     import deeplabcut as dlc  # noqa: WPS433
@@ -241,7 +401,7 @@ def predict_trial_from_jpg_stacks_safe(
     cam1_imgs = _list_images_sorted(cam1_dir)
     cam2_imgs = _list_images_sorted(cam2_dir)
     start_frame, end_frame, n_effective = _resolve_frame_window(len(cam1_imgs), len(cam2_imgs), frame_range)
-
+    # print("pre vid check")
     _ensure_avi_from_jpg_stack(
         cam1_dir,
         cam1_avi,
@@ -258,26 +418,32 @@ def predict_trial_from_jpg_stacks_safe(
         end_frame=int(end_frame),
         force_rebuild=bool(force_rebuild_avi),
     )
-    
+    print("pre cleanup")
+    print(cleanup_dlc_csv)
+    print(f"Trial: {trial_dir}")
     if cleanup_dlc_csv:
         # Clear prior DLC analysis artifacts so analyze_videos does not short-circuit
         # with "already analyzed" when rerunning the same trial repeatedly.
-        for pat in ("Cam1DLC*", "Cam2DLC*"):
+        for pat in ("*\Cam1DLC*", "*\Cam2DLC*", "*\*Predicted2DPoints*"):
             for old_artifact in trial_dir.glob(pat):
+                # print(old_artifact)
                 if old_artifact.is_file():
+                    # print(f"Removing and repredicting file: {old_artifact}")
                     old_artifact.unlink(missing_ok=True)
+       
    
-    
+    print("pre analyze")
+    print(f"Analyzing Vid:", cam1_avi)
     dlc.analyze_videos(
         str(config_path),
         [str(cam1_avi), str(cam2_avi)],
         save_as_csv=bool(save_as_csv),
-        destfolder=str(trial_dir),
+        destfolder=str(outdir),
         batchsize=int(batchsize),
     )
-
-    cam1_dlc_csv = _latest_csv(trial_dir, "Cam1DLC*.csv")
-    cam2_dlc_csv = _latest_csv(trial_dir, "Cam2DLC*.csv")
+    print("post analyze")
+    cam1_dlc_csv = _latest_csv(outdir, "Cam1DLC*.csv")
+    cam2_dlc_csv = _latest_csv(outdir, "Cam2DLC*.csv")
 
     pred_df = xt.dlc_to_xma(str(cam1_dlc_csv), str(cam2_dlc_csv), str(xma_base_name), str(trial_dir))
     pred_df = pred_df.iloc[: int(n_effective)].copy()
@@ -287,7 +453,7 @@ def predict_trial_from_jpg_stacks_safe(
         pad_df = pd.DataFrame(np.nan, index=range(pad_rows), columns=pred_df.columns)
         pred_df = pd.concat([pred_df, pad_df], ignore_index=True)
 
-    pred_csv = trial_dir / f"{xma_base_name}-Predicted2DPoints.csv"
+    pred_csv = outdir / f"{xma_base_name}-Predicted2DPoints.csv"
     pred_df.to_csv(pred_csv, na_rep="NaN", index=False)
 
     return {
@@ -378,6 +544,7 @@ def evaluate_within_across_for_bird(
     build_manifest_path = Path(build_manifest_path)
 
     model_df = _load_models_from_build_manifest(build_manifest_path, bird)
+    # print("in function evaluating models")
     if model_df.empty:
         raise RuntimeError(f"No models found for bird={bird} in {build_manifest_path}")
 
@@ -390,10 +557,12 @@ def evaluate_within_across_for_bird(
 
     run_idx = 0
     for _, model_row in model_df.sort_values(["trial_num", "method", "nframes"]).iterrows():
+        # print('inside loop')
         train_trial = int(model_row["trial_num"])
         method = str(model_row["method"])
         nframes = int(model_row["nframes"])
         config_path = Path(str(model_row["config_path"]))
+        # print("config path", config_path)
 
         if not config_path.exists():
             score_rows.append(
@@ -428,9 +597,11 @@ def evaluate_within_across_for_bird(
             pair_label = f"TrainT{train_trial}_EvalT{eval_trial}"
             model_label = f"{method}_n{nframes}_TrainT{train_trial}"
             xma_name = f"{bird}_{model_label}_EvalT{eval_trial}"
-            print(test_dir)
+            test_dir_out = Path(test_dir) / model_label
+            test_dir_out.mkdir(parents=True, exist_ok=True)
+            # print(test_dir_out)
             try:
-                
+                # print("inside trial")
                 pred_result = predict_trial_from_jpg_stacks_safe(
                     trial_dir=test_dir,
                     config_path=config_path,
@@ -441,6 +612,7 @@ def evaluate_within_across_for_bird(
                     frame_range=None,
                     force_rebuild_avi=bool(force_rebuild_avi),
                     cleanup_dlc_csv=True,
+                    outdir = test_dir_out,
                 )
 
                 pred_csv = Path(pred_result["pred_csv"])
@@ -480,6 +652,7 @@ def evaluate_within_across_for_bird(
                     pred_csv.unlink(missing_ok=True)
 
             except Exception as exc:
+                print(f"Error: {exc}")
                 score_rows.append(
                     {
                         "bird": bird,
@@ -578,4 +751,316 @@ def evaluate_within_across_all_birds(
     return {
         "results_by_bird": all_results,
         "combined_scores_df": combined_scores,
+    }
+
+
+def evaluate_within_across_blobdetect_for_bird(
+    *,
+    bird: str,
+    data_root: str | Path,
+    build_manifest_path: str | Path,
+    threshold_px: float = 5.0,
+    fps: int = 500,
+    batchsize: int = 16,
+    delete_intermediate_predictions: bool = False,
+    force_rebuild_avi: bool = True,
+    blob_max_match_dist: float = 15.0,
+    blob_verbose: bool = False,
+    repredict: bool = False
+) -> dict[str, Any]:
+    data_root = Path(data_root)
+    build_manifest_path = Path(build_manifest_path)
+
+    model_df = _load_models_from_build_manifest(build_manifest_path, bird)
+    if model_df.empty:
+        raise RuntimeError(f"No models found for bird={bird} in {build_manifest_path}")
+
+    eval_trials = _load_eval_trials(data_root, bird)
+    if len(eval_trials) == 0:
+        raise RuntimeError(f"No eval test folders found for bird={bird} under {data_root}")
+
+    score_rows: list[dict[str, Any]] = []
+    error_rows: list[pd.DataFrame] = []
+
+    for _, model_row in model_df.sort_values(["trial_num", "method", "nframes"]).iterrows():
+        train_trial = int(model_row["trial_num"])
+        method = str(model_row["method"])
+        nframes = int(model_row["nframes"])
+        config_path = Path(str(model_row["config_path"]))
+
+        if not config_path.exists():
+            score_rows.append(
+                {
+                    "bird": bird,
+                    "train_trial": int(train_trial),
+                    "eval_trial": np.nan,
+                    "pair": "",
+                    "pair_type": "",
+                    "method": method,
+                    "nframes": int(nframes),
+                    "model": f"{method}_n{nframes}_TrainT{train_trial}",
+                    "prediction_variant": "baseline",
+                    "rmse_px": np.nan,
+                    "threshold_px": float(threshold_px),
+                    "percent_points_within_threshold": np.nan,
+                    "percent_frames_all_points_within_threshold": np.nan,
+                    "mean_n_predictions_within_threshold_per_frame": np.nan,
+                    "std_n_predictions_within_threshold_per_frame": np.nan,
+                    "n_points_compared": 0,
+                    "n_frames_compared": 0,
+                    "config_path": str(config_path),
+                    "pred_csv": "",
+                    "status": "error",
+                    "error": f"Config not found: {config_path}",
+                }
+            )
+            continue
+
+        for eval_trial, test_dir in eval_trials:
+            pair_type = "within" if train_trial == eval_trial else "across"
+            pair_label = f"TrainT{train_trial}_EvalT{eval_trial}"
+            model_label = f"{method}_n{nframes}_TrainT{train_trial}"
+            xma_name = f"{bird}_{model_label}_EvalT{eval_trial}"
+            test_dir_out = Path(test_dir) / model_label
+            test_dir_out.mkdir(parents=True, exist_ok=True)
+
+            truth_csv = test_dir / "LabeledBodyPartsCoordinates.csv"
+            if not truth_csv.exists():
+                score_rows.append(
+                    {
+                        "bird": bird,
+                        "train_trial": int(train_trial),
+                        "eval_trial": int(eval_trial),
+                        "pair": pair_label,
+                        "pair_type": pair_type,
+                        "method": method,
+                        "nframes": int(nframes),
+                        "model": model_label,
+                        "prediction_variant": "baseline",
+                        "rmse_px": np.nan,
+                        "threshold_px": float(threshold_px),
+                        "percent_points_within_threshold": np.nan,
+                        "percent_frames_all_points_within_threshold": np.nan,
+                        "mean_n_predictions_within_threshold_per_frame": np.nan,
+                        "std_n_predictions_within_threshold_per_frame": np.nan,
+                        "n_points_compared": 0,
+                        "n_frames_compared": 0,
+                        "config_path": str(config_path),
+                        "pred_csv": "",
+                        "status": "error",
+                        "error": f"Truth CSV not found: {truth_csv}",
+                    }
+                )
+                continue
+
+            try:
+                pred_result = predict_trial_from_jpg_stacks_safe(
+                    trial_dir=test_dir,
+                    config_path=config_path,
+                    fps=int(fps),
+                    batchsize=int(batchsize),
+                    save_as_csv=True,
+                    xma_base_name=xma_name,
+                    frame_range=None,
+                    force_rebuild_avi=bool(force_rebuild_avi),
+                    cleanup_dlc_csv=repredict,
+                    outdir=test_dir_out,
+                )
+
+                pred_csv = Path(pred_result["pred_csv"])
+                n_effective_frames = int(pred_result.get("n_effective_frames", 0))
+
+                baseline_row, baseline_err_df = _score_variant(
+                    pred_csv=pred_csv,
+                    truth_csv=truth_csv,
+                    threshold_px=float(threshold_px),
+                    prediction_variant="baseline",
+                    bird=bird,
+                    train_trial=int(train_trial),
+                    eval_trial=int(eval_trial),
+                    pair_label=pair_label,
+                    pair_type=pair_type,
+                    method=method,
+                    nframes=int(nframes),
+                    model_label=model_label,
+                    config_path=config_path,
+                )
+                score_rows.append(baseline_row)
+                error_rows.append(baseline_err_df)
+
+                blob_csv = _apply_blobdetect_correction_to_prediction(
+                    trial_dir=Path(test_dir),
+                    pred_csv=pred_csv,
+                    n_frames_to_correct=int(n_effective_frames),
+                    max_match_dist=float(blob_max_match_dist),
+                    verbose=bool(blob_verbose),
+                )
+
+                blob_row, blob_err_df = _score_variant(
+                    pred_csv=blob_csv,
+                    truth_csv=truth_csv,
+                    threshold_px=float(threshold_px),
+                    prediction_variant="blobDetect",
+                    bird=bird,
+                    train_trial=int(train_trial),
+                    eval_trial=int(eval_trial),
+                    pair_label=pair_label,
+                    pair_type=pair_type,
+                    method=method,
+                    nframes=int(nframes),
+                    model_label=model_label,
+                    config_path=config_path,
+                )
+                score_rows.append(blob_row)
+                error_rows.append(blob_err_df)
+
+                if delete_intermediate_predictions:
+                    pred_csv.unlink(missing_ok=True)
+                    blob_csv.unlink(missing_ok=True)
+
+            except Exception as exc:
+                print(f"Error: {exc}")
+                score_rows.append(
+                    {
+                        "bird": bird,
+                        "train_trial": int(train_trial),
+                        "eval_trial": int(eval_trial),
+                        "pair": pair_label,
+                        "pair_type": pair_type,
+                        "method": method,
+                        "nframes": int(nframes),
+                        "model": model_label,
+                        "prediction_variant": "baseline",
+                        "rmse_px": np.nan,
+                        "threshold_px": float(threshold_px),
+                        "percent_points_within_threshold": np.nan,
+                        "percent_frames_all_points_within_threshold": np.nan,
+                        "mean_n_predictions_within_threshold_per_frame": np.nan,
+                        "std_n_predictions_within_threshold_per_frame": np.nan,
+                        "n_points_compared": 0,
+                        "n_frames_compared": 0,
+                        "config_path": str(config_path),
+                        "pred_csv": "",
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+                score_rows.append(
+                    {
+                        "bird": bird,
+                        "train_trial": int(train_trial),
+                        "eval_trial": int(eval_trial),
+                        "pair": pair_label,
+                        "pair_type": pair_type,
+                        "method": method,
+                        "nframes": int(nframes),
+                        "model": model_label,
+                        "prediction_variant": "blobDetect",
+                        "rmse_px": np.nan,
+                        "threshold_px": float(threshold_px),
+                        "percent_points_within_threshold": np.nan,
+                        "percent_frames_all_points_within_threshold": np.nan,
+                        "mean_n_predictions_within_threshold_per_frame": np.nan,
+                        "std_n_predictions_within_threshold_per_frame": np.nan,
+                        "n_points_compared": 0,
+                        "n_frames_compared": 0,
+                        "config_path": str(config_path),
+                        "pred_csv": "",
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+
+    scores_df = pd.DataFrame(score_rows)
+    errors_df = pd.concat(error_rows, ignore_index=True) if error_rows else pd.DataFrame()
+    comparison_df = _build_blobdetect_comparison(scores_df)
+
+    stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    out_root = data_root / "evaluation_results"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    full_scores_csv = out_root / f"{bird}_within_across_scores_with_blobDetect_{stamp}.csv"
+    scores_df.to_csv(full_scores_csv, index=False)
+
+    full_comparison_csv = out_root / f"{bird}_within_across_blobDetect_comparison_{stamp}.csv"
+    comparison_df.to_csv(full_comparison_csv, index=False)
+
+    full_errors_csv = None
+    if not errors_df.empty:
+        full_errors_csv = out_root / f"{bird}_within_across_point_errors_with_blobDetect_{stamp}.csv"
+        errors_df.to_csv(full_errors_csv, index=False)
+
+    per_eval_paths: list[Path] = []
+    if not scores_df.empty and "eval_trial" in scores_df.columns:
+        for eval_trial, sub_df in scores_df.groupby("eval_trial", dropna=False):
+            if pd.isna(eval_trial):
+                continue
+            out_csv = out_root / f"{bird}_EvalT{int(eval_trial)}_within_across_scores_with_blobDetect_{stamp}.csv"
+            sub_df.sort_values(["prediction_variant", "pair_type", "train_trial", "method", "nframes"]).to_csv(
+                out_csv,
+                index=False,
+            )
+            per_eval_paths.append(out_csv)
+
+    return {
+        "bird": bird,
+        "scores_df": scores_df,
+        "errors_df": errors_df,
+        "comparison_df": comparison_df,
+        "full_scores_csv": full_scores_csv,
+        "full_comparison_csv": full_comparison_csv,
+        "full_errors_csv": full_errors_csv,
+        "per_eval_paths": per_eval_paths,
+    }
+
+
+def evaluate_within_across_blobdetect_all_birds(
+    *,
+    data_root: str | Path,
+    build_manifest_path: str | Path,
+    birds: list[str] | None = None,
+    threshold_px: float = 5.0,
+    fps: int = 500,
+    batchsize: int = 16,
+    delete_intermediate_predictions: bool = False,
+    force_rebuild_avi: bool = True,
+    blob_max_match_dist: float = 15.0,
+    blob_verbose: bool = False,
+    repredict_all: bool = False
+) -> dict[str, Any]:
+    build_manifest_path = Path(build_manifest_path)
+    build_manifest_df = pd.read_csv(build_manifest_path)
+
+    if birds is None:
+        birds = sorted(build_manifest_df["bird"].dropna().astype(str).unique().tolist())
+
+    all_results: dict[str, Any] = {}
+    all_scores: list[pd.DataFrame] = []
+    all_comparisons: list[pd.DataFrame] = []
+
+    for bird in birds:
+        bird_result = evaluate_within_across_blobdetect_for_bird(
+            bird=str(bird),
+            data_root=data_root,
+            build_manifest_path=build_manifest_path,
+            threshold_px=float(threshold_px),
+            fps=int(fps),
+            batchsize=int(batchsize),
+            delete_intermediate_predictions=bool(delete_intermediate_predictions),
+            force_rebuild_avi=bool(force_rebuild_avi),
+            blob_max_match_dist=float(blob_max_match_dist),
+            blob_verbose=bool(blob_verbose),
+            repredict = bool(repredict_all)
+        )
+        all_results[str(bird)] = bird_result
+        all_scores.append(bird_result["scores_df"])
+        all_comparisons.append(bird_result["comparison_df"])
+
+    combined_scores = pd.concat(all_scores, ignore_index=True) if all_scores else pd.DataFrame()
+    combined_comparison = pd.concat(all_comparisons, ignore_index=True) if all_comparisons else pd.DataFrame()
+
+    return {
+        "results_by_bird": all_results,
+        "combined_scores_df": combined_scores,
+        "combined_comparison_df": combined_comparison,
     }

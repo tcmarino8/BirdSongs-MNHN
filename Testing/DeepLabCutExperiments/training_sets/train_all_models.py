@@ -12,8 +12,31 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
-
+import numpy
 import pandas as pd
+
+
+def _install_numpy_pickle_compat_aliases() -> None:
+    """Install NumPy module aliases used by pickles across NumPy versions.
+
+    Some serialized artifacts reference internal module paths that differ
+    between NumPy major versions (for example ``numpy.core.numeric`` vs
+    ``numpy._core.numeric``). Mapping both names avoids import failures when
+    those artifacts are loaded by downstream libraries.
+    """
+    try:
+        import numpy.core as np_core  # noqa: PLC0415
+        import numpy.core.numeric as np_core_numeric  # noqa: PLC0415
+    except Exception:
+        return
+
+    sys.modules.setdefault("numpy.core", np_core)
+    sys.modules.setdefault("numpy.core.numeric", np_core_numeric)
+    sys.modules.setdefault("numpy._core", np_core)
+    sys.modules.setdefault("numpy._core.numeric", np_core_numeric)
+
+
+_install_numpy_pickle_compat_aliases()
 
 
 def _ensure_codetesting_on_syspath() -> Path:
@@ -206,8 +229,8 @@ def _train_one_job(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
 
     job_tag = _job_label(job)
-    print(f"\n[train-job {job_index}/{total_jobs}] {job_tag}")
-    print(f"[train-job config] {job.config_path}")
+    print(f"\n[train-job {job_index}/{total_jobs}] {job_tag}", flush=True)
+    print(f"[train-job config] {job.config_path}", flush=True)
     if assigned_gpu is not None:
         print(f"[train-job gpu] CUDA_VISIBLE_DEVICES={assigned_gpu}")
 

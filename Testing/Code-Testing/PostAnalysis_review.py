@@ -17,23 +17,82 @@ from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider, TextB
 import numpy as np
 import pandas as pd
 from PIL import Image
-
+from scipy.ndimage import gaussian_filter
+from skimage.feature import blob_dog
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+import deeplabcut as dlc
+import xrommtools_copy as xt
+import DLCsupport as dlcs
+import cv2 
+import torch
+from torchvision import transforms
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
 
-# Default snapshots associated with each bird for fine-tuning.
-BIRD_SNAPSHOT_PATHS: dict[str, str] = {
-	"DavidBowie": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCut2\DavidBowie\Model519\n400_T17\Canari-Tyler-2026-05-22\dlc-models-pytorch\iteration-0\CanariMay22-trainset95shuffle1\train\snapshot-100.pt",
-	"Tulio": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\ProcessingData\Tulio\Trial10\active_updates\dino\Model\Tulio-Tyler-2026-06-30\dlc-models-pytorch\iteration-0\TulioJun30-trainset95shuffle1\train\snapshot-100.pt",
+
+# Ideal folder structure:
+
+# BirdProject/
+# │
+# ├── Code/
+# │   ├── dlcsupport.py
+# │   ├── PostAnalysis_review.py
+# │   └── ...
+# │
+# ├── Model_Zoo/
+# │   ├── DB_15_17_Trained/
+# │   ├── Tulio_10_05_Trained/
+# │   ├── Miguel_06_Trained/
+# │   └── ...
+# │
+# └── Data/
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+MODEL_ZOO = PROJECT_ROOT / "Model_Zoo"
+
+MODEL_DIRS = {
+    "DavidBowie": MODEL_ZOO / "DB_15_17_Trained",
+    "Tulio": MODEL_ZOO / "Tulio_10_05_Trained",
+    "Miguel": MODEL_ZOO / "Miguel_06_Trained",
+    "Endive": MODEL_ZOO / "Endive_42_Trained",
 }
 
+# print(MODEL_DIRS)
 # Default inference configs associated with each bird.
 # Keep this map editable as birds/models change.
-BIRD_CONFIG_PATHS: dict[str, str] = {
-	"DavidBowie": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\DeepLabCut2\DavidBowie\Model519\n400_T17\Canari-Tyler-2026-05-22\config.yaml",
-	"Tulio": r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\ProcessingData\Tulio\Trial10\active_updates\dino\Model\Tulio-Tyler-2026-06-30\config.yaml",
+BIRD_CONFIG_PATHS = {
+    "DavidBowie": MODEL_DIRS["DavidBowie"] / "Canari-FineTuner-2026-07-19" / "config.yaml",
+    "Tulio": MODEL_DIRS["Tulio"] / "Canari-FineTuner-2026-07-19" / "config.yaml",
+    "Miguel": MODEL_DIRS["Miguel"] / "Canari-FineTuner-2026-07-17" / "config.yaml",
+    "Endive": MODEL_DIRS["Endive"] / "Canari-FineTuner-2026-07-17" / "config.yaml",
 }
+
+
+ # Default snapshots associated with each bird for fine-tuning.
+BIRD_SNAPSHOT_PATHS = {
+    "DavidBowie": MODEL_DIRS["DavidBowie"] / "Canari-FineTuner-2026-07-19" /
+                   "dlc-models-pytorch" / "iteration-0" /
+                   "CanariJul19-trainset95shuffle1" / "train" / "snapshot-125.pt",
+
+    "Tulio": MODEL_DIRS["Tulio"] / "Canari-FineTuner-2026-07-19" /
+              "dlc-models-pytorch" / "iteration-0" /
+              "CanariJul19-trainset95shuffle1" / "train" / "snapshot-125.pt",
+
+    "Miguel": MODEL_DIRS["Miguel"] / "Canari-FineTuner-2026-07-17" /
+               "dlc-models-pytorch" / "iteration-0" /
+               "CanariJul17-trainset95shuffle1" / "train" / "snapshot-125.pt",
+
+    "Endive": MODEL_DIRS["Endive"] / "Canari-FineTuner-2026-07-17" /
+               "dlc-models-pytorch" / "iteration-0" /
+               "CanariJul17-trainset95shuffle1" / "train" / "snapshot-125.pt",
+}
+# print(BIRD_SNAPSHOT_PATHS)
 
 
 def _load_data_converter_module() -> Any:
@@ -2884,6 +2943,7 @@ def make_postanalysis_overlay_popout(
 				return
 			auto_path = export_dir / "data" / "corrections_autosave.csv"
 			auto_path.parent.mkdir(parents=True, exist_ok=True)
+			xma_path = export_dir / "data" / "corrections_autosave_xmalab.csv"
 			rows: list[dict[str, Any]] = []
 			for (frame_pos, camera_name, bodypart_name), (x_val, y_val) in sorted(correction_cache.items()):
 				if int(frame_pos) not in export_frames:
@@ -2931,8 +2991,10 @@ def make_postanalysis_overlay_popout(
 							frame_row[x_col] = float(match.iloc[0]["x_corrected"])
 							frame_row[y_col] = float(match.iloc[0]["y_corrected"])
 				xmalab_rows.append(frame_row)
-
-			pd.DataFrame(xmalab_rows).to_csv(auto_path, index=False)
+			To_Save_XmaLabStyle = pd.DataFrame(xmalab_rows)
+			To_Save_XmaLabStyle.to_csv(auto_path, index=False)
+			XmaLab_Accessible_df = To_Save_XmaLabStyle.iloc[:, 5:]
+			XmaLab_Accessible_df.to_csv(xma_path, index=False)
 
 		def _resolve_point_xy(camera_name: str, frame_pos: int, bodypart_name: str) -> tuple[float, float] | None:
 			pts = _pred_points(camera_name, frame_pos)

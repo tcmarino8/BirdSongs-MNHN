@@ -215,6 +215,36 @@ BIRD_BODYPARTS: dict[str, list[str]] = {
         "PelvisPosterior",
         "PelvisAnterior",
         "PelvisRightMiddle"
+    ],
+
+    "Pig" : [
+        "LowerIncisor", 
+        "right lateral 2", 
+        "right lateral 3", 
+        "left lateral 4",
+          "left lateral 5", 
+          "left lateral 6", 
+          "left lateral 7", 
+          "right lateral 8", 
+          "left lateral 9", 
+          "right lateral 10"
+    ],
+
+    "Hans" : [
+        "L_Upper_Middle_Mandible",
+        "L_Lower_Middle_Mandible",
+        "L_Anterior_Mandible",
+        "L_Anteriormost_Mandible",
+        "L_Posterior_Mandible",
+        "R_Anterior_Mandible",
+        "R_Anteriormost_Mandible",
+        "R_Upper_Middle_Mandible",
+        "R_Posterior_Mandible",
+        "R_Lower_Middle_Mandible",
+        "L_Anterior_Zygomatic",
+        "L_Posterior_Zygomatic",
+        "R_Posterior_Zygomatic",
+        "R_Anterior_Zygomatic"
     ]
 }
 

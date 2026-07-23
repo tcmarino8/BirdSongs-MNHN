@@ -326,13 +326,13 @@ def jpg_stack_to_avi(
 def avi_to_jpg_stack(
     avi_path: str | Path,
     output_dir: str | Path,
-    prefix: str = "Cam1_Img00_UND",
+    prefix: str = "Cam1_Img",
     every_n: int = 1,
     jpg_quality: int = 95,
     start_index: int = 1,
 ) -> int:
     """
-    Writes frames like: Cam1_Img00_UND.0001.jpg
+    Writes frames like: Cam1_Img.0001.jpg
     Returns number of images written.
     """
     avi_path = Path(avi_path)
@@ -353,7 +353,7 @@ def avi_to_jpg_stack(
 
             if i % every_n == 0:
                 frame_idx = start_index + written
-                out_file = output_dir / f"{prefix}.{frame_idx:04d}.jpg"
+                out_file = output_dir / f"{prefix}{frame_idx:04d}.jpg"
                 cv2.imwrite(
                     str(out_file),
                     frame,
