@@ -534,7 +534,7 @@ def evaluate_within_across_for_bird(
     bird: str,
     data_root: str | Path,
     build_manifest_path: str | Path,
-    threshold_px: float = 5.0,
+    threshold_px: float = 3.0,
     fps: int = 500,
     batchsize: int = 16,
     delete_intermediate_predictions: bool = False,
@@ -544,6 +544,7 @@ def evaluate_within_across_for_bird(
     build_manifest_path = Path(build_manifest_path)
 
     model_df = _load_models_from_build_manifest(build_manifest_path, bird)
+    # print(model_df)
     # print("in function evaluating models")
     if model_df.empty:
         raise RuntimeError(f"No models found for bird={bird} in {build_manifest_path}")
@@ -772,10 +773,12 @@ def evaluate_within_across_blobdetect_for_bird(
     build_manifest_path = Path(build_manifest_path)
 
     model_df = _load_models_from_build_manifest(build_manifest_path, bird)
+    # print(model_df)
     if model_df.empty:
         raise RuntimeError(f"No models found for bird={bird} in {build_manifest_path}")
 
     eval_trials = _load_eval_trials(data_root, bird)
+    # print(eval_trials)
     if len(eval_trials) == 0:
         raise RuntimeError(f"No eval test folders found for bird={bird} under {data_root}")
 
