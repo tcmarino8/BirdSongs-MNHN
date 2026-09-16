@@ -1354,7 +1354,7 @@ def train_update_model(
 				"elapsed_seconds": 0,
 			}
 
-	models_dir.mkdir(exist_ok=True)
+	models_dir.mkdir(parents=True, exist_ok=True)
 
 	dummy_video = trial_dir / "Cam1.avi"
 	combined_config = dlcs.create_combined_project_if_missing(
@@ -1600,6 +1600,12 @@ def _predict_with_updated_model(
 		src_trial = _resolve_active_update_dir(base_dir=base, bird=bird, trial_num=trial_num, update_set=update_set)
 		models_dir = src_trial / "ModelsToTune"
 		src_trial_name = src_trial.name
+	if not models_dir.exists():
+		raise FileNotFoundError(
+			f"Expected trained model directory was not found: {models_dir}. "
+			"Run training from the correction workflow first."
+		)
+
 	configs = list(models_dir.rglob("config.yaml"))
 	if len(configs) == 0:
 		raise FileNotFoundError(f"No config.yaml found in:\n{models_dir}")
