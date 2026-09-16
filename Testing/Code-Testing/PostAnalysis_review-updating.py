@@ -112,15 +112,78 @@ def _workflow_state_path(trial_dir: str | Path) -> Path:
 	return Path(trial_dir) / WORKFLOW_STATE_FILE
 
 
-def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
+def _json_safe(value: Any) -> Any:
+	"""Convert numpy/pandas scalars and nested containers into JSON-safe values."""
+	if isinstance(value, dict):
+		return {str(k): _json_safe(v) for k, v in value.items()}
+	if isinstance(value, (list, tuple, set)):
+		return [_json_safe(v) for v in value]
+	if isinstance(value, (np.integer, np.int64, np.int32)):
+		return int(value)
+	if isinstance(value, (np.floating, np.float64, np.float32)):
+		v = float(value)
+		return None if not np.isfinite(v) else v
+	if isinstance(value, float):
+		return None if not np.isfinite(value) else value
+	if isinstance(value, Path):
+		return str(value)
+	return value
+
+
+def _load_workflow_state(trial_dir: str | Path) -> dict[str, Any]:
 	state_path = _workflow_state_path(trial_dir)
 	if not state_path.exists():
-		return None
+		return {}
 	try:
 		data = json.loads(state_path.read_text(encoding="utf-8"))
 	except Exception:
-		return None
+		return {}
+	return data if isinstance(data, dict) else {}
 
+
+def _save_workflow_state(trial_dir: str | Path, state: dict[str, Any]) -> None:
+	state_path = _workflow_state_path(trial_dir)
+	state_path.parent.mkdir(parents=True, exist_ok=True)
+	state_clean = _json_safe(state)
+	state_clean["updated_unix"] = int(time.time())
+	state_path.write_text(json.dumps(state_clean, indent=2), encoding="utf-8")
+
+
+def _correction_sets_map(state: dict[str, Any]) -> dict[str, Any]:
+	if "correction_sets" not in state or not isinstance(state.get("correction_sets"), dict):
+		state["correction_sets"] = {}
+	return state["correction_sets"]
+
+
+def _get_correction_set(trial_dir: str | Path, set_name: str) -> dict[str, Any] | None:
+	state = _load_workflow_state(trial_dir)
+	sets = _correction_sets_map(state)
+	entry = sets.get(str(set_name))
+	return entry if isinstance(entry, dict) else None
+
+
+def _list_correction_sets(trial_dir: str | Path) -> list[str]:
+	state = _load_workflow_state(trial_dir)
+	sets = _correction_sets_map(state)
+	return sorted(str(k) for k, v in sets.items() if isinstance(v, dict))
+
+
+def _upsert_correction_set(trial_dir: str | Path, set_name: str, payload: dict[str, Any]) -> None:
+	state = _load_workflow_state(trial_dir)
+	sets = _correction_sets_map(state)
+	existing = sets.get(str(set_name), {})
+	if not isinstance(existing, dict):
+		existing = {}
+	updated = dict(existing)
+	updated.update(dict(payload))
+	updated["name"] = str(set_name)
+	updated["updated_unix"] = int(time.time())
+	sets[str(set_name)] = _json_safe(updated)
+	_save_workflow_state(trial_dir, state)
+
+
+def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
+	data = _load_workflow_state(trial_dir)
 	frame_range = data.get("frame_range", {}) if isinstance(data, dict) else {}
 	start = frame_range.get("start")
 	end = frame_range.get("end")
@@ -136,27 +199,15 @@ def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
 
 
 def _save_frame_range(trial_dir: str | Path, start_frame: int, end_frame: int, source: str = "") -> None:
-	state_path = _workflow_state_path(trial_dir)
-	state_path.parent.mkdir(parents=True, exist_ok=True)
-
 	start_i = int(start_frame)
 	end_i = int(end_frame)
 	if end_i < start_i:
 		start_i, end_i = end_i, start_i
 
-	data: dict[str, Any] = {}
-	if state_path.exists():
-		try:
-			loaded = json.loads(state_path.read_text(encoding="utf-8"))
-			if isinstance(loaded, dict):
-				data = loaded
-		except Exception:
-			data = {}
-
+	data = _load_workflow_state(trial_dir)
 	data["frame_range"] = {"start": start_i, "end": end_i}
 	data["last_source"] = str(source)
-	data["updated_unix"] = int(time.time())
-	state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+	_save_workflow_state(trial_dir, data)
 
 
 def find_darkest_pixel(
@@ -1256,15 +1307,26 @@ def train_update_model(
 	),
 	update_set: str | None = None,
 ) -> dict[str, Any]:
-	"""Create/update a DLC training dataset for an active-update set and train the model."""
+	"""Create/update a DLC training dataset and train from saved correction-set data."""
 	import DLCsupport as dlcs
 
-	src_trial = _resolve_active_update_dir(
-		base_dir=base_dir,
-		bird=bird,
-		trial_num=trial_num,
-		update_set=update_set,
-	)
+	base_dir = Path(base_dir)
+	trial_dir = base_dir / bird / f"Trial{trial_num}"
+	set_name = str(update_set or "random")
+	correction_set = _get_correction_set(trial_dir, set_name)
+	use_json_set = correction_set is not None
+
+	if use_json_set:
+		src_trial = trial_dir
+		models_root = trial_dir / "active_update_models" / set_name
+	else:
+		src_trial = _resolve_active_update_dir(
+			base_dir=base_dir,
+			bird=bird,
+			trial_num=trial_num,
+			update_set=update_set,
+		)
+		models_root = src_trial
 
 	if snapshot_path is None:
 		snapshot_path = BIRD_SNAPSHOT_PATHS.get(str(bird))
@@ -1275,7 +1337,7 @@ def train_update_model(
 	if not src_trial.exists():
 		raise FileNotFoundError(f"Trial folder not found:\n{src_trial}")
 
-	models_dir = src_trial / "ModelsToTune"
+	models_dir = models_root / "ModelsToTune"
 
 	# Check if the ModelsToTune directory exists
 	# FIXME: we need this below logic to apply before it prompts you model hyper params (num images, num epochs etc...)
@@ -1294,7 +1356,7 @@ def train_update_model(
 
 	models_dir.mkdir(exist_ok=True)
 
-	dummy_video = Path(base_dir) / bird / f"Trial{trial_num}" / "Cam1.avi"
+	dummy_video = trial_dir / "Cam1.avi"
 	combined_config = dlcs.create_combined_project_if_missing(
 		task=task,
 		experimenter=finetune_experimenter,
@@ -1304,30 +1366,163 @@ def train_update_model(
 
 	dlcs.apply_bird_bodyparts_to_configs({bird: [combined_config]}, strict=True)
 
-	clean_trial = src_trial / "ModelTraining"
+	clean_trial = models_root / "ModelTraining"
 	clean_trial.mkdir(parents=True, exist_ok=True)
 
-	for cam_folder in ["cam1", "cam2", "Cam1", "Cam2"]:
-		src = src_trial / cam_folder
-		if not src.exists() or not src.is_dir():
-			continue
-		dst_name = "Cam1" if cam_folder.lower() == "cam1" else "Cam2"
-		dst = clean_trial / dst_name
-		if dst.exists():
-			shutil.rmtree(dst)
-		shutil.copytree(src, dst)
+	if use_json_set:
+		points_payload = correction_set.get("correction_points", []) if isinstance(correction_set, dict) else []
+		legacy_rows_payload = correction_set.get("corrections_table_rows", []) if isinstance(correction_set, dict) else []
+		frame_refs_payload = correction_set.get("frame_refs", []) if isinstance(correction_set, dict) else []
+		if (
+			(not isinstance(points_payload, list) or not points_payload)
+			and (not isinstance(legacy_rows_payload, list) or not legacy_rows_payload)
+			and (not isinstance(frame_refs_payload, list) or not frame_refs_payload)
+		):
+			raise FileNotFoundError(
+				f"No correction data found for set '{set_name}' in {WORKFLOW_STATE_FILE}. "
+				"Open Correction Tab and save a frame selection first."
+			)
 
-	truth_csv = src_trial / "data" / "corrections_autosave.csv"
-	if not truth_csv.exists():
-		raise FileNotFoundError(f"Missing label file:\n{truth_csv}")
+		coord_cols: list[str] = []
+		try:
+			pred_csv_by_cam = _resolve_prediction_csvs(trial_dir)
+			coord_cols = [
+				str(col)
+				for col in pd.read_csv(pred_csv_by_cam["cam1"], nrows=0).columns
+				if re.search(r"_cam[12]_[XY]$", str(col))
+			]
+		except Exception:
+			coord_cols = []
 
-	df = pd.read_csv(truth_csv)
-	coord_cols = [c for c in df.columns if re.search(r"_cam[12]_[XY]$", str(c))]
-	if len(coord_cols) == 0:
-		raise ValueError("No coordinate columns matching *_cam[12]_[XY] found.")
+		if len(coord_cols) == 0 and isinstance(points_payload, list):
+			pairs: set[tuple[str, str]] = set()
+			for item in points_payload:
+				if not isinstance(item, dict):
+					continue
+				bp = str(item.get("bodypart", "")).strip()
+				cam = _cam_norm(item.get("camera", ""))
+				if not bp or cam not in ("cam1", "cam2"):
+					continue
+				pairs.add((bp, cam))
+			coord_cols = [f"{bp}_{cam}_X" for bp, cam in sorted(pairs)] + [f"{bp}_{cam}_Y" for bp, cam in sorted(pairs)]
 
-	clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
-	df[coord_cols].to_csv(clean_points_csv, index=False)
+		if len(coord_cols) == 0 and isinstance(legacy_rows_payload, list) and legacy_rows_payload:
+			df_legacy_cols = pd.DataFrame(legacy_rows_payload)
+			coord_cols = [c for c in df_legacy_cols.columns if re.search(r"_cam[12]_[XY]$", str(c))]
+
+		if len(coord_cols) == 0:
+			raise ValueError("Could not determine coordinate columns for JSON correction set.")
+
+		total_frames = len(collect_images(trial_dir / "Cam1"))
+		if total_frames <= 0:
+			raise FileNotFoundError(f"No Cam1 images found under: {trial_dir / 'Cam1'}")
+
+		full_labels = pd.DataFrame(np.nan, index=range(int(total_frames)), columns=coord_cols)
+
+		image_to_index = {"cam1": {}, "cam2": {}}
+		cam1_images = collect_images(trial_dir / "Cam1")
+		cam2_images = collect_images(trial_dir / "Cam2")
+		image_to_index["cam1"] = {p.name: int(i) for i, p in enumerate(cam1_images)}
+		image_to_index["cam2"] = {p.name: int(i) for i, p in enumerate(cam2_images)}
+
+		if isinstance(points_payload, list) and points_payload:
+			for item in points_payload:
+				if not isinstance(item, dict):
+					continue
+				bp = str(item.get("bodypart", "")).strip()
+				cam = _cam_norm(item.get("camera", ""))
+				if not bp or cam not in ("cam1", "cam2"):
+					continue
+
+				idx = None
+				for key_name in ("row_index", "frame_pos"):
+					val = pd.to_numeric(item.get(key_name), errors="coerce")
+					if np.isfinite(val):
+						idx = int(val)
+						break
+				if idx is None:
+					img_name = str(item.get("image_name", "")).strip()
+					if img_name:
+						idx = image_to_index.get(cam, {}).get(img_name)
+
+				if idx is None or not (0 <= int(idx) < int(total_frames)):
+					continue
+				x_val = pd.to_numeric(item.get("x", item.get("x_corrected")), errors="coerce")
+				y_val = pd.to_numeric(item.get("y", item.get("y_corrected")), errors="coerce")
+				x_col = f"{bp}_{cam}_X"
+				y_col = f"{bp}_{cam}_Y"
+				if x_col in full_labels.columns and np.isfinite(x_val):
+					full_labels.at[int(idx), x_col] = float(x_val)
+				if y_col in full_labels.columns and np.isfinite(y_val):
+					full_labels.at[int(idx), y_col] = float(y_val)
+		elif isinstance(frame_refs_payload, list) and frame_refs_payload:
+			pred_csv_by_cam = _resolve_prediction_csvs(trial_dir)
+			pred_wide = pd.read_csv(pred_csv_by_cam["cam1"])
+			for ref in frame_refs_payload:
+				if not isinstance(ref, dict):
+					continue
+				idx_val = pd.to_numeric(ref.get("row_index", ref.get("frame_pos")), errors="coerce")
+				if not np.isfinite(idx_val):
+					continue
+				idx = int(idx_val)
+				if not (0 <= idx < int(total_frames)) or idx >= len(pred_wide):
+					continue
+				for col in coord_cols:
+					if col in pred_wide.columns:
+						full_labels.at[idx, col] = pd.to_numeric(pred_wide.iloc[idx].get(col), errors="coerce")
+		elif isinstance(legacy_rows_payload, list) and legacy_rows_payload:
+			df = pd.DataFrame(legacy_rows_payload)
+			if "frame_pos" in df.columns:
+				for _, row in df.iterrows():
+					frame_pos = pd.to_numeric(row.get("frame_pos"), errors="coerce")
+					if not np.isfinite(frame_pos):
+						continue
+					idx = int(frame_pos)
+					if not (0 <= idx < int(total_frames)):
+						continue
+					for col in coord_cols:
+						full_labels.at[idx, col] = pd.to_numeric(row.get(col), errors="coerce")
+			else:
+				for idx, (_, row) in enumerate(df.iterrows()):
+					if not (0 <= idx < int(total_frames)):
+						continue
+					for col in coord_cols:
+						full_labels.at[idx, col] = pd.to_numeric(row.get(col), errors="coerce")
+
+		for cam_folder in ("Cam1", "Cam2"):
+			src = trial_dir / cam_folder
+			dst = clean_trial / cam_folder
+			if dst.exists() or not src.exists():
+				continue
+			try:
+				dst.symlink_to(src, target_is_directory=True)
+			except Exception:
+				shutil.copytree(src, dst)
+
+		clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
+		full_labels.to_csv(clean_points_csv, index=False)
+	else:
+		for cam_folder in ["cam1", "cam2", "Cam1", "Cam2"]:
+			src = src_trial / cam_folder
+			if not src.exists() or not src.is_dir():
+				continue
+			dst_name = "Cam1" if cam_folder.lower() == "cam1" else "Cam2"
+			dst = clean_trial / dst_name
+			if dst.exists():
+				shutil.rmtree(dst)
+			shutil.copytree(src, dst)
+
+		truth_csv = src_trial / "data" / "corrections_autosave.csv"
+		if not truth_csv.exists():
+			raise FileNotFoundError(f"Missing label file:\n{truth_csv}")
+
+		df = pd.read_csv(truth_csv)
+		coord_cols = [c for c in df.columns if re.search(r"_cam[12]_[XY]$", str(c))]
+		if len(coord_cols) == 0:
+			raise ValueError("No coordinate columns matching *_cam[12]_[XY] found.")
+
+		clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
+		df[coord_cols].to_csv(clean_points_csv, index=False)
 
 	dataset_name = f"UpdateModelForTrial{trial_num}"
 	dlcs.build_combined_dataset(
@@ -1362,14 +1557,14 @@ def train_update_model(
 		f"\nTraining complete"
 		f"\nBird: {bird}"
 		f"\nTrial: {trial_num}"
-		f"\nUpdate set: {src_trial.name}"
+		f"\nUpdate set: {set_name if use_json_set else src_trial.name}"
 		f"\nElapsed: {elapsed:.1f} sec ({elapsed / 60:.1f} min)"
 	)
 
 	return {
 		"bird": bird,
 		"trial": trial_num,
-		"update_set": src_trial.name,
+		"update_set": set_name if use_json_set else src_trial.name,
 		"config": combined_config,
 		"elapsed_seconds": elapsed,
 	}
@@ -1397,9 +1592,14 @@ def _predict_with_updated_model(
 
 	base = Path(base_dir)
 	trial_dir = base / bird / f"Trial{trial_num}"
-	src_trial = _resolve_active_update_dir(base_dir=base, bird=bird, trial_num=trial_num, update_set=update_set)
-
-	models_dir = src_trial / "ModelsToTune"
+	set_name = str(update_set or "random")
+	if _get_correction_set(trial_dir, set_name) is not None:
+		models_dir = trial_dir / "active_update_models" / set_name / "ModelsToTune"
+		src_trial_name = set_name
+	else:
+		src_trial = _resolve_active_update_dir(base_dir=base, bird=bird, trial_num=trial_num, update_set=update_set)
+		models_dir = src_trial / "ModelsToTune"
+		src_trial_name = src_trial.name
 	configs = list(models_dir.rglob("config.yaml"))
 	if len(configs) == 0:
 		raise FileNotFoundError(f"No config.yaml found in:\n{models_dir}")
@@ -1475,7 +1675,7 @@ def _predict_with_updated_model(
 
 	return {
 		"config": config_path,
-		"update_set": src_trial.name,
+		"update_set": src_trial_name,
 		"Updated Csv": pred_csv,
 		"output_dir": updated_dir,
 	}
@@ -2478,66 +2678,114 @@ def make_postanalysis_overlay_popout(
 	def _method_folder_name(method_name: str) -> str:
 		return {"random": "random", "displacement": "displacement", "dino": "dino"}.get(method_name, method_name)
 
+	def _current_trial_dir() -> Path | None:
+		if state.pred_root.exists() and (state.pred_root / "Cam1").is_dir() and (state.pred_root / "Cam2").is_dir():
+			return Path(state.pred_root)
+		try:
+			ctx = _extract_trial_context_from_path(state.pred_root)
+			return Path(ctx["trial_dir"])
+		except Exception:
+			return None
+
 	def _list_active_update_sets() -> list[str]:
-		active_root = state.pred_root / "active_updates"
-		if not active_root.exists() or not active_root.is_dir():
+		trial_dir = _current_trial_dir()
+		if trial_dir is None:
 			return []
-		sets: list[str] = []
-		for candidate in sorted([p for p in active_root.iterdir() if p.is_dir()]):
-			if (candidate / "cam1").is_dir() and (candidate / "cam2").is_dir():
-				sets.append(candidate.name)
-		return sets
+		return _list_correction_sets(trial_dir)
 
 	def _frames_for_active_update_set(set_name: str) -> list[int]:
-		method_dir = state.pred_root / "active_updates" / str(set_name)
+		trial_dir = _current_trial_dir()
+		if trial_dir is None:
+			return []
+		entry = _get_correction_set(trial_dir, str(set_name))
+		if entry is None:
+			return []
+		frames_raw = entry.get("frames", [])
+		frames = sorted({int(x) for x in frames_raw if pd.notna(x)})
+		if frames:
+			return frames
+
+		refs = entry.get("frame_refs", [])
+		if isinstance(refs, list):
+			ref_frames = sorted(
+				{
+					int(pd.to_numeric(r.get("row_index", r.get("frame_pos")), errors="coerce"))
+					for r in refs
+					if isinstance(r, dict)
+					and np.isfinite(pd.to_numeric(r.get("row_index", r.get("frame_pos")), errors="coerce"))
+				}
+			)
+			if ref_frames:
+				return ref_frames
+
+		images_payload = entry.get("image_names", {})
+		if not isinstance(images_payload, dict):
+			return []
 		cam_frames: dict[str, set[int]] = {}
 		for camera_name in ("cam1", "cam2"):
-			camera_dir = method_dir / camera_name
-			if not camera_dir.exists() or not camera_dir.is_dir():
+			names = images_payload.get(camera_name, [])
+			if not isinstance(names, list):
 				cam_frames[camera_name] = set()
 				continue
-
-			subset_images = [p for p in camera_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
 			name_to_index = {img_path.name: idx for idx, img_path in enumerate(state.images_by_cam.get(camera_name, []))}
-			cam_frames[camera_name] = {
-				int(name_to_index[p.name])
-				for p in subset_images
-				if p.name in name_to_index
-			}
+			cam_frames[camera_name] = {int(name_to_index[n]) for n in names if n in name_to_index}
 
 		if cam_frames.get("cam1") and cam_frames.get("cam2"):
-			frames = sorted(cam_frames["cam1"].intersection(cam_frames["cam2"]))
-			if frames:
-				return [int(frame) for frame in frames]
+			both = sorted(cam_frames["cam1"].intersection(cam_frames["cam2"]))
+			if both:
+				return both
+		return sorted(cam_frames.get("cam1", set()).union(cam_frames.get("cam2", set())))
 
-		merged = sorted(cam_frames.get("cam1", set()).union(cam_frames.get("cam2", set())))
-		return [int(frame) for frame in merged]
+	def _save_active_update_selection(
+		method_name: str,
+		frames: list[int],
+		meta: dict[int, dict[str, Any]],
+		summary_lines: list[str],
+		source_camera: str,
+	) -> tuple[str, Path]:
+		trial_dir = _current_trial_dir()
+		if trial_dir is None:
+			raise RuntimeError("Could not infer trial directory for saving correction selection.")
 
-	def _export_active_updates_subset(method_name: str, frames: list[int]) -> Path:
-		method_dir = state.pred_root / "active_updates" / _method_folder_name(method_name)
-		cam1_dir = method_dir / "cam1"
-		cam2_dir = method_dir / "cam2"
-		data_dir = method_dir / "data"
+		set_name = _method_folder_name(method_name)
+		unique_frames = sorted({int(frame) for frame in frames})
+		existing_entry = _get_correction_set(trial_dir, set_name) or {}
+		existing_points = existing_entry.get("correction_points", []) if isinstance(existing_entry, dict) else []
+		frame_refs: list[dict[str, Any]] = []
+		for frame in unique_frames:
+			frame_refs.append(
+				{
+					"row_index": int(frame),
+					"frame_pos": int(frame),
+					"pred_frame_id_cam1": int(_frame_pos_to_pred_id("cam1", int(frame))),
+					"pred_frame_id_cam2": int(_frame_pos_to_pred_id("cam2", int(frame))),
+					"image_cam1": state.images_by_cam["cam1"][int(frame)].name if 0 <= int(frame) < len(state.images_by_cam.get("cam1", [])) else "",
+					"image_cam2": state.images_by_cam["cam2"][int(frame)].name if 0 <= int(frame) < len(state.images_by_cam.get("cam2", [])) else "",
+				}
+			)
 
-		if method_dir.exists():
-			shutil.rmtree(method_dir)
-		cam1_dir.mkdir(parents=True, exist_ok=True)
-		cam2_dir.mkdir(parents=True, exist_ok=True)
-		data_dir.mkdir(parents=True, exist_ok=True)
+		payload: dict[str, Any] = {
+			"selection_mode": str(method_name),
+			"frames": unique_frames,
+			"summary_lines": [str(line) for line in summary_lines],
+			"source_camera": str(source_camera),
+			"frame_refs": frame_refs,
+			"frame_meta": {str(k): dict(v) for k, v in meta.items() if int(k) in unique_frames},
+			"correction_points": existing_points if isinstance(existing_points, list) else [],
+			"corrections_table_rows": [],
+		}
+		_upsert_correction_set(trial_dir, set_name, payload)
 
-		for camera_name, export_dir in (("cam1", cam1_dir), ("cam2", cam2_dir)):
-			images = state.images_by_cam.get(camera_name, [])
-			for frame in sorted(set(int(frame) for frame in frames)):
-				if 0 <= frame < len(images):
-					shutil.copy2(images[frame], export_dir / images[frame].name)
-
-		return method_dir
-
-	def _extract_trial_context_from_export_dir(export_dir: Path) -> dict[str, Any]:
-		return _extract_trial_context_from_path(export_dir)
+		# Verify write so save-button failures are explicit during testing.
+		written = _get_correction_set(trial_dir, set_name)
+		if not isinstance(written, dict):
+			raise RuntimeError(
+				f"Failed to persist correction set '{set_name}' to {_workflow_state_path(trial_dir)}"
+			)
+		return set_name, trial_dir
 
 	def _prompt_train_predict_inputs(
-		export_dir: Path,
+		trial_dir: Path,
 		frames_local: list[int],
 		default_update_set: str,
 	) -> dict[str, Any] | None:
@@ -2547,7 +2795,7 @@ def make_postanalysis_overlay_popout(
 		except Exception as exc:
 			raise RuntimeError("Tkinter prompts are required for train-and-predict confirmation.") from exc
 
-		context = _extract_trial_context_from_export_dir(export_dir)
+		context = _extract_trial_context_from_path(trial_dir)
 		bird = str(context["bird"])
 		trial_num = int(context["trial_num"])
 		saved_range = _load_saved_frame_range(Path(context["trial_dir"]))
@@ -2662,8 +2910,8 @@ def make_postanalysis_overlay_popout(
 			"nframes": int(nframes),
 		}
 
-	def _run_train_and_predict_from_review(export_dir: Path, frames_local: list[int], method_name: str) -> bool:
-		params = _prompt_train_predict_inputs(export_dir, frames_local, default_update_set=method_name)
+	def _run_train_and_predict_from_review(trial_dir: Path, frames_local: list[int], method_name: str) -> bool:
+		params = _prompt_train_predict_inputs(trial_dir, frames_local, default_update_set=method_name)
 		if params is None:
 			return False
 
@@ -2688,7 +2936,8 @@ def make_postanalysis_overlay_popout(
 		redraw()
 		return True
 
-	def _open_correction_subset_view(method_name: str, frames: list[int], export_dir: Path) -> None:
+	def _open_correction_subset_view(method_name: str, frames: list[int], trial_dir: Path) -> None:
+		trial_dir = Path(trial_dir)
 		frames_local = [int(frame) for frame in sorted(set(frames))]
 		if not frames_local:
 			raise RuntimeError("No selected frames are available for correction review.")
@@ -2770,6 +3019,7 @@ def make_postanalysis_overlay_popout(
 			"cam1": {p.name: int(i) for i, p in enumerate(state.images_by_cam.get("cam1", []))},
 			"cam2": {p.name: int(i) for i, p in enumerate(state.images_by_cam.get("cam2", []))},
 		}
+		set_payload = _get_correction_set(trial_dir, str(method_name)) or {}
 
 		def _resolve_frame_pos_for_saved_row(camera_name: str, row: pd.Series, row_idx: int) -> int | None:
 			camera_name = _cam_norm(str(camera_name))
@@ -2834,90 +3084,84 @@ def make_postanalysis_overlay_popout(
 			return None
 
 		def _load_existing_corrections() -> None:
-			auto_path = export_dir / "data" / "corrections_autosave.csv"
-			if not auto_path.exists():
-				return
-			try:
-				saved_df = pd.read_csv(auto_path)
-			except Exception as exc:
-				print(f"Warning: could not read existing corrections at {auto_path}: {exc}")
-				return
-			if saved_df.empty:
-				return
-
 			loaded_count = 0
-			required_long = {"camera", "bodypart", "x_corrected", "y_corrected"}
-			if required_long.issubset(set(saved_df.columns)):
-				for row_idx, (_, row) in enumerate(saved_df.iterrows()):
-					camera_name = _cam_norm(str(row.get("camera", "")))
+
+			points_payload = set_payload.get("correction_points", []) if isinstance(set_payload, dict) else []
+			if isinstance(points_payload, list) and points_payload:
+				for row_idx, item in enumerate(points_payload):
+					if not isinstance(item, dict):
+						continue
+					camera_name = _cam_norm(str(item.get("camera", "")))
 					if camera_name not in ("cam1", "cam2"):
 						continue
-					bodypart_name = str(row.get("bodypart", "")).strip()
+					bodypart_name = str(item.get("bodypart", "")).strip()
 					if not bodypart_name:
 						continue
-					x_val = float(pd.to_numeric(row.get("x_corrected"), errors="coerce"))
-					y_val = float(pd.to_numeric(row.get("y_corrected"), errors="coerce"))
+
+					x_val = float(pd.to_numeric(item.get("x", item.get("x_corrected")), errors="coerce"))
+					y_val = float(pd.to_numeric(item.get("y", item.get("y_corrected")), errors="coerce"))
 					if not (np.isfinite(x_val) and np.isfinite(y_val)):
 						continue
-					frame_pos = _resolve_frame_pos_for_saved_row(camera_name, row, row_idx)
+
+					frame_pos = None
+					for key_name in ("row_index", "frame_pos"):
+						val = pd.to_numeric(item.get(key_name), errors="coerce")
+						if np.isfinite(val):
+							frame_pos = int(val)
+							break
 					if frame_pos is None:
+						image_name = str(item.get("image_name", "")).strip()
+						if image_name:
+							frame_pos = image_pos_by_cam_name.get(camera_name, {}).get(image_name)
+
+					if frame_pos is None or int(frame_pos) not in export_frames:
 						continue
 					key = (int(frame_pos), str(camera_name), str(bodypart_name))
 					correction_cache[key] = (float(x_val), float(y_val))
 					correction_pixel_index[key] = (int(round(y_val)), int(round(x_val)))
 					loaded_count += 1
-			else:
-				col_map: dict[tuple[str, str, str], str] = {}
-				for col in saved_df.columns:
-					m = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
-					if m is None:
-						continue
-					bodypart_name = str(m.group("bodypart"))
-					camera_name = f"cam{m.group('cam')}"
-					coord = str(m.group("coord")).upper()
-					col_map[(bodypart_name, camera_name, coord)] = str(col)
 
-				bodyparts = sorted({bp for (bp, _, _coord) in col_map.keys()})
-				for row_idx, (_, row) in enumerate(saved_df.iterrows()):
-					for camera_name in ("cam1", "cam2"):
-						frame_pos = _resolve_frame_pos_for_saved_row(camera_name, row, row_idx)
-						if frame_pos is None:
-							continue
-						for bodypart_name in bodyparts:
-							x_col = col_map.get((bodypart_name, camera_name, "X"))
-							y_col = col_map.get((bodypart_name, camera_name, "Y"))
-							if x_col is None or y_col is None:
+			if loaded_count == 0:
+				rows_payload = set_payload.get("corrections_table_rows", []) if isinstance(set_payload, dict) else []
+				if isinstance(rows_payload, list) and rows_payload:
+					saved_df = pd.DataFrame(rows_payload)
+					if not saved_df.empty:
+						col_map: dict[tuple[str, str, str], str] = {}
+						for col in saved_df.columns:
+							m = re.match(r"(?P<bodypart>.+)_cam(?P<cam>[12])_(?P<coord>[XY])$", str(col))
+							if m is None:
 								continue
-							x_val = float(pd.to_numeric(row.get(x_col), errors="coerce"))
-							y_val = float(pd.to_numeric(row.get(y_col), errors="coerce"))
-							if not (np.isfinite(x_val) and np.isfinite(y_val)):
-								continue
-							key = (int(frame_pos), str(camera_name), str(bodypart_name))
-							correction_cache[key] = (float(x_val), float(y_val))
-							correction_pixel_index[key] = (int(round(y_val)), int(round(x_val)))
-							loaded_count += 1
+							bodypart_name = str(m.group("bodypart"))
+							camera_name = f"cam{m.group('cam')}"
+							coord = str(m.group("coord")).upper()
+							col_map[(bodypart_name, camera_name, coord)] = str(col)
+
+						bodyparts = sorted({bp for (bp, _, _coord) in col_map.keys()})
+						for row_idx, (_, row) in enumerate(saved_df.iterrows()):
+							for camera_name in ("cam1", "cam2"):
+								frame_pos = _resolve_frame_pos_for_saved_row(camera_name, row, row_idx)
+								if frame_pos is None:
+									continue
+								for bodypart_name in bodyparts:
+									x_col = col_map.get((bodypart_name, camera_name, "X"))
+									y_col = col_map.get((bodypart_name, camera_name, "Y"))
+									if x_col is None or y_col is None:
+										continue
+									x_val = float(pd.to_numeric(row.get(x_col), errors="coerce"))
+									y_val = float(pd.to_numeric(row.get(y_col), errors="coerce"))
+									if not (np.isfinite(x_val) and np.isfinite(y_val)):
+										continue
+									key = (int(frame_pos), str(camera_name), str(bodypart_name))
+									correction_cache[key] = (float(x_val), float(y_val))
+									correction_pixel_index[key] = (int(round(y_val)), int(round(x_val)))
+									loaded_count += 1
 
 			if loaded_count > 0:
-				print(f"Loaded {loaded_count} saved corrections from {auto_path}")
+				print(f"Loaded {loaded_count} saved corrections from workflow JSON ({method_name}).")
 
 		def _initialize_corrections_from_predictions() -> None:
-			for frame_pos in export_frames:
-				for camera_name in ("cam1", "cam2"):
-					pts = _pred_points(camera_name, int(frame_pos))
-					if pts.empty:
-						continue
-					for _, row in pts.iterrows():
-						bodypart = str(row["bodypart"])
-						x_val = float(pd.to_numeric(row["x"], errors="coerce"))
-						y_val = float(pd.to_numeric(row["y"], errors="coerce"))
-						if not (np.isfinite(x_val) and np.isfinite(y_val)):
-							continue
-						key = (int(frame_pos), str(camera_name), bodypart)
-						correction_cache[key] = (x_val, y_val)
-						row_int = int(round(y_val))
-						col_int = int(round(x_val))
-						correction_pixel_index[key] = (row_int, col_int)
-						# likelihood_lookup[key] = float(pd.to_numeric(row["likelihood"], errors="coerce"))
+			# Keep cache sparse: corrections are stored only when edited or loaded from JSON.
+			return
 
 		def _image_name_for(camera_name: str, frame_pos: int) -> str:
 			images = state.images_by_cam.get(camera_name, [])
@@ -2928,58 +3172,45 @@ def make_postanalysis_overlay_popout(
 		def _autosave_corrections() -> None:
 			if not correction_cache or not export_frames:
 				return
-			auto_path = export_dir / "data" / "corrections_autosave.csv"
-			auto_path.parent.mkdir(parents=True, exist_ok=True)
-			rows: list[dict[str, Any]] = []
+			points: list[dict[str, Any]] = []
 			for (frame_pos, camera_name, bodypart_name), (x_val, y_val) in sorted(correction_cache.items()):
 				if int(frame_pos) not in export_frames:
 					continue
-				key = (int(frame_pos), str(camera_name), str(bodypart_name))
-				rows.append(
+				points.append(
 					{
+						"row_index": int(frame_pos),
 						"frame_pos": int(frame_pos),
 						"image_name": _image_name_for(str(camera_name), int(frame_pos)),
-						"frame_id": int(frame_pos),
 						"camera": str(camera_name),
 						"bodypart": str(bodypart_name),
-						"x_corrected": float(x_val),
-						"y_corrected": float(y_val),
-						# "likelihood": float(likelihood_lookup.get(key, np.nan)),
+						"x": float(x_val),
+						"y": float(y_val),
 					}
 				)
-			if not rows:
+			if not points:
 				return
-			long_df = pd.DataFrame(rows).sort_values(["frame_pos", "camera", "bodypart"], kind="mergesort")
-
-			# Save only XMALab-style wide output with row order matching selected image frames.
-			xmalab_rows: list[dict[str, Any]] = []
-			bodyparts = sorted(pd.Index(long_df["bodypart"].astype(str)).unique().tolist())
-			for frame_pos in export_frames:
-				frame_row: dict[str, Any] = {}
-				frame_row["frame_pos"] = int(frame_pos)
-				frame_row["frame_id_cam1"] = int(_frame_pos_to_pred_id("cam1", int(frame_pos)))
-				frame_row["frame_id_cam2"] = int(_frame_pos_to_pred_id("cam2", int(frame_pos)))
-				frame_row["image_cam1"] = _image_name_for("cam1", int(frame_pos))
-				frame_row["image_cam2"] = _image_name_for("cam2", int(frame_pos))
-				for bodypart_name in bodyparts:
-					for camera_name, cam_id in (("cam1", "1"), ("cam2", "2")):
-						match = long_df[
-							(long_df["frame_pos"] == int(frame_pos))
-							& (long_df["camera"] == str(camera_name))
-							& (long_df["bodypart"] == str(bodypart_name))
-						]
-						x_col = f"{bodypart_name}_cam{cam_id}_X"
-						y_col = f"{bodypart_name}_cam{cam_id}_Y"
-						if match.empty:
-							frame_row[x_col] = np.nan
-							frame_row[y_col] = np.nan
-						else:
-							frame_row[x_col] = float(match.iloc[0]["x_corrected"])
-							frame_row[y_col] = float(match.iloc[0]["y_corrected"])
-				xmalab_rows.append(frame_row)
-			To_Save_XmaLabStyle = pd.DataFrame(xmalab_rows)
-			XmaLab_Accessible_df = To_Save_XmaLabStyle.iloc[:, 5:]
-			XmaLab_Accessible_df.to_csv(auto_path, index=False)
+			frame_refs = [
+				{
+					"row_index": int(frame),
+					"frame_pos": int(frame),
+					"pred_frame_id_cam1": int(_frame_pos_to_pred_id("cam1", int(frame))),
+					"pred_frame_id_cam2": int(_frame_pos_to_pred_id("cam2", int(frame))),
+					"image_cam1": _image_name_for("cam1", int(frame)),
+					"image_cam2": _image_name_for("cam2", int(frame)),
+				}
+				for frame in export_frames
+			]
+			_upsert_correction_set(
+				trial_dir,
+				str(method_name),
+				{
+					"frames": [int(frame) for frame in export_frames],
+					"selection_mode": str(method_name),
+					"frame_refs": frame_refs,
+					"correction_points": points,
+					"corrections_table_rows": [],
+				},
+			)
 
 		def _resolve_point_xy(camera_name: str, frame_pos: int, bodypart_name: str) -> tuple[float, float] | None:
 			pts = _pred_points(camera_name, frame_pos)
@@ -3455,10 +3686,7 @@ def make_postanalysis_overlay_popout(
 				return
 			frame_pos = int(slider_review.val)
 			camera_name = "cam1" if event.inaxes == review_axes[0] else "cam2"
-			# min_like = float(slider_like.val)
 			nearest = _nearest_marker_in_axes(event, camera_name, frame_pos)
-			# min_like
-
 			if nearest is not None:
 				bodypart_name, x_near, y_near, _ = nearest
 				_apply_snapped_edit(frame_pos, camera_name, bodypart_name, float(x_near), float(y_near))
@@ -3538,7 +3766,7 @@ def make_postanalysis_overlay_popout(
 		def _on_finish_corrections(_event: Any) -> None:
 			try:
 				_autosave_corrections()
-				success = _run_train_and_predict_from_review(export_dir=export_dir, frames_local=frames_local, method_name=method_name)
+				success = _run_train_and_predict_from_review(trial_dir=trial_dir, frames_local=frames_local, method_name=method_name)
 				if success:
 					print("Train-and-predict complete. Main viewer refreshed with updated predictions.")
 					plt.close(review_fig)
@@ -3585,7 +3813,7 @@ def make_postanalysis_overlay_popout(
 	def _open_active_updates_browser() -> None:
 		available_sets = _list_active_update_sets()
 		if not available_sets:
-			raise RuntimeError("No active_updates subsets found. Create one first with a frame selection and Correction.")
+			raise RuntimeError("No saved correction sets found in workflow JSON. Create one first with a frame selection and Correction.")
 
 		browser_fig, browser_ax = plt.subplots(figsize=(4.8, 3.8))
 		browser_fig.subplots_adjust(left=0.12, right=0.95, bottom=0.18, top=0.90)
@@ -3598,7 +3826,7 @@ def make_postanalysis_overlay_popout(
 		radio_sets = RadioButtons(radio_ax, available_sets, active=0)
 		btn_open = Button(open_ax, "Open")
 		btn_cancel = Button(cancel_ax, "Close")
-		browser_fig.suptitle("Correction Tab: active_updates", fontsize=11)
+		browser_fig.suptitle("Correction Tab: saved sets", fontsize=11)
 
 		def _apply_browser_widget_scaling(_event: Any = None) -> None:
 			button_font = _scaled_font(browser_fig, base_size=9.5, ref_w=4.8, ref_h=3.8, min_size=8.0, max_size=14.0)
@@ -3623,9 +3851,13 @@ def make_postanalysis_overlay_popout(
 			set_name = str(radio_sets.value_selected)
 			frames = _frames_for_active_update_set(set_name)
 			if not frames:
-				print(f"Correction tab: no index-matched frames found in active_updates/{set_name}.")
+				print(f"Correction tab: no index-matched frames found in workflow set '{set_name}'.")
 				return
-			_open_correction_subset_view(set_name, frames, state.pred_root / "active_updates" / set_name)
+			trial_dir = _current_trial_dir()
+			if trial_dir is None:
+				print("Correction tab: could not infer trial directory for selected set.")
+				return
+			_open_correction_subset_view(set_name, frames, trial_dir)
 			plt.close(browser_fig)
 
 		def _close_browser(_event: Any) -> None:
@@ -3754,10 +3986,56 @@ def make_postanalysis_overlay_popout(
 		ax_resample.set_visible(selection_controls_visible)
 		redraw()
 
+	def _prompt_saved_selection_range(mode: str) -> None:
+		trial_dir = _current_trial_dir()
+		if trial_dir is None:
+			return
+		saved_range = _load_saved_frame_range(trial_dir)
+		if saved_range is None:
+			return
+
+		frame_limit = _shared_frame_limit()
+		if frame_limit <= 0:
+			return
+		max_frame = int(frame_limit - 1)
+		start_frame = int(np.clip(saved_range[0], 0, max_frame))
+		end_frame = int(np.clip(saved_range[1], 0, max_frame))
+		if end_frame < start_frame:
+			start_frame, end_frame = end_frame, start_frame
+
+		use_saved = False
+		try:
+			import tkinter as tk
+			from tkinter import messagebox
+			prompt_root = tk.Tk()
+			prompt_root.withdraw()
+			prompt_root.attributes("-topmost", True)
+			use_saved = bool(
+				messagebox.askyesno(
+					title="Use Saved Frame Range",
+					message=(
+						f"A saved frame range was found in {WORKFLOW_STATE_FILE}:\n"
+						f"{start_frame} to {end_frame}\n\n"
+						f"Use this range for {mode.title()} frame selection?"
+					),
+					parent=prompt_root,
+				)
+			)
+			prompt_root.destroy()
+		except Exception:
+			return
+
+		if use_saved:
+			textbox_window_start.set_val(str(start_frame))
+			textbox_window_end.set_val(str(end_frame))
+
 	def _activate_selection(mode: str, force_resample: bool = False, source_camera: str | None = None) -> None:
 		if not force_resample and selection_controls_visible and selection_mode == mode:
 			_set_selection_controls_visible(False)
 			return
+
+		if not force_resample:
+			_prompt_saved_selection_range(mode)
 
 		if force_resample or selection_mode != mode or not selected_frames:
 			if mode == "displacement":
@@ -4036,15 +4314,63 @@ def make_postanalysis_overlay_popout(
 
 	def _on_correction_export(_event: Any) -> None:
 		try:
+			print("Save Correction Frames clicked")
 			if not selected_frames or not selection_mode:
 				raise RuntimeError("Create a frame selection first with Random, Displacement, or DINO before opening Correction.")
 
 			frames = [int(frame) for frame in sorted(set(selected_frames))]
 			method_name = _method_folder_name(selection_mode)
-			export_dir = _export_active_updates_subset(method_name, frames)
-			_open_correction_subset_view(method_name, frames, export_dir)
+			trial_dir_guess = _current_trial_dir()
+			print(f"Save debug: pred_root={state.pred_root}")
+			print(f"Save debug: trial_dir={trial_dir_guess}")
+			print(f"Save debug: method={method_name}, n_frames={len(frames)}")
+			set_name, trial_dir = _save_active_update_selection(
+				method_name=method_name,
+				frames=frames,
+				meta=selected_frame_meta,
+				summary_lines=selection_summary_lines,
+				source_camera=selection_source_camera,
+			)
+			state_now = _load_workflow_state(trial_dir)
+			n_sets = len(state_now.get("correction_sets", {})) if isinstance(state_now.get("correction_sets", {}), dict) else 0
+			saved_path = _workflow_state_path(trial_dir)
+			print(f"Saved correction set '{set_name}' to {saved_path} (total sets: {n_sets})")
+			try:
+				import tkinter as tk
+				from tkinter import messagebox
+				popup_root = tk.Tk()
+				popup_root.withdraw()
+				popup_root.attributes("-topmost", True)
+				messagebox.showinfo(
+					title="Correction Set Saved",
+					message=(
+						f"Saved set '{set_name}' to:\n{saved_path}\n\n"
+						f"Total saved sets: {n_sets}"
+					),
+					parent=popup_root,
+				)
+				popup_root.destroy()
+			except Exception:
+				pass
+			_open_correction_subset_view(set_name, frames, trial_dir)
 		except Exception as exc:
+			import traceback
 			print(f"Correction export failed: {exc}")
+			traceback.print_exc()
+			try:
+				import tkinter as tk
+				from tkinter import messagebox
+				popup_root = tk.Tk()
+				popup_root.withdraw()
+				popup_root.attributes("-topmost", True)
+				messagebox.showerror(
+					title="Save Correction Frames Failed",
+					message=str(exc),
+					parent=popup_root,
+				)
+				popup_root.destroy()
+			except Exception:
+				pass
 
 	def _prompt_open_existing_active_updates() -> None:
 		available_sets = _list_active_update_sets()
@@ -4052,7 +4378,7 @@ def make_postanalysis_overlay_popout(
 			return
 
 		message = (
-			f"Found {len(available_sets)} correction set(s) in active_updates under:\n"
+			f"Found {len(available_sets)} correction set(s) in {WORKFLOW_STATE_FILE} under:\n"
 			f"{state.pred_root}\n\n"
 			"Open Correction Tab now?"
 		)
