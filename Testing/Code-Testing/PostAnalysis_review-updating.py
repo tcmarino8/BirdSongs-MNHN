@@ -2981,7 +2981,7 @@ def make_postanalysis_overlay_popout(
 		btn_finish_corrections = Button(ax_finish_corrections, "Are you finished correcting?")
 		check_bulk_snap = CheckButtons(ax_bulk_snap, ["Auto snap frame"], [False])
 		radio_snap_mode = RadioButtons(ax_snap_mode, ["blob", "darkest"], active=0)
-		radio_prediction_source = RadioButtons(ax_prediction_source, ["Current", "Prior frame"], active=0)
+		radio_prediction_source = RadioButtons(ax_prediction_source, ["Current", "Prior frame", "Next frame"], active=0)
 		_add_info_bubble(ax_info_updating, 
 				   "Correct and Update the Training Data: \n--The Buttons above allow for rapid labeling.\n--Selecting snap to darkest pixel or closest blob will help existing predictions arrive at the center of the marker.\n--Pulling information from the previous frame will allow you to carry over locational information from the previous frame to help you label the current frame.",
 				   figure=review_fig)
@@ -3289,6 +3289,51 @@ def make_postanalysis_overlay_popout(
 			if bool(autosave):
 				_autosave_corrections()
 
+		def _previous_selected_frame(frame_pos: int) -> int | None:
+			ordered = [int(v) for v in export_frames]
+			if not ordered:
+				return None
+			if int(frame_pos) in ordered:
+				idx = int(ordered.index(int(frame_pos)))
+				return int(ordered[idx - 1]) if idx > 0 else None
+			previous = [v for v in ordered if v < int(frame_pos)]
+			return int(previous[-1]) if previous else None
+
+		def _next_selected_frame(frame_pos: int) -> int | None:
+			ordered = [int(v) for v in export_frames]
+			if not ordered:
+				return None
+			if int(frame_pos) in ordered:
+				idx = int(ordered.index(int(frame_pos)))
+				return int(ordered[idx + 1]) if idx < len(ordered) - 1 else None
+			next_vals = [v for v in ordered if v > int(frame_pos)]
+			return int(next_vals[0]) if next_vals else None
+
+		def _selected_reference_frame(frame_pos: int) -> int | None:
+			source_mode = str(radio_prediction_source.value_selected)
+			if source_mode == "Prior frame":
+				return _previous_selected_frame(int(frame_pos))
+			if source_mode == "Next frame":
+				return _next_selected_frame(int(frame_pos))
+			return None
+
+		def _point_xy_for_frame(frame_pos: int, camera_name: str, bodypart_name: str) -> tuple[float, float] | None:
+			key = (int(frame_pos), str(camera_name), str(bodypart_name))
+			if key in correction_cache:
+				return correction_cache[key]
+
+			pts_ref = _pred_points(str(camera_name), int(frame_pos))
+			if pts_ref.empty:
+				return None
+			match = pts_ref[pts_ref["bodypart"].astype(str) == str(bodypart_name)]
+			if match.empty:
+				return None
+			x_ref = float(pd.to_numeric(match.iloc[0]["x"], errors="coerce"))
+			y_ref = float(pd.to_numeric(match.iloc[0]["y"], errors="coerce"))
+			if not (np.isfinite(x_ref) and np.isfinite(y_ref)):
+				return None
+			return x_ref, y_ref
+
 			# New feature for similar frame corrections!
 		def _get_prediction(
 			frame_pos: int,
@@ -3297,23 +3342,15 @@ def make_postanalysis_overlay_popout(
 			pred_row: pd.Series,
 		) -> tuple[float, float]:
 
-			use_previous = (
-				radio_prediction_source.value_selected == "Prior frame"
-			)
-
-			#
-			# PRIOR FRAME
-			#
-			if use_previous and frame_pos > 0:
-
-				prev_key = (
-					frame_pos - 1,
-					camera_name,
-					bodypart_name,
+			ref_selected = _selected_reference_frame(int(frame_pos))
+			if ref_selected is not None:
+				ref_xy = _point_xy_for_frame(
+					frame_pos=int(ref_selected),
+					camera_name=str(camera_name),
+					bodypart_name=str(bodypart_name),
 				)
-				# print(prev_key)
-				if prev_key in correction_cache:
-					return correction_cache[prev_key]
+				if ref_xy is not None:
+					return ref_xy
 
 			#
 			# CURRENT FRAME (existing behaviour)
@@ -3338,26 +3375,24 @@ def make_postanalysis_overlay_popout(
 			return (mode,)
 
 		def _snap_to_dark_pixel(frame_pos: int, camera_name: str, bodypart_name: str, x_val: float, y_val: float) -> tuple[float, float]:
-			use_previous = (
-				radio_prediction_source.value_selected == "Prior frame"
-			)
-			# PRIOR FRAME
-			if use_previous and frame_pos > 0:
-				frame_pos = frame_pos - 1
-			else:
-				frame_pos = frame_pos
+			target_frame_pos = int(frame_pos)
+			context_frame_pos = int(frame_pos)
+			ref_selected = _selected_reference_frame(int(frame_pos))
+			if ref_selected is not None:
+				context_frame_pos = int(ref_selected)
+
 			images = state.images_by_cam.get(camera_name, [])
-			if not (0 <= int(frame_pos) < len(images)):
+			if not (0 <= int(context_frame_pos) < len(images)):
 				return float(x_val), float(y_val)
 
-			with Image.open(images[int(frame_pos)]) as image_file:
+			with Image.open(images[int(context_frame_pos)]) as image_file:
 				gray_img = np.asarray(image_file.convert("L"))
 
-			key = (int(frame_pos), str(camera_name), str(bodypart_name))
+			key = (int(target_frame_pos), str(camera_name), str(bodypart_name))
 			occupied_pixels: set[tuple[int, int]] = {
 				(rr, cc)
 				for (fpos, cam_name, bp_name), (rr, cc) in correction_pixel_index.items()
-				if int(fpos) == int(frame_pos) and str(cam_name) == str(camera_name) and str(bp_name) != str(bodypart_name)
+				if int(fpos) == int(target_frame_pos) and str(cam_name) == str(camera_name) and str(bp_name) != str(bodypart_name)
 			}
 
 			if key in correction_pixel_index:
@@ -3757,9 +3792,13 @@ def make_postanalysis_overlay_popout(
 
 		def _on_apply_frame(_event: Any) -> None:
 			nonlocal last_bulk_apply_signature
+			source_mode = str(radio_prediction_source.value_selected)
+			used_reference_source = source_mode in {"Prior frame", "Next frame"}
 			frame_pos = int(slider_review.val)
 			updated = _apply_snap_to_entire_frame(frame_pos)
 			last_bulk_apply_signature = (int(frame_pos), str(radio_snap_mode.value_selected))
+			if used_reference_source:
+				radio_prediction_source.set_active(0)
 			print(f"Bulk frame snap: updated {updated} points on frame {frame_pos}.")
 			_redraw_review()
 
