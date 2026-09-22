@@ -57,6 +57,183 @@ WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _default_model_zoo_dir() -> Path:
+	"""Resolve the model-zoo root, preferring environment overrides and the local project folder."""
+	for env_name in ("MODEL_ZOO_DIR", "TYLERML_MODEL_ZOO_DIR", "MODEL_ZOO"):
+		env_value = os.environ.get(env_name)
+		if env_value:
+			return Path(env_value).expanduser()
+
+	local_candidates = [
+		PROJECT_ROOT / "Model_Zoo",
+		PROJECT_ROOT.parent / "Model_Zoo",
+		Path.home() / "Documents" / "MachineLearning" / "BirdSongs-MNHN" / "Testing" / "Model_Zoo",
+	]
+	for candidate in local_candidates:
+		if candidate.exists():
+			return candidate
+	return PROJECT_ROOT / "Model_Zoo"
+
+
+def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
+	"""Prompt the user to select the model-zoo root folder for the current machine."""
+	try:
+		import tkinter as tk
+		from tkinter import filedialog, messagebox
+	except Exception as exc:
+		raise RuntimeError(
+			"GUI file picker is unavailable. Provide the model-zoo path through MODEL_ZOO_DIR."
+		) from exc
+
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+	messagebox.showinfo(
+		title=title,
+		message=(
+			"Select the folder that contains your bird model directories, such as:\n\n"
+			"Model_Zoo/DB_15_17_Trained\n"
+			"or\n"
+			"Model_Zoo/DavidBowie/Trials15-17"
+		),
+		parent=root,
+	)
+	folder_path = filedialog.askdirectory(title=title, parent=root)
+	root.destroy()
+
+	if not folder_path:
+		raise RuntimeError(f"No folder selected for: {title}")
+	return Path(folder_path)
+
+
+def _resolve_model_zoo_root(prompt_if_missing: bool = False) -> Path:
+	root = _default_model_zoo_dir()
+	if root.exists() and any(p.is_dir() for p in root.iterdir()):
+		return root
+	if prompt_if_missing:
+		return _choose_model_zoo_directory()
+	return root
+
+
+def _snapshot_sort_key(path: Path) -> tuple[int, float]:
+	match = re.search(r"snapshot-(\d+)", path.name)
+	snapshot_num = int(match.group(1)) if match else -1
+	return (snapshot_num, path.stat().st_mtime)
+
+
+def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> tuple[Path | None, Path | None]:
+	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
+	bird_dir = root / str(bird_name)
+	if not bird_dir.exists() or not bird_dir.is_dir():
+		return None, None
+
+	snapshot_candidates = sorted(bird_dir.rglob("snapshot-*.pt"), key=_snapshot_sort_key, reverse=True)
+	if not snapshot_candidates:
+		return None, None
+
+	latest_snapshot = snapshot_candidates[0]
+	config_candidates = sorted(bird_dir.rglob("config.yaml"), key=lambda p: len(p.relative_to(bird_dir).parts))
+	config_path = config_candidates[0] if config_candidates else None
+	return config_path, latest_snapshot
+
+
+def register_model_in_zoo(
+	bird: str,
+	original_trial: int,
+	new_trial: int,
+	config_path: str | Path | None = None,
+	snapshot_path: str | Path | None = None,
+	model_zoo_root: str | Path | None = None,
+) -> Path:
+	"""Copy a trained model into the selected model-zoo root under Bird/Trials{orig}-{new}."""
+	root = Path(model_zoo_root) if model_zoo_root is not None else _resolve_model_zoo_root(prompt_if_missing=True)
+	bird_dir = root / str(bird)
+	bird_dir.mkdir(parents=True, exist_ok=True)
+
+	trial_label = f"Trials{int(original_trial)}-{int(new_trial)}"
+	target_dir = bird_dir / trial_label
+	if target_dir.exists():
+		counter = 1
+		while True:
+			candidate = bird_dir / f"{trial_label}_v{counter}"
+			if not candidate.exists():
+				target_dir = candidate
+				break
+			counter += 1
+		target_dir.mkdir(parents=True, exist_ok=True)
+	else:
+		target_dir.mkdir(parents=True, exist_ok=True)
+
+	config_source = Path(config_path).resolve() if config_path is not None else None
+	if config_source is not None and config_source.exists():
+		copy_target = target_dir / config_source.name
+		if copy_target.exists():
+			copy_target.unlink()
+		shutil.copy2(config_source, copy_target)
+
+	snapshot_source = Path(snapshot_path).resolve() if snapshot_path is not None else None
+	if snapshot_source is not None and snapshot_source.exists():
+		model_root = None
+		for candidate in (snapshot_source.parent, *snapshot_source.parents):
+			config_candidate = candidate / "config.yaml"
+			if config_candidate.exists():
+				model_root = candidate
+				break
+		if model_root is None and config_source is not None:
+			model_root = config_source.parent
+		if model_root is not None:
+			copy_model_dir = target_dir / model_root.name
+			if copy_model_dir.exists():
+				shutil.rmtree(copy_model_dir)
+			shutil.copytree(model_root, copy_model_dir)
+		else:
+			copy_snapshot_target = target_dir / snapshot_source.name
+			if copy_snapshot_target.exists():
+				copy_snapshot_target.unlink()
+			shutil.copy2(snapshot_source, copy_snapshot_target)
+
+	return target_dir
+
+
+def _maybe_prompt_add_model_to_zoo(
+	bird: str,
+	original_trial: int,
+	new_trial: int,
+	config_path: str | Path | None = None,
+	snapshot_path: str | Path | None = None,
+) -> Path | None:
+	"""Ask whether a newly trained model should be added to the model-zoo."""
+	try:
+		import tkinter as tk
+		from tkinter import messagebox
+	except Exception:
+		return None
+
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+	should_store = bool(
+		messagebox.askyesno(
+			title="Add model to Model Zoo",
+			message=(
+				f"Add this trained model for {bird} to the model zoo as "
+				f"Trials{int(original_trial)}-{int(new_trial)}?"
+			),
+			parent=root,
+		)
+	)
+	root.destroy()
+	if not should_store:
+		return None
+	return register_model_in_zoo(
+		bird=bird,
+		original_trial=original_trial,
+		new_trial=new_trial,
+		config_path=config_path,
+		snapshot_path=snapshot_path,
+	)
+
+
 def _default_processingdata_base_dir() -> Path:
 	"""Resolve ProcessingData root across OSes, with env var override first."""
 	for env_name in ("POSTANALYSIS_BASE_DIR", "TYLERML_PROCESSINGDATA_DIR"):
@@ -96,45 +273,22 @@ def _resolve_processingdata_base_dir(base_dir: str | Path | None) -> Path:
 		return _default_processingdata_base_dir()
 	return Path(base_dir).expanduser()
 
-MODEL_ZOO = PROJECT_ROOT / "Model_Zoo"
+MODEL_ZOO = _resolve_model_zoo_root(prompt_if_missing=True)
 
 MODEL_DIRS = {
-    "DavidBowie": MODEL_ZOO / "DB_15_17_Trained",
-    "Tulio": MODEL_ZOO / "Tulio_10_05_Trained",
-    "Miguel": MODEL_ZOO / "Miguel_06_Trained",
-    "Endive": MODEL_ZOO / "Endive_42_Trained",
+    path.name: path
+    for path in sorted(MODEL_ZOO.iterdir(), key=lambda p: p.name.lower())
+    if path.is_dir()
 }
 
-# print(MODEL_DIRS)
-# Default inference configs associated with each bird.
-# Keep this map editable as birds/models change.
-BIRD_CONFIG_PATHS = {
-    "DavidBowie": MODEL_DIRS["DavidBowie"] / "Canari-FineTuner-2026-07-19" / "config.yaml",
-    "Tulio": MODEL_DIRS["Tulio"] / "Canari-FineTuner-2026-07-19" / "config.yaml",
-    "Miguel": MODEL_DIRS["Miguel"] / "Canari-FineTuner-2026-07-17" / "config.yaml",
-    "Endive": MODEL_DIRS["Endive"] / "Canari-FineTuner-2026-07-17" / "config.yaml",
-}
-
-
- # Default snapshots associated with each bird for fine-tuning.
-BIRD_SNAPSHOT_PATHS = {
-    "DavidBowie": MODEL_DIRS["DavidBowie"] / "Canari-FineTuner-2026-07-19" /
-                   "dlc-models-pytorch" / "iteration-0" /
-                   "CanariJul19-trainset95shuffle1" / "train" / "snapshot-125.pt",
-
-    "Tulio": MODEL_DIRS["Tulio"] / "Canari-FineTuner-2026-07-19" /
-              "dlc-models-pytorch" / "iteration-0" /
-              "CanariJul19-trainset95shuffle1" / "train" / "snapshot-125.pt",
-
-    "Miguel": MODEL_DIRS["Miguel"] / "Canari-FineTuner-2026-07-17" /
-               "dlc-models-pytorch" / "iteration-0" /
-               "CanariJul17-trainset95shuffle1" / "train" / "snapshot-125.pt",
-
-    "Endive": MODEL_DIRS["Endive"] / "Canari-FineTuner-2026-07-17" /
-               "dlc-models-pytorch" / "iteration-0" /
-               "CanariJul17-trainset95shuffle1" / "train" / "snapshot-125.pt",
-}
-# print(BIRD_SNAPSHOT_PATHS)
+BIRD_CONFIG_PATHS: dict[str, Path] = {}
+BIRD_SNAPSHOT_PATHS: dict[str, Path] = {}
+for bird_name, bird_dir in MODEL_DIRS.items():
+    config_path, snapshot_path = _find_best_model_paths_for_bird(bird_name, MODEL_ZOO)
+    if config_path is not None:
+        BIRD_CONFIG_PATHS[bird_name] = config_path
+    if snapshot_path is not None:
+        BIRD_SNAPSHOT_PATHS[bird_name] = snapshot_path
 
 
 def _load_data_converter_module() -> Any:
@@ -1600,11 +1754,23 @@ def train_update_model(
 		f"\nElapsed: {elapsed:.1f} sec ({elapsed / 60:.1f} min)"
 	)
 
+	snapshot_candidates = sorted(combined_config.parent.rglob("snapshot-*.pt"), key=_snapshot_sort_key, reverse=True)
+	latest_snapshot = snapshot_candidates[0] if snapshot_candidates else None
+	model_zoo_path = _maybe_prompt_add_model_to_zoo(
+		bird=bird,
+		original_trial=trial_num,
+		new_trial=trial_num,
+		config_path=combined_config,
+		snapshot_path=latest_snapshot,
+	)
+
 	return {
 		"bird": bird,
 		"trial": trial_num,
 		"update_set": set_name if use_json_set else src_trial.name,
 		"config": combined_config,
+		"snapshot": latest_snapshot,
+		"model_zoo_path": str(model_zoo_path) if model_zoo_path is not None else None,
 		"elapsed_seconds": elapsed,
 	}
 
