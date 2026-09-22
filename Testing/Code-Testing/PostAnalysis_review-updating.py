@@ -1487,6 +1487,389 @@ def correct_frames_from_df_fast(
 	return df_corrected
 
 
+def _find_training_labels_csv(trial_dir: Path) -> Path:
+	"""Resolve the labels CSV used for training from a trial folder."""
+	candidates = [
+		trial_dir / "UpdatedLabels-2Dpoints.csv",
+		trial_dir / "labeledBodyPartsCoordinates.csv",
+		trial_dir / "data" / "corrections_autosave.csv",
+	]
+	for candidate in candidates:
+		if candidate.exists() and candidate.is_file():
+			return candidate
+
+	pattern_candidates = sorted([p for p in trial_dir.glob("*2Dpoints*.csv") if p.is_file()])
+	if pattern_candidates:
+		return pattern_candidates[0]
+
+	raise FileNotFoundError(f"Could not find training labels CSV in: {trial_dir}")
+
+
+def _parse_trial_numbers(trials_text: str) -> list[int]:
+	"""Parse comma/space-separated trial numbers into a sorted unique list."""
+	parts = re.split(r"[,\s]+", str(trials_text).strip())
+	vals: list[int] = []
+	for token in parts:
+		if not token:
+			continue
+		match = re.search(r"(\d+)", token)
+		if match is None:
+			continue
+		vals.append(int(match.group(1)))
+	if not vals:
+		raise ValueError("No valid trial numbers were provided.")
+	return sorted(set(vals))
+
+
+def _copy_trial_into_combined_training_set(
+	src_trial: Path,
+	dst_trial: Path,
+	frame_indices: list[int] | None = None,
+) -> dict[str, Any]:
+	"""Copy one trial's Cam1/Cam2 image stacks plus labels CSV into a normalized training layout."""
+	cam1_src = src_trial / "Cam1"
+	cam2_src = src_trial / "Cam2"
+	if not cam1_src.is_dir() or not cam2_src.is_dir():
+		raise FileNotFoundError(f"Missing Cam1/Cam2 folders in trial: {src_trial}")
+
+	labels_src = _find_training_labels_csv(src_trial)
+	labels_df = pd.read_csv(labels_src)
+	coord_cols = [c for c in labels_df.columns if re.search(r"_cam[12]_[XY]$", str(c))]
+	if coord_cols:
+		labels_df = labels_df[coord_cols].copy()
+
+	cam1_images = collect_images(cam1_src)
+	cam2_images = collect_images(cam2_src)
+	if not cam1_images or not cam2_images:
+		raise FileNotFoundError(f"No images found in Cam1/Cam2 for trial: {src_trial}")
+
+	n_rows = int(len(labels_df.index))
+	max_frames = int(min(n_rows, len(cam1_images), len(cam2_images)))
+	if frame_indices is not None:
+		requested = sorted({int(i) for i in frame_indices if np.isfinite(pd.to_numeric(i, errors="coerce"))})
+		requested = [idx for idx in requested if 0 <= int(idx) < int(max_frames)]
+		if requested:
+			labels_df = labels_df.iloc[requested].reset_index(drop=True)
+			cam1_images = [cam1_images[idx] for idx in requested]
+			cam2_images = [cam2_images[idx] for idx in requested]
+
+	n_frames = int(min(len(labels_df.index), len(cam1_images), len(cam2_images)))
+	if n_frames <= 0:
+		raise ValueError(f"Trial has no usable paired rows/images: {src_trial}")
+
+	labels_df = labels_df.iloc[:n_frames].reset_index(drop=True)
+	cam1_images = cam1_images[:n_frames]
+	cam2_images = cam2_images[:n_frames]
+
+	dst_cam1 = dst_trial / "Cam1"
+	dst_cam2 = dst_trial / "Cam2"
+	dst_cam1.mkdir(parents=True, exist_ok=True)
+	dst_cam2.mkdir(parents=True, exist_ok=True)
+
+	for idx, image_path in enumerate(cam1_images):
+		out_name = f"{src_trial.name}_cam1_{idx:06d}{image_path.suffix.lower()}"
+		shutil.copy2(image_path, dst_cam1 / out_name)
+	for idx, image_path in enumerate(cam2_images):
+		out_name = f"{src_trial.name}_cam2_{idx:06d}{image_path.suffix.lower()}"
+		shutil.copy2(image_path, dst_cam2 / out_name)
+
+	labels_out = dst_trial / "UpdatedLabels-2Dpoints.csv"
+	labels_df.to_csv(labels_out, index=False)
+
+	return {
+		"trial_dir": str(src_trial),
+		"labels_src": str(labels_src),
+		"labels_rows": int(n_rows),
+		"copied_frames": int(n_frames),
+	}
+
+
+def _frames_from_correction_set(trial_dir: Path, set_name: str) -> list[int]:
+	"""Get frame indices from a saved correction set in workflow JSON."""
+	entry = _get_correction_set(trial_dir, str(set_name))
+	if not isinstance(entry, dict):
+		return []
+
+	frames_raw = entry.get("frames", [])
+	frames = sorted({int(x) for x in frames_raw if np.isfinite(pd.to_numeric(x, errors="coerce"))})
+	if frames:
+		return frames
+
+	refs = entry.get("frame_refs", [])
+	if isinstance(refs, list):
+		ref_frames = sorted(
+			{
+				int(pd.to_numeric(item.get("row_index", item.get("frame_pos")), errors="coerce"))
+				for item in refs
+				if isinstance(item, dict)
+				and np.isfinite(pd.to_numeric(item.get("row_index", item.get("frame_pos")), errors="coerce"))
+			}
+		)
+		if ref_frames:
+			return ref_frames
+
+	return []
+
+
+def _prompt_multi_trial_training_inputs(
+	default_bird: str | None,
+	base_dir: Path,
+) -> dict[str, Any] | None:
+	"""Prompt for bird, trials, method, nframes, and epochs for multi-trial training."""
+	try:
+		import tkinter as tk
+		from tkinter import messagebox, simpledialog
+	except Exception as exc:
+		raise RuntimeError("Tkinter prompts are required for multi-trial training.") from exc
+
+	birds = sorted([d.name for d in base_dir.iterdir() if d.is_dir()])
+	if not birds:
+		raise FileNotFoundError(f"No bird folders found under: {base_dir}")
+
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+
+	bird_guess = default_bird if default_bird in birds else birds[0]
+	bird = simpledialog.askstring(
+		"Multi-Trial Training",
+		"Which bird?\n\nAvailable birds:\n" + "\n".join(birds),
+		initialvalue=str(bird_guess),
+		parent=root,
+	)
+	if bird is None:
+		root.destroy()
+		return None
+	bird = str(bird).strip()
+	if bird not in birds:
+		root.destroy()
+		raise ValueError(f"Bird '{bird}' is not available under {base_dir}")
+
+	trial_dirs = sorted((base_dir / bird).glob("Trial*"))
+	available_trials: list[int] = []
+	for trial_path in trial_dirs:
+		match = re.fullmatch(r"Trial(\d+)", trial_path.name, flags=re.IGNORECASE)
+		if match is not None:
+			available_trials.append(int(match.group(1)))
+	if not available_trials:
+		root.destroy()
+		raise FileNotFoundError(f"No Trial* folders were found for bird '{bird}'.")
+
+	trials_text = simpledialog.askstring(
+		"Multi-Trial Training",
+		"Which trials? Enter comma-separated numbers, e.g. 15,17\n\n"
+		+ f"Available: {', '.join(str(t) for t in available_trials)}",
+		initialvalue=",".join(str(t) for t in available_trials[: min(2, len(available_trials))]),
+		parent=root,
+	)
+	if trials_text is None:
+		root.destroy()
+		return None
+
+	selected_trials = _parse_trial_numbers(trials_text)
+	missing_trials = [t for t in selected_trials if t not in available_trials]
+	if missing_trials:
+		root.destroy()
+		raise ValueError(f"Trials not found for {bird}: {missing_trials}")
+
+	method = simpledialog.askstring(
+		"Sampling Method",
+		"Sampling method (random / displacement / dino):",
+		initialvalue="random",
+		parent=root,
+	)
+	if method is None:
+		root.destroy()
+		return None
+	method = str(method).strip().lower()
+	if method not in {"random", "displacement", "dino"}:
+		root.destroy()
+		raise ValueError("Sampling method must be one of: random, displacement, dino.")
+
+	suggested_nframes = int(100 * len(selected_trials))
+	nframes = simpledialog.askinteger(
+		"Frames To Select",
+		f"How many frames to select for training?\n\nHint: try {suggested_nframes} (100 x {len(selected_trials)} trials)",
+		initialvalue=suggested_nframes,
+		minvalue=1,
+		parent=root,
+	)
+	if nframes is None:
+		root.destroy()
+		return None
+
+	epochs = simpledialog.askinteger(
+		"Training Epochs",
+		"Number of epochs:",
+		initialvalue=100,
+		minvalue=1,
+		parent=root,
+	)
+	if epochs is None:
+		root.destroy()
+		return None
+
+	confirmed = bool(
+		messagebox.askyesno(
+			title="Confirm Multi-Trial Training",
+			message=(
+				f"Bird: {bird}\n"
+				f"Trials: {selected_trials}\n"
+				f"Method: {method}\n"
+				f"Frames: {int(nframes)}\n"
+				f"Epochs: {int(epochs)}\n\n"
+				"Start training now?"
+			),
+			parent=root,
+		)
+	)
+	root.destroy()
+	if not confirmed:
+		return None
+
+	return {
+		"bird": bird,
+		"trials": [int(t) for t in selected_trials],
+		"sampling_method": method,
+		"nframes": int(nframes),
+		"epochs": int(epochs),
+	}
+
+
+def train_multiple_trials(
+	bird: str,
+	trial_nums: list[int],
+	sampling_method: str,
+	nframes: int,
+	epochs: int = 100,
+	frame_selection_seed: int = 42,
+	task: str = "Canari",
+	experimenter: str = "Tyler",
+	finetune_experimenter: str = "FineTuner",
+	base_dir: str | Path | None = None,
+	snapshot_path: str | Path | None = None,
+) -> dict[str, Any]:
+	"""Train a DLC model from multiple full trials merged into one temporary dataset root."""
+	base = _resolve_processingdata_base_dir(base_dir)
+	trial_list = sorted({int(t) for t in trial_nums})
+	if not trial_list:
+		raise ValueError("At least one trial is required for multi-trial training.")
+
+	method = str(sampling_method).strip().lower()
+	if method not in {"random", "displacement", "dino"}:
+		raise ValueError("sampling_method must be one of: random, displacement, dino")
+
+	bird_dir = base / str(bird)
+	if not bird_dir.exists():
+		raise FileNotFoundError(f"Bird folder not found: {bird_dir}")
+
+	trial_dirs: list[Path] = []
+	for trial_num in trial_list:
+		trial_dir = bird_dir / f"Trial{int(trial_num)}"
+		if not trial_dir.exists():
+			raise FileNotFoundError(f"Trial folder not found: {trial_dir}")
+		trial_dirs.append(trial_dir)
+
+	trial_label = "-".join(str(t) for t in trial_list)
+	multi_root = bird_dir / "multi_trial_training" / f"{method}_train" / f"Trials{trial_label}" / f"nframes_{int(nframes)}"
+	models_dir = multi_root / "ModelsToTune"
+	models_dir.mkdir(parents=True, exist_ok=True)
+
+	dummy_video = trial_dirs[0] / "Cam1.avi"
+	if not dummy_video.exists():
+		raise FileNotFoundError(
+			f"Missing dummy video for project creation: {dummy_video}. "
+			"Create Cam1.avi for the first selected trial, then retry."
+		)
+
+	combined_config = dlcs.create_combined_project_if_missing(
+		task=task,
+		experimenter=finetune_experimenter,
+		combined_project_root=models_dir,
+		dummy_video=dummy_video,
+	)
+	dlcs.apply_bird_bodyparts_to_configs({bird: [combined_config]}, strict=True)
+
+	temp_combined_data = multi_root / "_combined_data_tmp"
+	if temp_combined_data.exists():
+		shutil.rmtree(temp_combined_data)
+	temp_combined_data.mkdir(parents=True, exist_ok=True)
+
+	copy_summary: list[dict[str, Any]] = []
+	cleaned_tmp = False
+	try:
+		for src_trial in trial_dirs:
+			dst_trial = temp_combined_data / src_trial.name
+			method_frames: list[int] | None = None
+			if method in {"displacement", "dino"}:
+				candidate_frames = _frames_from_correction_set(src_trial, method)
+				if candidate_frames:
+					method_frames = candidate_frames
+				else:
+					print(
+						f"No saved '{method}' correction set found for {src_trial.name}; "
+						"falling back to full-trial frames."
+					)
+			summary = _copy_trial_into_combined_training_set(src_trial, dst_trial, frame_indices=method_frames)
+			copy_summary.append(summary)
+
+		dataset_name = f"MultiTrial_{bird}_Trials{trial_label}_{method}"
+		dlcs.build_combined_dataset(
+			combined_config=combined_config,
+			data_path=temp_combined_data,
+			dataset_name=dataset_name,
+			experimenter=experimenter,
+			nframes=int(nframes),
+			frame_selection_seed=int(frame_selection_seed),
+		)
+
+		if snapshot_path is None:
+			snapshot_path = BIRD_SNAPSHOT_PATHS.get(str(bird))
+
+		t0 = time.perf_counter()
+		if snapshot_path is not None and Path(snapshot_path).exists():
+			dlcs.create_and_train(
+				config_path=combined_config,
+				epochs=int(epochs),
+				snapshot_path=str(snapshot_path),
+			)
+		else:
+			dlcs.create_and_train(
+				config_path=combined_config,
+				epochs=int(epochs),
+			)
+		elapsed = float(time.perf_counter() - t0)
+	finally:
+		if temp_combined_data.exists():
+			shutil.rmtree(temp_combined_data, ignore_errors=True)
+		cleaned_tmp = not temp_combined_data.exists()
+
+	snapshot_candidates = sorted(combined_config.parent.rglob("snapshot-*.pt"), key=_snapshot_sort_key, reverse=True)
+	latest_snapshot = snapshot_candidates[0] if snapshot_candidates else None
+	model_zoo_path = _maybe_prompt_add_model_to_zoo(
+		bird=str(bird),
+		original_trial=int(min(trial_list)),
+		new_trial=int(max(trial_list)),
+		config_path=combined_config,
+		snapshot_path=latest_snapshot,
+	)
+
+	return {
+		"bird": str(bird),
+		"trials": [int(t) for t in trial_list],
+		"sampling_method": method,
+		"nframes": int(nframes),
+		"epochs": int(epochs),
+		"config": combined_config,
+		"snapshot": latest_snapshot,
+		"model_zoo_path": str(model_zoo_path) if model_zoo_path is not None else None,
+		"output_root": multi_root,
+		"copy_summary": copy_summary,
+		"temp_combined_deleted": bool(cleaned_tmp),
+		"elapsed_seconds": elapsed,
+	}
+
+
 def train_update_model(
 	bird: str,
 	trial_num: int,
@@ -2104,6 +2487,7 @@ def make_postanalysis_overlay_popout(
 	ax_window_end = fig.add_axes([0.905, 0.685, 0.075, 0.03])
 	ax_color_mode = fig.add_axes([0.82, 0.25, 0.16, 0.08])
 	ax_selection_info = fig.add_axes([0.82, 0.005, 0.16, 0.035])
+	ax_multi_train = fig.add_axes([0.01, 0.01, 0.22, 0.04])
 	ax_info_frame = fig.add_axes([0, 0.255, 0.022, 0.035])
 	# ax_info_like = fig.add_axes([0.045, 0.205, 0.022, 0.035])
 	ax_info_nframes = fig.add_axes([0.79, 0.345, 0.022, 0.035])
@@ -2117,6 +2501,7 @@ def make_postanalysis_overlay_popout(
 	btn_select_displacement = Button(ax_select_displacement, "Select Displacement")
 	btn_select_dino = Button(ax_select_dino, "Select DINO Frames")
 	btn_correction = Button(ax_correction, "Save Correction Frames")
+	btn_multi_train = Button(ax_multi_train, "Train on multiple trials")
 	# button_use_previous = Button(
 	# 	description="Use Prior Frame",
 	# 	button_style="info",
@@ -2203,6 +2588,7 @@ def make_postanalysis_overlay_popout(
 		ax_window_end.set_position([right_x + right_w * 0.60, 0.685, right_w * 0.50, 0.03])
 		ax_color_mode.set_position([right_x, 0.25, right_w, 0.08])
 		ax_selection_info.set_position([right_x, 0.005, right_w, 0.035])
+		ax_multi_train.set_position([0.01, 0.01, 0.22, 0.04])
 
 		ax_info_frame.set_position([0.0, 0.255, 0.022, 0.035])
 		# ax_info_like.set_position([left_info_x, 0.205, 0.022, 0.035])
@@ -2222,7 +2608,7 @@ def make_postanalysis_overlay_popout(
 		control_font = _scaled_font(fig, base_size=9.0, ref_w=12.2, ref_h=8.4, min_size=7.5, max_size=14.0)
 		value_font = _scaled_font(fig, base_size=8.5, ref_w=12.2, ref_h=8.4, min_size=7.0, max_size=13.0)
 
-		for btn in (btn_correction_tab, btn_switch_bird, btn_switch_trial, btn_select_random, btn_select_displacement, btn_select_dino, btn_correction, btn_prev, btn_next, btn_resample):
+		for btn in (btn_correction_tab, btn_switch_bird, btn_switch_trial, btn_select_random, btn_select_displacement, btn_select_dino, btn_correction, btn_multi_train, btn_prev, btn_next, btn_resample):
 			btn.label.set_fontsize(button_font)
 
 		for txt in check.labels:
@@ -4613,6 +4999,87 @@ def make_postanalysis_overlay_popout(
 			except Exception:
 				pass
 
+	def _on_train_multiple_trials(_event: Any) -> None:
+		try:
+			base_dir = _ensure_processing_root()
+			if base_dir is None:
+				raise RuntimeError("Could not resolve the ProcessingData base directory.")
+
+			params = _prompt_multi_trial_training_inputs(
+				default_bird=current_bird,
+				base_dir=Path(base_dir),
+			)
+			if params is None:
+				return
+
+			result = train_multiple_trials(
+				bird=str(params["bird"]),
+				trial_nums=[int(x) for x in params["trials"]],
+				sampling_method=str(params["sampling_method"]),
+				nframes=int(params["nframes"]),
+				epochs=int(params["epochs"]),
+				base_dir=Path(base_dir),
+			)
+
+			config_path = Path(result["config"])
+			snapshot_path = result.get("snapshot")
+			snapshot_text = str(snapshot_path) if snapshot_path is not None else "(not found)"
+			model_zoo_path = result.get("model_zoo_path")
+			model_zoo_text = str(model_zoo_path) if model_zoo_path else "(not saved)"
+			print(
+				"Multi-trial training complete"
+				f"\nBird: {result['bird']}"
+				f"\nTrials: {result['trials']}"
+				f"\nMethod: {result['sampling_method']}"
+				f"\nFrames sampled: {result['nframes']}"
+				f"\nConfig: {config_path}"
+				f"\nSnapshot: {snapshot_text}"
+				f"\nModel zoo save path: {model_zoo_text}"
+				f"\nTemp combined dataset deleted: {result['temp_combined_deleted']}"
+			)
+
+			try:
+				import tkinter as tk
+				from tkinter import messagebox
+				popup_root = tk.Tk()
+				popup_root.withdraw()
+				popup_root.attributes("-topmost", True)
+				messagebox.showinfo(
+					title="Multi-Trial Training Complete",
+					message=(
+						f"Bird: {result['bird']}\n"
+						f"Trials: {result['trials']}\n"
+						f"Method: {result['sampling_method']}\n"
+						f"Frames sampled: {result['nframes']}\n"
+						f"Model config:\n{config_path}\n\n"
+						f"Latest snapshot:\n{snapshot_text}\n\n"
+						f"Model zoo save path:\n{model_zoo_text}\n\n"
+						f"Temporary combined dataset deleted: {result['temp_combined_deleted']}"
+					),
+					parent=popup_root,
+				)
+				popup_root.destroy()
+			except Exception:
+				pass
+		except Exception as exc:
+			import traceback
+			print(f"Train on multiple trials failed: {exc}")
+			traceback.print_exc()
+			try:
+				import tkinter as tk
+				from tkinter import messagebox
+				popup_root = tk.Tk()
+				popup_root.withdraw()
+				popup_root.attributes("-topmost", True)
+				messagebox.showerror(
+					title="Train On Multiple Trials Failed",
+					message=str(exc),
+					parent=popup_root,
+				)
+				popup_root.destroy()
+			except Exception:
+				pass
+
 	def _prompt_open_existing_active_updates() -> None:
 		available_sets = _list_active_update_sets()
 		if not available_sets:
@@ -4658,6 +5125,7 @@ def make_postanalysis_overlay_popout(
 	btn_select_displacement.on_clicked(_on_select_displacement_frames)
 	btn_select_dino.on_clicked(_on_select_dino_frames)
 	btn_correction.on_clicked(_on_correction_export)
+	btn_multi_train.on_clicked(_on_train_multiple_trials)
 	btn_prev.on_clicked(_on_prev)
 	btn_next.on_clicked(_on_next)
 	btn_resample.on_clicked(_on_resample)
