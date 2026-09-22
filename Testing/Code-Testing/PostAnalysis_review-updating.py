@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import platform
 import re
 import shutil
 import time
@@ -53,6 +55,46 @@ WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _default_processingdata_base_dir() -> Path:
+	"""Resolve ProcessingData root across OSes, with env var override first."""
+	for env_name in ("POSTANALYSIS_BASE_DIR", "TYLERML_PROCESSINGDATA_DIR"):
+		env_value = os.environ.get(env_name)
+		if env_value:
+			return Path(env_value).expanduser()
+
+	workspace_processing = PROJECT_ROOT / "ProcessingData"
+	if workspace_processing.exists():
+		return workspace_processing
+
+	home = Path.home()
+	system = platform.system().lower()
+
+	if system == "windows":
+		legacy_windows = Path(
+			r"C:\Users\Salle-Cineradio\Documents\MachineLearning\BirdSongs-MNHN\Testing\ProcessingData"
+		)
+		if legacy_windows.exists():
+			return legacy_windows
+
+	if system == "darwin":
+		mac_candidate = home / "Documents" / "MachineLearning" / "BirdSongs-MNHN" / "Testing" / "ProcessingData"
+		if mac_candidate.exists():
+			return mac_candidate
+
+	linux_candidate = home / "Documents" / "MachineLearning" / "BirdSongs-MNHN" / "Testing" / "ProcessingData"
+	if linux_candidate.exists():
+		return linux_candidate
+
+	# Final fallback keeps behavior deterministic even if folders are created later.
+	return workspace_processing
+
+
+def _resolve_processingdata_base_dir(base_dir: str | Path | None) -> Path:
+	if base_dir is None:
+		return _default_processingdata_base_dir()
+	return Path(base_dir).expanduser()
 
 MODEL_ZOO = PROJECT_ROOT / "Model_Zoo"
 
@@ -1301,16 +1343,13 @@ def train_update_model(
 	task: str = "Canari",
 	experimenter: str = "Tyler",
 	finetune_experimenter: str = "FineTuner",
-	base_dir: str | Path = (
-		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
-		r"\BirdSongs-MNHN\Testing\ProcessingData"
-	),
+	base_dir: str | Path | None = None,
 	update_set: str | None = None,
 ) -> dict[str, Any]:
 	"""Create/update a DLC training dataset and train from saved correction-set data."""
 	import DLCsupport as dlcs
 
-	base_dir = Path(base_dir)
+	base_dir = _resolve_processingdata_base_dir(base_dir)
 	trial_dir = base_dir / bird / f"Trial{trial_num}"
 	set_name = str(update_set or "random")
 	correction_set = _get_correction_set(trial_dir, set_name)
@@ -1576,10 +1615,7 @@ def _predict_with_updated_model(
 	frame_boundary: list[int],
 	model_name: str = "ModelUpdateMonday",
 	batchsize: int = 16,
-	base_dir: str | Path = (
-		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
-		r"\BirdSongs-MNHN\Testing\ProcessingData"
-	),
+	base_dir: str | Path | None = None,
 	update_set: str | None = None,
 	# FIXME: fps needs to be added to the update inputs
 	fps = 500,
@@ -1590,7 +1626,7 @@ def _predict_with_updated_model(
 	dc = _load_data_converter_module()
 	import cv2 
 
-	base = Path(base_dir)
+	base = _resolve_processingdata_base_dir(base_dir)
 	trial_dir = base / bird / f"Trial{trial_num}"
 	set_name = str(update_set or "random")
 	if _get_correction_set(trial_dir, set_name) is not None:
@@ -1698,10 +1734,7 @@ def train_and_predict_from_corrections(
 	task: str = "Canari",
 	experimenter: str = "Tyler",
 	finetune_experimenter: str = "FineTuner",
-	base_path: str | Path = (
-		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
-		r"\BirdSongs-MNHN\Testing\ProcessingData"
-	),
+	base_path: str | Path | None = None,
 	update_set: str | None = None,
 	model_name: str = "ModelUpdateMonday",
 	batchsize: int = 16,
@@ -1746,10 +1779,7 @@ def _Train_and_Predict(
 	task: str = "Canari",
 	experimenter: str = "Tyler",
 	finetune_experimenter: str = "FineTuner",
-	base_path: str | Path = (
-		r"C:\Users\Salle-Cineradio\Documents\MachineLearning"
-		r"\BirdSongs-MNHN\Testing\ProcessingData"
-	),
+	base_path: str | Path | None = None,
 	update_set: str | None = None,
 	model_name: str = "ModelUpdateMonday",
 	batchsize: int = 16,
