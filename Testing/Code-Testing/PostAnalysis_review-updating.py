@@ -302,7 +302,7 @@ def _load_data_converter_module() -> Any:
 	module = importlib.util.module_from_spec(spec)
 	spec.loader.exec_module(module)
 	return module
-
+dc = _load_data_converter_module()
 
 def _workflow_state_path(trial_dir: str | Path) -> Path:
 	return Path(trial_dir) / WORKFLOW_STATE_FILE
@@ -404,6 +404,74 @@ def _save_frame_range(trial_dir: str | Path, start_frame: int, end_frame: int, s
 	data["frame_range"] = {"start": start_i, "end": end_i}
 	data["last_source"] = str(source)
 	_save_workflow_state(trial_dir, data)
+
+
+def _frame_indices_from_range(start_frame: int, end_frame: int) -> list[int]:
+	"""Build inclusive frame indices from a [start, end] range."""
+	start_i = int(start_frame)
+	end_i = int(end_frame)
+	if end_i < start_i:
+		start_i, end_i = end_i, start_i
+	return list(range(start_i, end_i + 1))
+
+
+def _prompt_trial_frame_range_if_missing_workflow(
+	trial_dir: Path,
+	default_end: int = 1000,
+) -> list[int] | None:
+	"""If workflow JSON is missing, optionally prompt for a manual frame range for this trial."""
+	if _workflow_state_path(trial_dir).exists():
+		return None
+
+	try:
+		import tkinter as tk
+		from tkinter import messagebox, simpledialog
+	except Exception:
+		return None
+
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+
+	use_manual = bool(
+		messagebox.askyesno(
+			title="Missing Workflow File",
+			message=(
+				f"{WORKFLOW_STATE_FILE} was not found for:\n{trial_dir.name}\n\n"
+				"Do you want to specify a frame/page range for this trial?"
+			),
+			parent=root,
+		)
+	)
+	if not use_manual:
+		root.destroy()
+		return None
+
+	start_frame = simpledialog.askinteger(
+		"Frame/Page Range",
+		f"Start frame for {trial_dir.name}:",
+		initialvalue=0,
+		minvalue=0,
+		parent=root,
+	)
+	if start_frame is None:
+		root.destroy()
+		return None
+
+	end_default = max(int(start_frame), int(default_end))
+	end_frame = simpledialog.askinteger(
+		"Frame/Page Range",
+		f"End frame for {trial_dir.name} (inclusive):",
+		initialvalue=end_default,
+		minvalue=0,
+		parent=root,
+	)
+	root.destroy()
+	if end_frame is None:
+		return None
+
+	_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="train_multiple_trials_prompt")
+	return _frame_indices_from_range(int(start_frame), int(end_frame))
 
 
 def find_darkest_pixel(
@@ -1498,7 +1566,7 @@ def _find_training_labels_csv(trial_dir: Path) -> Path:
 		if candidate.exists() and candidate.is_file():
 			return candidate
 
-	pattern_candidates = sorted([p for p in trial_dir.glob("*2Dpoints*.csv") if p.is_file()])
+	pattern_candidates = sorted([p for p in trial_dir.glob("*.csv") if p.is_file()])
 	if pattern_candidates:
 		return pattern_candidates[0]
 
@@ -1776,11 +1844,34 @@ def train_multiple_trials(
 	models_dir.mkdir(parents=True, exist_ok=True)
 
 	dummy_video = trial_dirs[0] / "Cam1.avi"
-	if not dummy_video.exists():
-		raise FileNotFoundError(
-			f"Missing dummy video for project creation: {dummy_video}. "
-			"Create Cam1.avi for the first selected trial, then retry."
+	cam1_dir = trial_dirs[0]/ "Cam1"
+	print(cam1_dir)
+	first_trial_range = _load_saved_frame_range(trial_dirs[0])
+	if first_trial_range is None:
+		first_trial_frame_count = len([p for p in cam1_dir.iterdir() if p.is_file() and p.suffix.lower() == ".jpg"])
+		manual_first = _prompt_trial_frame_range_if_missing_workflow(
+			trial_dirs[0],
+			default_end=max(0, first_trial_frame_count - 1),
 		)
+		if manual_first:
+			start_frame, end_frame = int(manual_first[0]), int(manual_first[-1])
+		else:
+			start_frame, end_frame = int(0), int(max(0, first_trial_frame_count - 1))
+	else:
+		start_frame, end_frame = int(first_trial_range[0]), int(first_trial_range[1])
+
+			
+			
+	if not dummy_video.exists():
+		dc.jpg_stack_to_avi(
+			input_folder=cam1_dir,
+			output_path=dummy_video,
+			fps=int(500),
+			start_frame=int(start_frame),
+			end_frame=int(end_frame),
+		)
+	
+
 
 	combined_config = dlcs.create_combined_project_if_missing(
 		task=task,
@@ -1800,15 +1891,37 @@ def train_multiple_trials(
 	try:
 		for src_trial in trial_dirs:
 			dst_trial = temp_combined_data / src_trial.name
-			method_frames: list[int] | None = None
+			trial_range_frames: list[int] | None = None
+			saved_range = _load_saved_frame_range(src_trial)
+			if saved_range is not None:
+				trial_range_frames = _frame_indices_from_range(saved_range[0], saved_range[1])
+			else:
+				cam1_images = collect_images(src_trial / "Cam1")
+				trial_range_frames = _prompt_trial_frame_range_if_missing_workflow(
+					src_trial,
+					default_end=max(0, len(cam1_images) - 1),
+				)
+
+			method_frames: list[int] | None = trial_range_frames
 			if method in {"displacement", "dino"}:
 				candidate_frames = _frames_from_correction_set(src_trial, method)
 				if candidate_frames:
-					method_frames = candidate_frames
+					if trial_range_frames is not None:
+						allowed = set(trial_range_frames)
+						intersected = [idx for idx in candidate_frames if idx in allowed]
+						if intersected:
+							method_frames = intersected
+						else:
+							print(
+								f"No overlap between saved '{method}' correction set and frame range for {src_trial.name}; "
+								"falling back to frame-range/full-trial frames."
+							)
+					else:
+						method_frames = candidate_frames
 				else:
 					print(
 						f"No saved '{method}' correction set found for {src_trial.name}; "
-						"falling back to full-trial frames."
+						"falling back to frame-range/full-trial frames."
 					)
 			summary = _copy_trial_into_combined_training_set(src_trial, dst_trial, frame_indices=method_frames)
 			copy_summary.append(summary)
@@ -2172,7 +2285,7 @@ def _predict_with_updated_model(
 	"""Run DLC inference with newest trained model and write corrected full-length predictions."""
 	import deeplabcut as dlc
 	import xrommtools_copy as xt
-	dc = _load_data_converter_module()
+	
 	import cv2 
 
 	base = _resolve_processingdata_base_dir(base_dir)
@@ -3386,12 +3499,7 @@ def make_postanalysis_overlay_popout(
 		context = _extract_trial_context_from_path(trial_dir)
 		bird = str(context["bird"])
 		trial_num = int(context["trial_num"])
-		saved_range = _load_saved_frame_range(Path(context["trial_dir"]))
-		if saved_range is not None:
-			default_start, default_end = int(saved_range[0]), int(saved_range[1])
-		else:
-			default_start = int(min(frames_local)) if frames_local else 0
-			default_end = int(max(frames_local)) if frames_local else 0
+
 		snapshot_default = BIRD_SNAPSHOT_PATHS.get(bird)
 
 		root = tk.Tk()
@@ -3412,28 +3520,34 @@ def make_postanalysis_overlay_popout(
 		if not proceed:
 			root.destroy()
 			return None
-
-		start_frame = simpledialog.askinteger(
-			"Start Frame",
-			"Start frame for correction-aware update:",
-			initialvalue=default_start,
-			minvalue=0,
-			parent=root,
-		)
-		if start_frame is None:
-			root.destroy()
-			return None
-
-		end_frame = simpledialog.askinteger(
-			"End Frame",
-			"End frame for correction-aware update:",
-			initialvalue=default_end,
-			minvalue=0,
-			parent=root,
-		)
-		if end_frame is None:
-			root.destroy()
-			return None
+		saved_range = _load_saved_frame_range(Path(context["trial_dir"]))
+		if saved_range is not None:
+			start_frame, end_frame = int(saved_range[0]), int(saved_range[1])
+		else:
+			default_start = int(min(frames_local)) if frames_local else 0
+			default_end = int(max(frames_local)) if frames_local else 0
+			start_frame = simpledialog.askinteger(
+						"Start Frame",
+						"Start frame for correction-aware update:",
+						initialvalue=default_start,
+						minvalue=0,
+						parent=root,
+					)
+			if start_frame is None:
+						root.destroy()
+						return None
+			
+			end_frame = simpledialog.askinteger(
+						"End Frame",
+						"End frame for correction-aware update:",
+						initialvalue=default_end,
+						minvalue=0,
+						parent=root,
+					)
+			if end_frame is None:
+						root.destroy()
+						return None
+		
 
 		epochs = simpledialog.askinteger(
 			"Epochs",
