@@ -46,9 +46,8 @@ WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
 # │   └── ...
 # │
 # ├── Model_Zoo/
-# │   ├── DB_15_17_Trained/
-# │   ├── Tulio_10_05_Trained/
-# │   ├── Miguel_06_Trained/
+# │   ├── DavidBowie/TrialXX
+# │   ├── Tulio/TrialX
 # │   └── ...
 # │
 # └── Data/
@@ -135,6 +134,108 @@ def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None 
 	config_candidates = sorted(bird_dir.rglob("config.yaml"), key=lambda p: len(p.relative_to(bird_dir).parts))
 	config_path = config_candidates[0] if config_candidates else None
 	return config_path, latest_snapshot
+
+
+def _find_all_config_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> list[Path]:
+	"""Return all config.yaml files under a bird's model-zoo folder."""
+	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
+	bird_dir = root / str(bird_name)
+	if not bird_dir.exists() or not bird_dir.is_dir():
+		return []
+
+	configs = [p for p in bird_dir.rglob("config.yaml") if p.is_file()]
+	configs = sorted(
+		configs,
+		key=lambda p: (
+			len(p.relative_to(bird_dir).parts),
+			-p.stat().st_mtime,
+			str(p).lower(),
+		),
+	)
+	return configs
+
+
+def _prompt_select_model_config(
+	bird_name: str,
+	config_paths: list[Path],
+	parent: tk.Misc | None = None,
+) -> Path | None:
+	"""Show a dropdown for selecting one config.yaml when multiple models exist for a bird."""
+	if not config_paths:
+		return None
+	if len(config_paths) == 1:
+		return Path(config_paths[0])
+
+	import tkinter.ttk as ttk
+
+	root = parent if parent is not None else tk.Tk()
+	created_root = parent is None
+	if created_root:
+		root.withdraw()
+		root.attributes("-topmost", True)
+
+	model_zoo_root = _resolve_model_zoo_root(prompt_if_missing=False)
+	bird_dir = Path(model_zoo_root) / str(bird_name)
+
+	labels_by_path: dict[Path, str] = {}
+	for idx, path in enumerate(config_paths, start=1):
+		config_file = Path(path)
+		try:
+			rel = config_file.relative_to(bird_dir)
+			label_path = str(rel.parent) if str(rel.parent) != "." else config_file.parent.name
+		except Exception:
+			label_path = str(config_file.parent.name)
+		labels_by_path[config_file] = f"{idx}. {label_path}"
+
+	label_to_path = {label: path for path, label in labels_by_path.items()}
+	label_values = list(label_to_path.keys())
+
+	dialog = tk.Toplevel(root)
+	dialog.title("Choose Model Config")
+	dialog.attributes("-topmost", True)
+	dialog.resizable(False, False)
+	dialog.transient(root)
+
+	choice_var = tk.StringVar(value=label_values[0])
+	result: dict[str, Path | None] = {"path": None}
+
+	tk.Label(
+		dialog,
+		text=f"Multiple model configs found for {bird_name}. Select one for prediction:",
+		justify="left",
+		wraplength=520,
+	).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 8), sticky="w")
+
+	combo = ttk.Combobox(
+		dialog,
+		textvariable=choice_var,
+		values=label_values,
+		state="readonly",
+		width=72,
+	)
+	combo.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 10), sticky="ew")
+	combo.current(0)
+
+	def _confirm() -> None:
+		picked_label = choice_var.get()
+		result["path"] = label_to_path.get(picked_label)
+		dialog.destroy()
+
+	def _cancel() -> None:
+		result["path"] = None
+		dialog.destroy()
+
+	tk.Button(dialog, text="Use Selected", command=_confirm).grid(row=2, column=0, padx=(12, 6), pady=(0, 12), sticky="e")
+	tk.Button(dialog, text="Cancel", command=_cancel).grid(row=2, column=1, padx=(6, 12), pady=(0, 12), sticky="w")
+
+	dialog.protocol("WM_DELETE_WINDOW", _cancel)
+	dialog.grab_set()
+	dialog.wait_window()
+
+	if created_root:
+		root.destroy()
+
+	return result.get("path")
 
 
 def register_model_in_zoo(
@@ -1060,18 +1161,7 @@ def _choose_directory_gui(title: str, prompt: str) -> Path:
 		raise RuntimeError(f"No folder selected for: {title}")
 	return Path(folder_path)
 
-
-def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
-	"""Prompt user for same-folder mode, then collect required folder paths."""
-	try:
-		import tkinter as tk
-		from tkinter import filedialog, messagebox, simpledialog
-	except Exception as exc:
-		raise RuntimeError(
-			"GUI prompts are unavailable. Provide folder paths on the command line instead."
-		) from exc
-
-	def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
+def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
 		if not _looks_like_image_only_selection(shared_root):
 			return shared_root, None, None
 
@@ -1177,10 +1267,24 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 			frame_range = [int(default_start), int(default_end)]
 
 		default_config = BIRD_CONFIG_PATHS.get(bird)
-		config_path = Path(default_config) if default_config else None
+		available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
+		config_path = None
+
+		if len(available_configs) > 1:
+			picked_config = _prompt_select_model_config(
+				bird_name=bird,
+				config_paths=available_configs,
+				parent=prompt_root,
+			)
+			if picked_config is not None and Path(picked_config).exists():
+				config_path = Path(picked_config)
+
+		if config_path is None:
+			config_path = Path(default_config) if default_config else None
+
 		use_default = bool(config_path is not None and config_path.exists())
 
-		if use_default:
+		if use_default and len(available_configs) <= 1:
 			use_default = bool(
 				messagebox.askyesno(
 					title="Model Config",
@@ -1212,6 +1316,173 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 			xma_base_name="NoUpdateModel",
 		)
 		return Path(result["trial_dir"]), None, None
+
+
+def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
+	"""Prompt user for same-folder mode, then collect required folder paths."""
+	try:
+		import tkinter as tk
+		from tkinter import filedialog, messagebox, simpledialog
+	except Exception as exc:
+		raise RuntimeError(
+			"GUI prompts are unavailable. Provide folder paths on the command line instead."
+		) from exc
+
+	# def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
+	# 	if not _looks_like_image_only_selection(shared_root):
+	# 		return shared_root, None, None
+
+	# 	prompt_root = tk.Tk()
+	# 	prompt_root.withdraw()
+	# 	prompt_root.attributes("-topmost", True)
+
+	# 	should_predict = bool(
+	# 		messagebox.askyesno(
+	# 			title="Images Detected",
+	# 			message=(
+	# 				"The selected folder appears to contain images but no predictions.\n\n"
+	# 				"Do you want to run prediction now?"
+	# 			),
+	# 			parent=prompt_root,
+	# 		)
+	# 	)
+	# 	if not should_predict:
+	# 		prompt_root.destroy()
+	# 		raise RuntimeError("No prediction files found in selected folder. Prediction was cancelled.")
+
+	# 	trial_dir = _infer_trial_dir_from_selected_folder(shared_root)
+	# 	base_dir = trial_dir.parent.parent if trial_dir.parent.parent.exists() else trial_dir.parent
+	# 	try:
+	# 		context = _extract_trial_context_from_path(trial_dir)
+	# 		bird = str(context["bird"])
+	# 	except Exception:
+	# 		bird_input = simpledialog.askstring(
+	# 			"Bird Name",
+	# 			"Could not infer bird from path. Enter bird name:",
+	# 			initialvalue=str(trial_dir.parent.name),
+	# 			parent=prompt_root,
+	# 		)
+	# 		if bird_input is None or str(bird_input).strip() == "":
+	# 			prompt_root.destroy()
+	# 			raise RuntimeError("Prediction cancelled: no bird name provided.")
+	# 		bird = str(bird_input).strip()
+
+	# 		trial_input = simpledialog.askinteger(
+	# 			"Trial Number",
+	# 			"Could not infer trial from path. Enter trial number:",
+	# 			initialvalue=1,
+	# 			minvalue=1,
+	# 			parent=prompt_root,
+	# 		)
+	# 		if trial_input is None:
+	# 			prompt_root.destroy()
+	# 			raise RuntimeError("Prediction cancelled: no trial number provided.")
+
+	# 		trial_num = int(trial_input)
+	# 		trial_dir = Path(base_dir) / bird / f"Trial{trial_num}"
+	# 		if not trial_dir.exists():
+	# 			prompt_root.destroy()
+	# 			raise FileNotFoundError(
+	# 				f"The provided bird/trial path does not exist: {trial_dir}"
+	# 			)
+
+	# 	saved_range = _load_saved_frame_range(trial_dir)
+	# 	default_start = int(saved_range[0]) if saved_range is not None else 0
+	# 	default_end = int(saved_range[1]) if saved_range is not None else int(default_start + 1000)
+
+	# 	use_range = bool(
+	# 		messagebox.askyesno(
+	# 			title="Frame Range",
+	# 			message=(
+	# 				"Do you want to set a frame range for prediction/correction?"
+	# 				+ (
+	# 					f"\n\nSaved range found: {default_start} to {default_end}."
+	# 					if saved_range is not None
+	# 					else ""
+	# 				)
+	# 			),
+	# 			parent=prompt_root,
+	# 		)
+	# 	)
+	# 	frame_range = None
+	# 	if use_range:
+	# 		start_frame = simpledialog.askinteger(
+	# 			"Start Frame",
+	# 			"Start frame:",
+	# 			initialvalue=int(default_start),
+	# 			minvalue=0,
+	# 			parent=prompt_root,
+	# 		)
+	# 		if start_frame is None:
+	# 			prompt_root.destroy()
+	# 			raise RuntimeError("Prediction cancelled: no start frame provided.")
+
+	# 		end_frame = simpledialog.askinteger(
+	# 			"End Frame",
+	# 			"End frame:",
+	# 			initialvalue=int(default_end if saved_range is not None else int(start_frame) + 1000),
+	# 			minvalue=0,
+	# 			parent=prompt_root,
+	# 		)
+	# 		if end_frame is None:
+	# 			prompt_root.destroy()
+	# 			raise RuntimeError("Prediction cancelled: no end frame provided.")
+
+	# 		frame_range = [int(start_frame), int(end_frame)]
+	# 		_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="predict_trial_from_jpg_stacks")
+	# 	elif saved_range is not None:
+	# 		frame_range = [int(default_start), int(default_end)]
+
+	# 	default_config = BIRD_CONFIG_PATHS.get(bird)
+	# 	available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
+	# 	config_path = None
+
+	# 	if len(available_configs) > 1:
+	# 		picked_config = _prompt_select_model_config(
+	# 			bird_name=bird,
+	# 			config_paths=available_configs,
+	# 			parent=prompt_root,
+	# 		)
+	# 		if picked_config is not None and Path(picked_config).exists():
+	# 			config_path = Path(picked_config)
+
+	# 	if config_path is None:
+	# 		config_path = Path(default_config) if default_config else None
+
+	# 	use_default = bool(config_path is not None and config_path.exists())
+
+	# 	if use_default and len(available_configs) <= 1:
+	# 		use_default = bool(
+	# 			messagebox.askyesno(
+	# 				title="Model Config",
+	# 				message=(
+	# 					f"Use default config for {bird}?\n\n"
+	# 					f"{config_path}"
+	# 				),
+	# 				parent=prompt_root,
+	# 			)
+	# 		)
+
+	# 	if not use_default:
+	# 		picked = filedialog.askopenfilename(
+	# 			title="Select DeepLabCut config.yaml",
+	# 			filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
+	# 			parent=prompt_root,
+	# 		)
+	# 		if not picked:
+	# 			prompt_root.destroy()
+	# 			raise RuntimeError("Prediction cancelled: no config file selected.")
+	# 		config_path = Path(picked)
+
+	# 	prompt_root.destroy()
+
+	# 	result = predict_trial_from_jpg_stacks(
+	# 		trial_dir=trial_dir,
+	# 		config_path=config_path,
+	# 		frame_range=frame_range,
+	# 		xma_base_name="NoUpdateModel",
+	# 	)
+	# 	return Path(result["trial_dir"]), None, None
 
 	root = tk.Tk()
 	root.withdraw()
@@ -5042,7 +5313,9 @@ def make_postanalysis_overlay_popout(
 		if not trial_dir.exists():
 			print(f"Selected trial path does not exist: {trial_dir}")
 			return
-		_reload_trial_into_view(trial_dir)
+
+		resolved_trial_dir, _, _ = _maybe_predict_if_images_only(trial_dir)
+		_reload_trial_into_view(resolved_trial_dir)
 		current_bird = str(bird_name)
 		current_trial_num = int(trial_choice)
 		print(f"Loaded: {current_bird} Trial{current_trial_num}")
