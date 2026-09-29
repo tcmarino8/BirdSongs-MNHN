@@ -137,108 +137,6 @@ def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None 
 	return config_path, latest_snapshot
 
 
-def _find_all_config_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> list[Path]:
-	"""Return all config.yaml files under a bird's model-zoo folder."""
-	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
-	bird_dir = root / str(bird_name)
-	if not bird_dir.exists() or not bird_dir.is_dir():
-		return []
-
-	configs = [p for p in bird_dir.rglob("config.yaml") if p.is_file()]
-	configs = sorted(
-		configs,
-		key=lambda p: (
-			len(p.relative_to(bird_dir).parts),
-			-p.stat().st_mtime,
-			str(p).lower(),
-		),
-	)
-	return configs
-
-
-def _prompt_select_model_config(
-	bird_name: str,
-	config_paths: list[Path],
-	parent: tk.Misc | None = None,
-) -> Path | None:
-	"""Show a dropdown for selecting one config.yaml when multiple models exist for a bird."""
-	if not config_paths:
-		return None
-	if len(config_paths) == 1:
-		return Path(config_paths[0])
-
-	import tkinter.ttk as ttk
-
-	root = parent if parent is not None else tk.Tk()
-	created_root = parent is None
-	if created_root:
-		root.withdraw()
-		root.attributes("-topmost", True)
-
-	model_zoo_root = _resolve_model_zoo_root(prompt_if_missing=False)
-	bird_dir = Path(model_zoo_root) / str(bird_name)
-
-	labels_by_path: dict[Path, str] = {}
-	for idx, path in enumerate(config_paths, start=1):
-		config_file = Path(path)
-		try:
-			rel = config_file.relative_to(bird_dir)
-			label_path = str(rel.parent) if str(rel.parent) != "." else config_file.parent.name
-		except Exception:
-			label_path = str(config_file.parent.name)
-		labels_by_path[config_file] = f"{idx}. {label_path}"
-
-	label_to_path = {label: path for path, label in labels_by_path.items()}
-	label_values = list(label_to_path.keys())
-
-	dialog = tk.Toplevel(root)
-	dialog.title("Choose Model Config")
-	dialog.attributes("-topmost", True)
-	dialog.resizable(False, False)
-	dialog.transient(root)
-
-	choice_var = tk.StringVar(value=label_values[0])
-	result: dict[str, Path | None] = {"path": None}
-
-	tk.Label(
-		dialog,
-		text=f"Multiple model configs found for {bird_name}. Select one for prediction:",
-		justify="left",
-		wraplength=520,
-	).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 8), sticky="w")
-
-	combo = ttk.Combobox(
-		dialog,
-		textvariable=choice_var,
-		values=label_values,
-		state="readonly",
-		width=72,
-	)
-	combo.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 10), sticky="ew")
-	combo.current(0)
-
-	def _confirm() -> None:
-		picked_label = choice_var.get()
-		result["path"] = label_to_path.get(picked_label)
-		dialog.destroy()
-
-	def _cancel() -> None:
-		result["path"] = None
-		dialog.destroy()
-
-	tk.Button(dialog, text="Use Selected", command=_confirm).grid(row=2, column=0, padx=(12, 6), pady=(0, 12), sticky="e")
-	tk.Button(dialog, text="Cancel", command=_cancel).grid(row=2, column=1, padx=(6, 12), pady=(0, 12), sticky="w")
-
-	dialog.protocol("WM_DELETE_WINDOW", _cancel)
-	dialog.grab_set()
-	dialog.wait_window()
-
-	if created_root:
-		root.destroy()
-
-	return result.get("path")
-
-
 def register_model_in_zoo(
 	bird: str,
 	original_trial: int,
@@ -1279,24 +1177,10 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 			frame_range = [int(default_start), int(default_end)]
 
 		default_config = BIRD_CONFIG_PATHS.get(bird)
-		available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
-		config_path = None
-
-		if len(available_configs) > 1:
-			picked_config = _prompt_select_model_config(
-				bird_name=bird,
-				config_paths=available_configs,
-				parent=prompt_root,
-			)
-			if picked_config is not None and Path(picked_config).exists():
-				config_path = Path(picked_config)
-
-		if config_path is None:
-			config_path = Path(default_config) if default_config else None
-
+		config_path = Path(default_config) if default_config else None
 		use_default = bool(config_path is not None and config_path.exists())
 
-		if use_default and len(available_configs) <= 1:
+		if use_default:
 			use_default = bool(
 				messagebox.askyesno(
 					title="Model Config",
