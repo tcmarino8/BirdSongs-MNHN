@@ -62,12 +62,13 @@ def _default_model_zoo_dir() -> Path:
 		env_value = os.environ.get(env_name)
 		if env_value:
 			return Path(env_value).expanduser()
-
+# defining possible paths
 	local_candidates = [
 		PROJECT_ROOT / "Model_Zoo",
 		PROJECT_ROOT.parent / "Model_Zoo",
 		Path.home() / "Documents" / "MachineLearning" / "BirdSongs-MNHN" / "Testing" / "Model_Zoo",
 	]
+	# seeing if any path candidates exist
 	for candidate in local_candidates:
 		if candidate.exists():
 			return candidate
@@ -84,9 +85,11 @@ def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
 			"GUI file picker is unavailable. Provide the model-zoo path through MODEL_ZOO_DIR."
 		) from exc
 
+# instamtiate a new popup provess 
 	root = tk.Tk()
 	root.withdraw()
 	root.attributes("-topmost", True)
+	# message box popu to select new trial
 	messagebox.showinfo(
 		title=title,
 		message=(
@@ -97,40 +100,56 @@ def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
 		),
 		parent=root,
 	)
+	# chosen filepath to durectory containing trained model
 	folder_path = filedialog.askdirectory(title=title, parent=root)
 	root.destroy()
 
+# ensurs folder exists then return
 	if not folder_path:
 		raise RuntimeError(f"No folder selected for: {title}")
 	return Path(folder_path)
 
 
 def _resolve_model_zoo_root(prompt_if_missing: bool = False) -> Path:
+	''' inital check if model exists in expected folder otherwise prompt a selection '''
+	''' boolean input to check or not, filepath output of model_zoo'''
 	root = _default_model_zoo_dir()
+	# does amticipated dir exist?
 	if root.exists() and any(p.is_dir() for p in root.iterdir()):
 		return root
+	# should the user need fo select the model
 	if prompt_if_missing:
 		return _choose_model_zoo_directory()
 	return root
 
 
 def _snapshot_sort_key(path: Path) -> tuple[int, float]:
+	''' find smapshot numbers from files .pt and return number amd path'''
+	#find all itsrations associate to each snapshot
 	match = re.search(r"snapshot-(\d+)", path.name)
+	# return .group(1) of the matches otherwise the last one
 	snapshot_num = int(match.group(1)) if match else -1
 	return (snapshot_num, path.stat().st_mtime)
 
 
 def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> tuple[Path | None, Path | None]:
+	''' find animal specific model zoo and return config of the model anx snapshot of interest'''
+	
 	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
+	# add bird name to the root
 	bird_dir = root / str(bird_name)
+	# ensure bird dir exists
 	if not bird_dir.exists() or not bird_dir.is_dir():
 		return None, None
 
+	# find all snapshot candidars using _snapshot_sort_key from above
 	snapshot_candidates = sorted(bird_dir.rglob("snapshot-*.pt"), key=_snapshot_sort_key, reverse=True)
+# ensure there exists some candidate
 	if not snapshot_candidates:
 		return None, None
-
+# find latest config
 	latest_snapshot = snapshot_candidates[0]
+	# search dor config candidates
 	config_candidates = sorted(bird_dir.rglob("config.yaml"), key=lambda p: len(p.relative_to(bird_dir).parts))
 	config_path = config_candidates[0] if config_candidates else None
 	return config_path, latest_snapshot
