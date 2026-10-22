@@ -36,25 +36,11 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 WORKFLOW_STATE_FILE = "postanalysis_workflow.json"
 
 
-# Ideal folder structure:
-
-# BirdProject/
-# │
-# ├── Code/
-# │   ├── dlcsupport.py
-# │   ├── PostAnalysis_review.py
-# │   └── ...
-# │
-# ├── Model_Zoo/
-# │   ├── DavidBowie/TrialXX
-# │   ├── Tulio/TrialX
-# │   └── ...
-# │
-# └── Data/
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
+PROJECT_BASE = Path(__file__).resolve().parent
+print("project base: ", PROJECT_BASE)
 
 def _default_model_zoo_dir() -> Path:
 	"""Resolve the model-zoo root, preferring environment overrides and the local project folder."""
@@ -62,17 +48,16 @@ def _default_model_zoo_dir() -> Path:
 		env_value = os.environ.get(env_name)
 		if env_value:
 			return Path(env_value).expanduser()
-# defining possible paths
+
 	local_candidates = [
-		PROJECT_ROOT / "Model_Zoo",
-		PROJECT_ROOT.parent / "Model_Zoo",
+		PROJECT_BASE / "Model_Zoo",
+		PROJECT_BASE.parent / "Model_Zoo",
 		Path.home() / "Documents" / "MachineLearning" / "BirdSongs-MNHN" / "Testing" / "Model_Zoo",
 	]
-	# seeing if any path candidates exist
 	for candidate in local_candidates:
 		if candidate.exists():
 			return candidate
-	return PROJECT_ROOT / "Model_Zoo"
+	return PROJECT_BASE / "Model_Zoo"
 
 
 def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
@@ -85,11 +70,9 @@ def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
 			"GUI file picker is unavailable. Provide the model-zoo path through MODEL_ZOO_DIR."
 		) from exc
 
-# instamtiate a new popup provess 
 	root = tk.Tk()
 	root.withdraw()
 	root.attributes("-topmost", True)
-	# message box popu to select new trial
 	messagebox.showinfo(
 		title=title,
 		message=(
@@ -100,58 +83,45 @@ def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
 		),
 		parent=root,
 	)
-	# chosen filepath to durectory containing trained model
 	folder_path = filedialog.askdirectory(title=title, parent=root)
 	root.destroy()
 
-# ensurs folder exists then return
 	if not folder_path:
 		raise RuntimeError(f"No folder selected for: {title}")
 	return Path(folder_path)
 
 
 def _resolve_model_zoo_root(prompt_if_missing: bool = False) -> Path:
-	''' inital check if model exists in expected folder otherwise prompt a selection '''
-	''' boolean input to check or not, filepath output of model_zoo'''
 	root = _default_model_zoo_dir()
-	# does amticipated dir exist?
 	if root.exists() and any(p.is_dir() for p in root.iterdir()):
 		return root
-	# should the user need fo select the model
 	if prompt_if_missing:
 		return _choose_model_zoo_directory()
 	return root
 
 
 def _snapshot_sort_key(path: Path) -> tuple[int, float]:
-	''' find smapshot numbers from files .pt and return number amd path'''
-	#find all itsrations associate to each snapshot
 	match = re.search(r"snapshot-(\d+)", path.name)
-	# return .group(1) of the matches otherwise the last one
 	snapshot_num = int(match.group(1)) if match else -1
 	return (snapshot_num, path.stat().st_mtime)
 
 
 def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> tuple[Path | None, Path | None]:
-	''' find animal specific model zoo and return config of the model anx snapshot of interest'''
-	
 	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
-	# add bird name to the root
+	
 	bird_dir = root / str(bird_name)
-	# ensure bird dir exists
+	# print(bird_dir)
 	if not bird_dir.exists() or not bird_dir.is_dir():
 		return None, None
 
-	# find all snapshot candidars using _snapshot_sort_key from above
 	snapshot_candidates = sorted(bird_dir.rglob("snapshot-*.pt"), key=_snapshot_sort_key, reverse=True)
-# ensure there exists some candidate
 	if not snapshot_candidates:
 		return None, None
-# find latest config
+
 	latest_snapshot = snapshot_candidates[0]
-	# search dor config candidates
 	config_candidates = sorted(bird_dir.rglob("config.yaml"), key=lambda p: len(p.relative_to(bird_dir).parts))
 	config_path = config_candidates[0] if config_candidates else None
+	# print(config_path)
 	return config_path, latest_snapshot
 
 
@@ -187,8 +157,9 @@ def _prompt_select_model_config(
 
 	import tkinter.ttk as ttk
 
-	root = parent if parent is not None else tk.Tk()
-	created_root = parent is None
+	parent_is_visible = bool(parent is not None and parent.winfo_exists() and parent.winfo_viewable())
+	root = parent if parent_is_visible else tk.Tk()
+	created_root = not parent_is_visible
 	if created_root:
 		root.withdraw()
 		root.attributes("-topmost", True)
@@ -213,7 +184,8 @@ def _prompt_select_model_config(
 	dialog.title("Choose Model Config")
 	dialog.attributes("-topmost", True)
 	dialog.resizable(False, False)
-	dialog.transient(root)
+	if parent_is_visible:
+		dialog.transient(root)
 
 	choice_var = tk.StringVar(value=label_values[0])
 	result: dict[str, Path | None] = {"path": None}
@@ -236,8 +208,9 @@ def _prompt_select_model_config(
 	combo.current(0)
 
 	def _confirm() -> None:
-		picked_label = choice_var.get()
+		picked_label = combo.get()
 		result["path"] = label_to_path.get(picked_label)
+		print(f"Model config dropdown picked: {picked_label} -> {result['path']}")
 		dialog.destroy()
 
 	def _cancel() -> None:
@@ -248,6 +221,9 @@ def _prompt_select_model_config(
 	tk.Button(dialog, text="Cancel", command=_cancel).grid(row=2, column=1, padx=(6, 12), pady=(0, 12), sticky="w")
 
 	dialog.protocol("WM_DELETE_WINDOW", _cancel)
+	dialog.update_idletasks()
+	dialog.lift()
+	dialog.focus_force()
 	dialog.grab_set()
 	dialog.wait_window()
 
@@ -257,10 +233,19 @@ def _prompt_select_model_config(
 	return result.get("path")
 
 
+def _format_trials_label(trial_nums: list[int]) -> str:
+	"""Build a stable label like Trials1-10-100 from all selected trial numbers."""
+	ordered_trials = sorted({int(t) for t in trial_nums})
+	if not ordered_trials:
+		raise ValueError("At least one trial number is required to build a trials label.")
+	return "Trials" + "-".join(str(t) for t in ordered_trials)
+
+
 def register_model_in_zoo(
 	bird: str,
 	original_trial: int,
 	new_trial: int,
+	trial_nums: list[int] | None = None,
 	config_path: str | Path | None = None,
 	snapshot_path: str | Path | None = None,
 	model_zoo_root: str | Path | None = None,
@@ -270,7 +255,10 @@ def register_model_in_zoo(
 	bird_dir = root / str(bird)
 	bird_dir.mkdir(parents=True, exist_ok=True)
 
-	trial_label = f"Trials{int(original_trial)}-{int(new_trial)}"
+	if trial_nums:
+		trial_label = _format_trials_label(trial_nums)
+	else:
+		trial_label = f"Trials{int(original_trial)}-{int(new_trial)}"
 	target_dir = bird_dir / trial_label
 	if target_dir.exists():
 		counter = 1
@@ -284,12 +272,12 @@ def register_model_in_zoo(
 	else:
 		target_dir.mkdir(parents=True, exist_ok=True)
 
-	config_source = Path(config_path).resolve() if config_path is not None else None
-	if config_source is not None and config_source.exists():
-		copy_target = target_dir / config_source.name
-		if copy_target.exists():
-			copy_target.unlink()
-		shutil.copy2(config_source, copy_target)
+	# config_source = Path(config_path).resolve() if config_path is not None else None
+	# if config_source is not None and config_source.exists():
+	# 	copy_target = target_dir / config_source.name
+	# 	if copy_target.exists():
+	# 		copy_target.unlink()
+	# 	shutil.copy2(config_source, copy_target)
 
 	snapshot_source = Path(snapshot_path).resolve() if snapshot_path is not None else None
 	if snapshot_source is not None and snapshot_source.exists():
@@ -299,8 +287,8 @@ def register_model_in_zoo(
 			if config_candidate.exists():
 				model_root = candidate
 				break
-		if model_root is None and config_source is not None:
-			model_root = config_source.parent
+		# if model_root is None and config_source is not None:
+		# 	model_root = config_source.parent
 		if model_root is not None:
 			copy_model_dir = target_dir / model_root.name
 			if copy_model_dir.exists():
@@ -319,6 +307,7 @@ def _maybe_prompt_add_model_to_zoo(
 	bird: str,
 	original_trial: int,
 	new_trial: int,
+	trial_nums: list[int] | None = None,
 	config_path: str | Path | None = None,
 	snapshot_path: str | Path | None = None,
 ) -> Path | None:
@@ -332,12 +321,13 @@ def _maybe_prompt_add_model_to_zoo(
 	root = tk.Tk()
 	root.withdraw()
 	root.attributes("-topmost", True)
+	trials_label = _format_trials_label(trial_nums) if trial_nums else f"Trials{int(original_trial)}-{int(new_trial)}"
 	should_store = bool(
 		messagebox.askyesno(
 			title="Add model to Model Zoo",
 			message=(
 				f"Add this trained model for {bird} to the model zoo as "
-				f"Trials{int(original_trial)}-{int(new_trial)}?"
+				f"{trials_label}?"
 			),
 			parent=root,
 		)
@@ -349,6 +339,7 @@ def _maybe_prompt_add_model_to_zoo(
 		bird=bird,
 		original_trial=original_trial,
 		new_trial=new_trial,
+		trial_nums=trial_nums,
 		config_path=config_path,
 		snapshot_path=snapshot_path,
 	)
@@ -1180,7 +1171,18 @@ def _choose_directory_gui(title: str, prompt: str) -> Path:
 		raise RuntimeError(f"No folder selected for: {title}")
 	return Path(folder_path)
 
-def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
+
+def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
+	"""Prompt user for same-folder mode, then collect required folder paths."""
+	try:
+		import tkinter as tk
+		from tkinter import filedialog, messagebox, simpledialog
+	except Exception as exc:
+		raise RuntimeError(
+			"GUI prompts are unavailable. Provide folder paths on the command line instead."
+		) from exc
+
+	def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
 		if not _looks_like_image_only_selection(shared_root):
 			return shared_root, None, None
 
@@ -1286,7 +1288,11 @@ def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None,
 			frame_range = [int(default_start), int(default_end)]
 
 		default_config = BIRD_CONFIG_PATHS.get(bird)
+		print("Default Config")
+		print(default_config)
 		available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
+		print("available configs:")
+		print(available_configs)
 		config_path = None
 
 		if len(available_configs) > 1:
@@ -1297,10 +1303,12 @@ def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None,
 			)
 			if picked_config is not None and Path(picked_config).exists():
 				config_path = Path(picked_config)
+				print(f"Selected config: {config_path}")
 
 		if config_path is None:
 			config_path = Path(default_config) if default_config else None
-
+			print("original degault congfig: ")
+			print(config_path)
 		use_default = bool(config_path is not None and config_path.exists())
 
 		if use_default and len(available_configs) <= 1:
@@ -1321,187 +1329,22 @@ def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None,
 				filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
 				parent=prompt_root,
 			)
+			
 			if not picked:
 				prompt_root.destroy()
 				raise RuntimeError("Prediction cancelled: no config file selected.")
 			config_path = Path(picked)
+			print(config_path)
 
 		prompt_root.destroy()
-
+		# print(frame_range)
 		result = predict_trial_from_jpg_stacks(
 			trial_dir=trial_dir,
 			config_path=config_path,
 			frame_range=frame_range,
-			xma_base_name="NoUpdateModel",
+			xma_base_name="NoUpdateModel"
 		)
 		return Path(result["trial_dir"]), None, None
-
-
-def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
-	"""Prompt user for same-folder mode, then collect required folder paths."""
-	try:
-		import tkinter as tk
-		from tkinter import filedialog, messagebox, simpledialog
-	except Exception as exc:
-		raise RuntimeError(
-			"GUI prompts are unavailable. Provide folder paths on the command line instead."
-		) from exc
-
-	# def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
-	# 	if not _looks_like_image_only_selection(shared_root):
-	# 		return shared_root, None, None
-
-	# 	prompt_root = tk.Tk()
-	# 	prompt_root.withdraw()
-	# 	prompt_root.attributes("-topmost", True)
-
-	# 	should_predict = bool(
-	# 		messagebox.askyesno(
-	# 			title="Images Detected",
-	# 			message=(
-	# 				"The selected folder appears to contain images but no predictions.\n\n"
-	# 				"Do you want to run prediction now?"
-	# 			),
-	# 			parent=prompt_root,
-	# 		)
-	# 	)
-	# 	if not should_predict:
-	# 		prompt_root.destroy()
-	# 		raise RuntimeError("No prediction files found in selected folder. Prediction was cancelled.")
-
-	# 	trial_dir = _infer_trial_dir_from_selected_folder(shared_root)
-	# 	base_dir = trial_dir.parent.parent if trial_dir.parent.parent.exists() else trial_dir.parent
-	# 	try:
-	# 		context = _extract_trial_context_from_path(trial_dir)
-	# 		bird = str(context["bird"])
-	# 	except Exception:
-	# 		bird_input = simpledialog.askstring(
-	# 			"Bird Name",
-	# 			"Could not infer bird from path. Enter bird name:",
-	# 			initialvalue=str(trial_dir.parent.name),
-	# 			parent=prompt_root,
-	# 		)
-	# 		if bird_input is None or str(bird_input).strip() == "":
-	# 			prompt_root.destroy()
-	# 			raise RuntimeError("Prediction cancelled: no bird name provided.")
-	# 		bird = str(bird_input).strip()
-
-	# 		trial_input = simpledialog.askinteger(
-	# 			"Trial Number",
-	# 			"Could not infer trial from path. Enter trial number:",
-	# 			initialvalue=1,
-	# 			minvalue=1,
-	# 			parent=prompt_root,
-	# 		)
-	# 		if trial_input is None:
-	# 			prompt_root.destroy()
-	# 			raise RuntimeError("Prediction cancelled: no trial number provided.")
-
-	# 		trial_num = int(trial_input)
-	# 		trial_dir = Path(base_dir) / bird / f"Trial{trial_num}"
-	# 		if not trial_dir.exists():
-	# 			prompt_root.destroy()
-	# 			raise FileNotFoundError(
-	# 				f"The provided bird/trial path does not exist: {trial_dir}"
-	# 			)
-
-	# 	saved_range = _load_saved_frame_range(trial_dir)
-	# 	default_start = int(saved_range[0]) if saved_range is not None else 0
-	# 	default_end = int(saved_range[1]) if saved_range is not None else int(default_start + 1000)
-
-	# 	use_range = bool(
-	# 		messagebox.askyesno(
-	# 			title="Frame Range",
-	# 			message=(
-	# 				"Do you want to set a frame range for prediction/correction?"
-	# 				+ (
-	# 					f"\n\nSaved range found: {default_start} to {default_end}."
-	# 					if saved_range is not None
-	# 					else ""
-	# 				)
-	# 			),
-	# 			parent=prompt_root,
-	# 		)
-	# 	)
-	# 	frame_range = None
-	# 	if use_range:
-	# 		start_frame = simpledialog.askinteger(
-	# 			"Start Frame",
-	# 			"Start frame:",
-	# 			initialvalue=int(default_start),
-	# 			minvalue=0,
-	# 			parent=prompt_root,
-	# 		)
-	# 		if start_frame is None:
-	# 			prompt_root.destroy()
-	# 			raise RuntimeError("Prediction cancelled: no start frame provided.")
-
-	# 		end_frame = simpledialog.askinteger(
-	# 			"End Frame",
-	# 			"End frame:",
-	# 			initialvalue=int(default_end if saved_range is not None else int(start_frame) + 1000),
-	# 			minvalue=0,
-	# 			parent=prompt_root,
-	# 		)
-	# 		if end_frame is None:
-	# 			prompt_root.destroy()
-	# 			raise RuntimeError("Prediction cancelled: no end frame provided.")
-
-	# 		frame_range = [int(start_frame), int(end_frame)]
-	# 		_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="predict_trial_from_jpg_stacks")
-	# 	elif saved_range is not None:
-	# 		frame_range = [int(default_start), int(default_end)]
-
-	# 	default_config = BIRD_CONFIG_PATHS.get(bird)
-	# 	available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
-	# 	config_path = None
-
-	# 	if len(available_configs) > 1:
-	# 		picked_config = _prompt_select_model_config(
-	# 			bird_name=bird,
-	# 			config_paths=available_configs,
-	# 			parent=prompt_root,
-	# 		)
-	# 		if picked_config is not None and Path(picked_config).exists():
-	# 			config_path = Path(picked_config)
-
-	# 	if config_path is None:
-	# 		config_path = Path(default_config) if default_config else None
-
-	# 	use_default = bool(config_path is not None and config_path.exists())
-
-	# 	if use_default and len(available_configs) <= 1:
-	# 		use_default = bool(
-	# 			messagebox.askyesno(
-	# 				title="Model Config",
-	# 				message=(
-	# 					f"Use default config for {bird}?\n\n"
-	# 					f"{config_path}"
-	# 				),
-	# 				parent=prompt_root,
-	# 			)
-	# 		)
-
-	# 	if not use_default:
-	# 		picked = filedialog.askopenfilename(
-	# 			title="Select DeepLabCut config.yaml",
-	# 			filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
-	# 			parent=prompt_root,
-	# 		)
-	# 		if not picked:
-	# 			prompt_root.destroy()
-	# 			raise RuntimeError("Prediction cancelled: no config file selected.")
-	# 		config_path = Path(picked)
-
-	# 	prompt_root.destroy()
-
-	# 	result = predict_trial_from_jpg_stacks(
-	# 		trial_dir=trial_dir,
-	# 		config_path=config_path,
-	# 		frame_range=frame_range,
-	# 		xma_base_name="NoUpdateModel",
-	# 	)
-	# 	return Path(result["trial_dir"]), None, None
 
 	root = tk.Tk()
 	root.withdraw()
@@ -1615,6 +1458,61 @@ def _infer_trial_dir_from_selected_folder(selected_dir: Path) -> Path:
 	)
 
 
+def _analyze_videos_with_shuffle_fallback(
+	config_path: Path,
+	videos: list[str],
+	*,
+	save_as_csv: bool,
+	destfolder: str,
+	batchsize: int,
+) -> int:
+	"""Run DLC inference, retrying alternate shuffles when shuffle metadata is missing."""
+	shuffle_candidates = [1, 0, 2, 3, 4, 5]
+	last_exc: Exception | None = None
+
+	# Trained models usually live in a nested *FineTuner*/ project; try those (newest first) after the selected config.
+	config_path = Path(config_path)
+	config_candidates = [config_path]
+	nested = [
+		p for p in config_path.parent.glob("*/config.yaml")
+		if any(p.parent.glob("dlc-models-pytorch/iteration-*/*/train/snapshot*.pt"))
+		or any(p.parent.glob("dlc-models/iteration-*/*/train/snapshot*"))
+	]
+	nested.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+	config_candidates.extend(nested)
+
+	for cfg in config_candidates:
+		for shuffle_idx in shuffle_candidates:
+			try:
+				dlc.analyze_videos(
+					str(cfg),
+					videos,
+					shuffle=int(shuffle_idx),
+					trainingsetindex=0,
+					save_as_csv=bool(save_as_csv),
+					destfolder=str(destfolder),
+					batchsize=int(batchsize),
+				)
+				if cfg != config_path:
+					print(f"Using nested trained config: {cfg}")
+				return int(shuffle_idx)
+			except ValueError as exc:
+				message = str(exc)
+				if "Could not find a shuffle" in message:
+					last_exc = exc
+					continue
+				raise
+
+	if last_exc is not None:
+		raise RuntimeError(
+			"The selected config does not contain a trained shuffle compatible with prediction. "
+			"Try another model config from Model_Zoo or train this config first. "
+			f"Config: {config_path}"
+		) from last_exc
+
+	raise RuntimeError(f"Unable to run analyze_videos for config: {config_path}")
+
+
 def predict_trial_from_jpg_stacks(
 	trial_dir: str | Path,
 	config_path: str | Path,
@@ -1627,7 +1525,7 @@ def predict_trial_from_jpg_stacks(
 	"""Predict from Cam1/Cam2 JPG stacks for a selected trial directory and save combined output."""
 	import deeplabcut as dlc
 	import xrommtools_copy as xt
-
+	print(frame_range)
 	dc = _load_data_converter_module()
 	trial_dir = Path(trial_dir)
 	config_path = Path(config_path)
@@ -1669,13 +1567,14 @@ def predict_trial_from_jpg_stacks(
 		)
 
 	if not sorted(trial_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime):
-		dlc.analyze_videos(
-			str(config_path),
-			[str(cam1_avi), str(cam2_avi)],
+		used_shuffle = _analyze_videos_with_shuffle_fallback(
+			config_path=config_path,
+			videos=[str(cam1_avi), str(cam2_avi)],
 			save_as_csv=bool(save_as_csv),
 			destfolder=str(trial_dir),
 			batchsize=int(batchsize),
 		)
+		print(f"Prediction ran with shuffle={used_shuffle} for config: {config_path}")
 
 	cam1_candidates = sorted(trial_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime)
 	cam2_candidates = sorted(trial_dir.glob("Cam2DLC*.csv"), key=lambda path: path.stat().st_mtime)
@@ -2128,8 +2027,10 @@ def train_multiple_trials(
 			raise FileNotFoundError(f"Trial folder not found: {trial_dir}")
 		trial_dirs.append(trial_dir)
 
-	trial_label = "-".join(str(t) for t in trial_list)
-	multi_root = bird_dir / "multi_trial_training" / f"{method}_train" / f"Trials{trial_label}" / f"nframes_{int(nframes)}"
+	trials_folder_name = _format_trials_label(trial_list)
+	model_zoo_bird_dir = MODEL_ZOO / str(bird)
+	model_zoo_bird_dir.mkdir(parents=True, exist_ok=True)
+	multi_root = model_zoo_bird_dir / "multi_trial_training" / f"{method}_train" / trials_folder_name / f"nframes_{int(nframes)}"
 	models_dir = multi_root / "ModelsToTune"
 	models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2216,7 +2117,7 @@ def train_multiple_trials(
 			summary = _copy_trial_into_combined_training_set(src_trial, dst_trial, frame_indices=method_frames)
 			copy_summary.append(summary)
 
-		dataset_name = f"MultiTrial_{bird}_Trials{trial_label}_{method}"
+		dataset_name = f"MultiTrial_{bird}_{trials_folder_name}_{method}"
 		dlcs.build_combined_dataset(
 			combined_config=combined_config,
 			data_path=temp_combined_data,
@@ -2253,6 +2154,7 @@ def train_multiple_trials(
 		bird=str(bird),
 		original_trial=int(min(trial_list)),
 		new_trial=int(max(trial_list)),
+		trial_nums=trial_list,
 		config_path=combined_config,
 		snapshot_path=latest_snapshot,
 	)
@@ -2346,12 +2248,28 @@ def train_update_model(
 	dlcs.apply_bird_bodyparts_to_configs({bird: [combined_config]}, strict=True)
 
 	clean_trial = models_root / "ModelTraining"
+	if clean_trial.exists():
+		shutil.rmtree(clean_trial)
 	clean_trial.mkdir(parents=True, exist_ok=True)
+
+	dataset_nframes = int(nframes)
 
 	if use_json_set:
 		points_payload = correction_set.get("correction_points", []) if isinstance(correction_set, dict) else []
 		legacy_rows_payload = correction_set.get("corrections_table_rows", []) if isinstance(correction_set, dict) else []
 		frame_refs_payload = correction_set.get("frame_refs", []) if isinstance(correction_set, dict) else []
+		selected_frames = _frames_from_correction_set(trial_dir, set_name)
+		if not selected_frames:
+			selected_from_points = sorted(
+				{
+					int(pd.to_numeric(item.get("row_index", item.get("frame_pos")), errors="coerce"))
+					for item in points_payload
+					if isinstance(item, dict)
+					and np.isfinite(pd.to_numeric(item.get("row_index", item.get("frame_pos")), errors="coerce"))
+				}
+			)
+			if selected_from_points:
+				selected_frames = selected_from_points
 		if (
 			(not isinstance(points_payload, list) or not points_payload)
 			and (not isinstance(legacy_rows_payload, list) or not legacy_rows_payload)
@@ -2362,16 +2280,25 @@ def train_update_model(
 				"Open Correction Tab and save a frame selection first."
 			)
 
+		if not selected_frames:
+			raise ValueError(
+				f"No training frames found for set '{set_name}' in {WORKFLOW_STATE_FILE}. "
+				"Save a frame selection before training."
+			)
+
 		coord_cols: list[str] = []
+		pred_wide: pd.DataFrame | None = None
 		try:
 			pred_csv_by_cam = _resolve_prediction_csvs(trial_dir)
+			pred_wide = pd.read_csv(pred_csv_by_cam["cam1"])
 			coord_cols = [
 				str(col)
-				for col in pd.read_csv(pred_csv_by_cam["cam1"], nrows=0).columns
+				for col in pred_wide.columns
 				if re.search(r"_cam[12]_[XY]$", str(col))
 			]
 		except Exception:
 			coord_cols = []
+			pred_wide = None
 
 		if len(coord_cols) == 0 and isinstance(points_payload, list):
 			pairs: set[tuple[str, str]] = set()
@@ -2392,17 +2319,34 @@ def train_update_model(
 		if len(coord_cols) == 0:
 			raise ValueError("Could not determine coordinate columns for JSON correction set.")
 
-		total_frames = len(collect_images(trial_dir / "Cam1"))
+		cam1_images = collect_images(trial_dir / "Cam1")
+		cam2_images = collect_images(trial_dir / "Cam2")
+		total_frames = int(min(len(cam1_images), len(cam2_images)))
 		if total_frames <= 0:
 			raise FileNotFoundError(f"No Cam1 images found under: {trial_dir / 'Cam1'}")
 
-		full_labels = pd.DataFrame(np.nan, index=range(int(total_frames)), columns=coord_cols)
-
 		image_to_index = {"cam1": {}, "cam2": {}}
-		cam1_images = collect_images(trial_dir / "Cam1")
-		cam2_images = collect_images(trial_dir / "Cam2")
 		image_to_index["cam1"] = {p.name: int(i) for i, p in enumerate(cam1_images)}
 		image_to_index["cam2"] = {p.name: int(i) for i, p in enumerate(cam2_images)}
+
+		usable_frames = [
+			int(idx)
+			for idx in sorted({int(v) for v in selected_frames})
+			if 0 <= int(idx) < int(total_frames)
+		]
+		if pred_wide is not None:
+			usable_frames = [int(idx) for idx in usable_frames if int(idx) < len(pred_wide.index)]
+		if not usable_frames:
+			raise ValueError(
+				f"No usable frame indices from set '{set_name}' overlap trial data for training."
+			)
+
+		if pred_wide is not None and all(col in pred_wide.columns for col in coord_cols):
+			labels_subset = pred_wide.loc[usable_frames, coord_cols].copy().reset_index(drop=True)
+		else:
+			labels_subset = pd.DataFrame(np.nan, index=range(len(usable_frames)), columns=coord_cols)
+
+		frame_to_row = {int(frame_idx): int(row_idx) for row_idx, frame_idx in enumerate(usable_frames)}
 
 		if isinstance(points_payload, list) and points_payload:
 			for item in points_payload:
@@ -2424,19 +2368,21 @@ def train_update_model(
 					if img_name:
 						idx = image_to_index.get(cam, {}).get(img_name)
 
-				if idx is None or not (0 <= int(idx) < int(total_frames)):
+				if idx is None or int(idx) not in frame_to_row:
 					continue
 				x_val = pd.to_numeric(item.get("x", item.get("x_corrected")), errors="coerce")
 				y_val = pd.to_numeric(item.get("y", item.get("y_corrected")), errors="coerce")
 				x_col = f"{bp}_{cam}_X"
 				y_col = f"{bp}_{cam}_Y"
-				if x_col in full_labels.columns and np.isfinite(x_val):
-					full_labels.at[int(idx), x_col] = float(x_val)
-				if y_col in full_labels.columns and np.isfinite(y_val):
-					full_labels.at[int(idx), y_col] = float(y_val)
+				row_idx = frame_to_row[int(idx)]
+				if x_col in labels_subset.columns and np.isfinite(x_val):
+					labels_subset.at[int(row_idx), x_col] = float(x_val)
+				if y_col in labels_subset.columns and np.isfinite(y_val):
+					labels_subset.at[int(row_idx), y_col] = float(y_val)
 		elif isinstance(frame_refs_payload, list) and frame_refs_payload:
-			pred_csv_by_cam = _resolve_prediction_csvs(trial_dir)
-			pred_wide = pd.read_csv(pred_csv_by_cam["cam1"])
+			if pred_wide is None:
+				pred_csv_by_cam = _resolve_prediction_csvs(trial_dir)
+				pred_wide = pd.read_csv(pred_csv_by_cam["cam1"])
 			for ref in frame_refs_payload:
 				if not isinstance(ref, dict):
 					continue
@@ -2444,11 +2390,12 @@ def train_update_model(
 				if not np.isfinite(idx_val):
 					continue
 				idx = int(idx_val)
-				if not (0 <= idx < int(total_frames)) or idx >= len(pred_wide):
+				if idx not in frame_to_row or idx >= len(pred_wide):
 					continue
+				row_idx = frame_to_row[int(idx)]
 				for col in coord_cols:
 					if col in pred_wide.columns:
-						full_labels.at[idx, col] = pd.to_numeric(pred_wide.iloc[idx].get(col), errors="coerce")
+						labels_subset.at[row_idx, col] = pd.to_numeric(pred_wide.iloc[idx].get(col), errors="coerce")
 		elif isinstance(legacy_rows_payload, list) and legacy_rows_payload:
 			df = pd.DataFrame(legacy_rows_payload)
 			if "frame_pos" in df.columns:
@@ -2457,29 +2404,28 @@ def train_update_model(
 					if not np.isfinite(frame_pos):
 						continue
 					idx = int(frame_pos)
-					if not (0 <= idx < int(total_frames)):
+					if idx not in frame_to_row:
 						continue
+					row_idx = frame_to_row[int(idx)]
 					for col in coord_cols:
-						full_labels.at[idx, col] = pd.to_numeric(row.get(col), errors="coerce")
+						labels_subset.at[row_idx, col] = pd.to_numeric(row.get(col), errors="coerce")
 			else:
 				for idx, (_, row) in enumerate(df.iterrows()):
-					if not (0 <= idx < int(total_frames)):
+					if not (0 <= idx < len(usable_frames)):
 						continue
 					for col in coord_cols:
-						full_labels.at[idx, col] = pd.to_numeric(row.get(col), errors="coerce")
+						labels_subset.at[idx, col] = pd.to_numeric(row.get(col), errors="coerce")
 
-		for cam_folder in ("Cam1", "Cam2"):
-			src = trial_dir / cam_folder
+		for cam_folder, cam_images in (("Cam1", cam1_images), ("Cam2", cam2_images)):
 			dst = clean_trial / cam_folder
-			if dst.exists() or not src.exists():
-				continue
-			try:
-				dst.symlink_to(src, target_is_directory=True)
-			except Exception:
-				shutil.copytree(src, dst)
+			dst.mkdir(parents=True, exist_ok=True)
+			for frame_idx in usable_frames:
+				image_path = cam_images[int(frame_idx)]
+				shutil.copy2(image_path, dst / image_path.name)
 
 		clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
-		full_labels.to_csv(clean_points_csv, index=False)
+		labels_subset.to_csv(clean_points_csv, index=False)
+		dataset_nframes = int(len(usable_frames))
 	else:
 		for cam_folder in ["cam1", "cam2", "Cam1", "Cam2"]:
 			src = src_trial / cam_folder
@@ -2502,6 +2448,7 @@ def train_update_model(
 
 		clean_points_csv = clean_trial / "UpdatedLabels-2Dpoints.csv"
 		df[coord_cols].to_csv(clean_points_csv, index=False)
+		dataset_nframes = int(min(int(nframes), len(df.index)))
 
 	dataset_name = f"UpdateModelForTrial{trial_num}"
 	dlcs.build_combined_dataset(
@@ -2509,7 +2456,7 @@ def train_update_model(
 		data_path=clean_trial,
 		dataset_name=dataset_name,
 		experimenter=experimenter,
-		nframes=nframes,
+		nframes=int(dataset_nframes),
 		frame_selection_seed=frame_selection_seed,
 	)
 
@@ -2919,8 +2866,22 @@ def make_postanalysis_overlay_popout(
 	slider_pred_alpha = Slider(ax_pred_alpha, "Alpha", 0.05, 1.0, valinit=0.9, valstep=0.01)
 	textbox_pred_color = TextBox(ax_pred_color, "Color", initial="deepskyblue")
 	textbox_nframes = TextBox(ax_nframes, "ToCorrect", initial="30")
-	textbox_window_start = TextBox(ax_window_start, "Start", initial="0")
-	textbox_window_end = TextBox(ax_window_end, "End", initial="1")
+	window_start_initial = 3000
+	window_end_initial = 4500
+	try:
+		if state.pred_root.exists() and (state.pred_root / "Cam1").is_dir() and (state.pred_root / "Cam2").is_dir():
+			trial_dir_init = Path(state.pred_root)
+		else:
+			trial_dir_init = Path(_extract_trial_context_from_path(state.pred_root)["trial_dir"])
+		saved_range_init = _load_saved_frame_range(trial_dir_init)
+		if saved_range_init is not None:
+			window_start_initial = int(saved_range_init[0])
+			window_end_initial = int(saved_range_init[1])
+	except Exception:
+		pass
+
+	textbox_window_start = TextBox(ax_window_start, "Start", initial=str(window_start_initial))
+	textbox_window_end = TextBox(ax_window_end, "End", initial=str(window_end_initial))
 	radio_color_mode = RadioButtons(ax_color_mode, ["fixed", "by_name"], active=1)
 	ax_selection_info.set_axis_off()
 	range_title_text = fig.text(0.82, 0.72, "Select Frame Range", fontsize=9, fontweight="bold")
@@ -3790,11 +3751,53 @@ def make_postanalysis_overlay_popout(
 		bird = str(context["bird"])
 		trial_num = int(context["trial_num"])
 
-		snapshot_default = BIRD_SNAPSHOT_PATHS.get(bird)
-
 		root = tk.Tk()
 		root.withdraw()
 		root.attributes("-topmost", True)
+
+		default_config = BIRD_CONFIG_PATHS.get(bird)
+		available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
+		selected_config: Path | None = None
+
+		if len(available_configs) > 1:
+			picked_config = _prompt_select_model_config(
+				bird_name=bird,
+				config_paths=available_configs,
+				parent=root,
+			)
+			if picked_config is not None and Path(picked_config).exists():
+				selected_config = Path(picked_config)
+			else:
+				picked = filedialog.askopenfilename(
+					title="Select DeepLabCut config.yaml",
+					filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
+					parent=root,
+				)
+				if not picked:
+					root.destroy()
+					return None
+				selected_config = Path(picked)
+
+		if selected_config is None and default_config is not None and Path(default_config).exists():
+			selected_config = Path(default_config)
+
+		if selected_config is None and len(available_configs) == 1:
+			only_config = Path(available_configs[0])
+			if only_config.exists():
+				selected_config = only_config
+
+		snapshot_default = None
+		if selected_config is not None:
+			snapshot_candidates = sorted(
+				selected_config.parent.rglob("snapshot-*.pt"),
+				key=_snapshot_sort_key,
+				reverse=True,
+			)
+			if snapshot_candidates:
+				snapshot_default = snapshot_candidates[0]
+
+		if snapshot_default is None:
+			snapshot_default = BIRD_SNAPSHOT_PATHS.get(bird)
 
 		proceed = bool(
 			messagebox.askyesno(
@@ -3896,6 +3899,7 @@ def make_postanalysis_overlay_popout(
 			"trial_num": trial_num,
 			"base_path": Path(context["base_dir"]),
 			"update_set": str(default_update_set),
+			"model_config": str(selected_config) if selected_config is not None else None,
 			"orig_snapshot_path": str(snapshot_path),
 			"frame_boundary": [int(start_frame), int(end_frame)],
 			"epochs": int(epochs),
@@ -5332,9 +5336,7 @@ def make_postanalysis_overlay_popout(
 		if not trial_dir.exists():
 			print(f"Selected trial path does not exist: {trial_dir}")
 			return
-
-		resolved_trial_dir, _, _ = _maybe_predict_if_images_only(trial_dir)
-		_reload_trial_into_view(resolved_trial_dir)
+		_reload_trial_into_view(trial_dir)
 		current_bird = str(bird_name)
 		current_trial_num = int(trial_choice)
 		print(f"Loaded: {current_bird} Trial{current_trial_num}")
