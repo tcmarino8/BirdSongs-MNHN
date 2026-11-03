@@ -475,6 +475,45 @@ def _list_correction_sets(trial_dir: str | Path) -> list[str]:
 	return sorted(str(k) for k, v in sets.items() if isinstance(v, dict))
 
 
+def _resolve_update_set_name_from_workflow(
+	trial_dir: str | Path,
+	update_set: str | None,
+) -> tuple[str, bool]:
+	"""Resolve which correction set to use from workflow JSON.
+
+	Returns (set_name, found_in_workflow_json).
+	"""
+	available_sets = _list_correction_sets(trial_dir)
+	if update_set is not None:
+		requested = str(update_set).strip()
+		for set_name in available_sets:
+			if set_name.lower() == requested.lower():
+				return set_name, True
+		return requested, False
+
+	if not available_sets:
+		return "random", False
+	if len(available_sets) == 1:
+		return available_sets[0], True
+
+	state = _load_workflow_state(trial_dir)
+	sets_map = _correction_sets_map(state)
+	latest_name: str | None = None
+	latest_ts: float = float("-inf")
+	for set_name in available_sets:
+		entry = sets_map.get(set_name)
+		if not isinstance(entry, dict):
+			continue
+		ts = pd.to_numeric(entry.get("updated_unix"), errors="coerce")
+		if np.isfinite(ts) and float(ts) > latest_ts:
+			latest_ts = float(ts)
+			latest_name = set_name
+
+	if latest_name is not None:
+		return latest_name, True
+	return available_sets[-1], True
+
+
 def _upsert_correction_set(trial_dir: str | Path, set_name: str, payload: dict[str, Any]) -> None:
 	state = _load_workflow_state(trial_dir)
 	sets = _correction_sets_map(state)
@@ -1172,6 +1211,170 @@ def _choose_directory_gui(title: str, prompt: str) -> Path:
 	return Path(folder_path)
 
 
+def _prompt_prediction_for_images_only_selection(selected_dir: Path) -> Path:
+	"""Prompt and run prediction when a selected folder has images but no prediction CSVs."""
+	selected_dir = Path(selected_dir)
+	if not _looks_like_image_only_selection(selected_dir):
+		return selected_dir
+
+	import tkinter as tk
+	from tkinter import filedialog, messagebox, simpledialog
+
+	prompt_root = tk.Tk()
+	prompt_root.withdraw()
+	prompt_root.attributes("-topmost", True)
+
+	should_predict = bool(
+		messagebox.askyesno(
+			title="Images Detected",
+			message=(
+				"The selected folder appears to contain images but no predictions.\n\n"
+				"Do you want to run prediction now?"
+			),
+			parent=prompt_root,
+		)
+	)
+	if not should_predict:
+		prompt_root.destroy()
+		raise RuntimeError("No prediction files found in selected folder. Prediction was cancelled.")
+
+	trial_dir = _infer_trial_dir_from_selected_folder(selected_dir)
+	base_dir = trial_dir.parent.parent if trial_dir.parent.parent.exists() else trial_dir.parent
+	try:
+		context = _extract_trial_context_from_path(trial_dir)
+		bird = str(context["bird"])
+	except Exception:
+		bird_input = simpledialog.askstring(
+			"Bird Name",
+			"Could not infer bird from path. Enter bird name:",
+			initialvalue=str(trial_dir.parent.name),
+			parent=prompt_root,
+		)
+		if bird_input is None or str(bird_input).strip() == "":
+			prompt_root.destroy()
+			raise RuntimeError("Prediction cancelled: no bird name provided.")
+		bird = str(bird_input).strip()
+
+		trial_input = simpledialog.askinteger(
+			"Trial Number",
+			"Could not infer trial from path. Enter trial number:",
+			initialvalue=1,
+			minvalue=1,
+			parent=prompt_root,
+		)
+		if trial_input is None:
+			prompt_root.destroy()
+			raise RuntimeError("Prediction cancelled: no trial number provided.")
+
+		trial_num = int(trial_input)
+		trial_dir = _resolve_trial_dir(base_dir, bird, trial_num, required=True)
+
+	saved_range = _load_saved_frame_range(trial_dir)
+	default_start = int(saved_range[0]) if saved_range is not None else 0
+	default_end = int(saved_range[1]) if saved_range is not None else int(default_start + 1000)
+
+	use_range = bool(
+		messagebox.askyesno(
+			title="Frame Range",
+			message=(
+				"Do you want to set a frame range for prediction/correction?"
+				+ (
+					f"\n\nSaved range found: {default_start} to {default_end}."
+					if saved_range is not None
+					else ""
+				)
+			),
+			parent=prompt_root,
+		)
+	)
+	frame_range = None
+	if use_range:
+		start_frame = simpledialog.askinteger(
+			"Start Frame",
+			"Start frame:",
+			initialvalue=int(default_start),
+			minvalue=0,
+			parent=prompt_root,
+		)
+		if start_frame is None:
+			prompt_root.destroy()
+			raise RuntimeError("Prediction cancelled: no start frame provided.")
+
+		end_frame = simpledialog.askinteger(
+			"End Frame",
+			"End frame:",
+			initialvalue=int(default_end if saved_range is not None else int(start_frame) + 1000),
+			minvalue=0,
+			parent=prompt_root,
+		)
+		if end_frame is None:
+			prompt_root.destroy()
+			raise RuntimeError("Prediction cancelled: no end frame provided.")
+
+		frame_range = [int(start_frame), int(end_frame)]
+		_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="predict_trial_from_jpg_stacks")
+	elif saved_range is not None:
+		frame_range = [int(default_start), int(default_end)]
+
+	default_config = BIRD_CONFIG_PATHS.get(bird)
+	print("Default Config")
+	print(default_config)
+	available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
+	print("available configs:")
+	print(available_configs)
+	config_path = None
+
+	if len(available_configs) > 1:
+		picked_config = _prompt_select_model_config(
+			bird_name=bird,
+			config_paths=available_configs,
+			parent=prompt_root,
+		)
+		if picked_config is not None and Path(picked_config).exists():
+			config_path = Path(picked_config)
+			print(f"Selected config: {config_path}")
+
+	if config_path is None:
+		config_path = Path(default_config) if default_config else None
+		print("original degault congfig: ")
+		print(config_path)
+	use_default = bool(config_path is not None and config_path.exists())
+
+	if use_default and len(available_configs) <= 1:
+		use_default = bool(
+			messagebox.askyesno(
+				title="Model Config",
+				message=(
+					f"Use default config for {bird}?\n\n"
+					f"{config_path}"
+				),
+				parent=prompt_root,
+			)
+		)
+
+	if not use_default:
+		picked = filedialog.askopenfilename(
+			title="Select DeepLabCut config.yaml",
+			filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
+			parent=prompt_root,
+		)
+
+		if not picked:
+			prompt_root.destroy()
+			raise RuntimeError("Prediction cancelled: no config file selected.")
+		config_path = Path(picked)
+		print(config_path)
+
+	prompt_root.destroy()
+	result = predict_trial_from_jpg_stacks(
+		trial_dir=trial_dir,
+		config_path=config_path,
+		frame_range=frame_range,
+		xma_base_name="NoUpdateModel"
+	)
+	return Path(result["trial_dir"])
+
+
 def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 	"""Prompt user for same-folder mode, then collect required folder paths."""
 	try:
@@ -1185,166 +1388,8 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 	def _maybe_predict_if_images_only(shared_root: Path) -> tuple[Path, Path | None, Path | None]:
 		if not _looks_like_image_only_selection(shared_root):
 			return shared_root, None, None
-
-		prompt_root = tk.Tk()
-		prompt_root.withdraw()
-		prompt_root.attributes("-topmost", True)
-
-		should_predict = bool(
-			messagebox.askyesno(
-				title="Images Detected",
-				message=(
-					"The selected folder appears to contain images but no predictions.\n\n"
-					"Do you want to run prediction now?"
-				),
-				parent=prompt_root,
-			)
-		)
-		if not should_predict:
-			prompt_root.destroy()
-			raise RuntimeError("No prediction files found in selected folder. Prediction was cancelled.")
-
-		trial_dir = _infer_trial_dir_from_selected_folder(shared_root)
-		base_dir = trial_dir.parent.parent if trial_dir.parent.parent.exists() else trial_dir.parent
-		try:
-			context = _extract_trial_context_from_path(trial_dir)
-			bird = str(context["bird"])
-		except Exception:
-			bird_input = simpledialog.askstring(
-				"Bird Name",
-				"Could not infer bird from path. Enter bird name:",
-				initialvalue=str(trial_dir.parent.name),
-				parent=prompt_root,
-			)
-			if bird_input is None or str(bird_input).strip() == "":
-				prompt_root.destroy()
-				raise RuntimeError("Prediction cancelled: no bird name provided.")
-			bird = str(bird_input).strip()
-
-			trial_input = simpledialog.askinteger(
-				"Trial Number",
-				"Could not infer trial from path. Enter trial number:",
-				initialvalue=1,
-				minvalue=1,
-				parent=prompt_root,
-			)
-			if trial_input is None:
-				prompt_root.destroy()
-				raise RuntimeError("Prediction cancelled: no trial number provided.")
-
-			trial_num = int(trial_input)
-			trial_dir = Path(base_dir) / bird / f"Trial{trial_num}"
-			if not trial_dir.exists():
-				prompt_root.destroy()
-				raise FileNotFoundError(
-					f"The provided bird/trial path does not exist: {trial_dir}"
-				)
-
-		saved_range = _load_saved_frame_range(trial_dir)
-		default_start = int(saved_range[0]) if saved_range is not None else 0
-		default_end = int(saved_range[1]) if saved_range is not None else int(default_start + 1000)
-
-		use_range = bool(
-			messagebox.askyesno(
-				title="Frame Range",
-				message=(
-					"Do you want to set a frame range for prediction/correction?"
-					+ (
-						f"\n\nSaved range found: {default_start} to {default_end}."
-						if saved_range is not None
-						else ""
-					)
-				),
-				parent=prompt_root,
-			)
-		)
-		frame_range = None
-		if use_range:
-			start_frame = simpledialog.askinteger(
-				"Start Frame",
-				"Start frame:",
-				initialvalue=int(default_start),
-				minvalue=0,
-				parent=prompt_root,
-			)
-			if start_frame is None:
-				prompt_root.destroy()
-				raise RuntimeError("Prediction cancelled: no start frame provided.")
-
-			end_frame = simpledialog.askinteger(
-				"End Frame",
-				"End frame:",
-				initialvalue=int(default_end if saved_range is not None else int(start_frame) + 1000),
-				minvalue=0,
-				parent=prompt_root,
-			)
-			if end_frame is None:
-				prompt_root.destroy()
-				raise RuntimeError("Prediction cancelled: no end frame provided.")
-
-			frame_range = [int(start_frame), int(end_frame)]
-			_save_frame_range(trial_dir, int(start_frame), int(end_frame), source="predict_trial_from_jpg_stacks")
-		elif saved_range is not None:
-			frame_range = [int(default_start), int(default_end)]
-
-		default_config = BIRD_CONFIG_PATHS.get(bird)
-		print("Default Config")
-		print(default_config)
-		available_configs = _find_all_config_paths_for_bird(bird, MODEL_ZOO)
-		print("available configs:")
-		print(available_configs)
-		config_path = None
-
-		if len(available_configs) > 1:
-			picked_config = _prompt_select_model_config(
-				bird_name=bird,
-				config_paths=available_configs,
-				parent=prompt_root,
-			)
-			if picked_config is not None and Path(picked_config).exists():
-				config_path = Path(picked_config)
-				print(f"Selected config: {config_path}")
-
-		if config_path is None:
-			config_path = Path(default_config) if default_config else None
-			print("original degault congfig: ")
-			print(config_path)
-		use_default = bool(config_path is not None and config_path.exists())
-
-		if use_default and len(available_configs) <= 1:
-			use_default = bool(
-				messagebox.askyesno(
-					title="Model Config",
-					message=(
-						f"Use default config for {bird}?\n\n"
-						f"{config_path}"
-					),
-					parent=prompt_root,
-				)
-			)
-
-		if not use_default:
-			picked = filedialog.askopenfilename(
-				title="Select DeepLabCut config.yaml",
-				filetypes=[("YAML", "*.yaml *.yml"), ("All Files", "*.*")],
-				parent=prompt_root,
-			)
-			
-			if not picked:
-				prompt_root.destroy()
-				raise RuntimeError("Prediction cancelled: no config file selected.")
-			config_path = Path(picked)
-			print(config_path)
-
-		prompt_root.destroy()
-		# print(frame_range)
-		result = predict_trial_from_jpg_stacks(
-			trial_dir=trial_dir,
-			config_path=config_path,
-			frame_range=frame_range,
-			xma_base_name="NoUpdateModel"
-		)
-		return Path(result["trial_dir"]), None, None
+		trial_dir = _prompt_prediction_for_images_only_selection(shared_root)
+		return Path(trial_dir), None, None
 
 	root = tk.Tk()
 	root.withdraw()
@@ -1382,9 +1427,14 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 
 def _active_update_roots(base_dir: str | Path, bird: str, trial_num: int) -> list[Path]:
 	base_dir = Path(base_dir)
+	trial_dir = _resolve_trial_dir(base_dir, bird, trial_num, required=False)
+	if trial_dir is not None:
+		trial_folder_name = trial_dir.name
+	else:
+		trial_folder_name = f"Trial{int(trial_num)}"
 	return [
-		base_dir / bird / "active_updates" / f"Trial{trial_num}",
-		base_dir / bird / f"Trial{trial_num}" / "active_updates",
+		base_dir / bird / "active_updates" / trial_folder_name,
+		base_dir / bird / trial_folder_name / "active_updates",
 	]
 
 
@@ -1412,6 +1462,38 @@ def _extract_trial_context_from_path(path_like: str | Path) -> dict[str, Any]:
 		"base_dir": base_dir,
 		"trial_dir": trial_dir,
 	}
+
+
+def _resolve_trial_dir(
+	base_dir: str | Path,
+	bird: str,
+	trial_num: int,
+	*,
+	required: bool = True,
+) -> Path | None:
+	"""Resolve a trial folder allowing padded and non-padded names (e.g., Trial3 vs Trial003)."""
+	base = Path(base_dir)
+	bird_dir = base / str(bird)
+	trial_i = int(trial_num)
+	candidates = [
+		bird_dir / f"Trial{trial_i}",
+		bird_dir / f"Trial{trial_i:03d}",
+	]
+	for candidate in candidates:
+		if candidate.exists() and candidate.is_dir():
+			return candidate
+
+	for path in sorted(bird_dir.glob("Trial*")) if bird_dir.exists() else []:
+		match = re.fullmatch(r"Trial(\d+)", path.name, flags=re.IGNORECASE)
+		if match is not None and int(match.group(1)) == trial_i and path.is_dir():
+			return path
+
+	if required:
+		raise FileNotFoundError(
+			f"Trial folder not found for {bird} trial {trial_i} under {bird_dir}. "
+			"Accepted names include Trial3 and Trial003."
+		)
+	return None
 
 
 def _looks_like_image_only_selection(selected_dir: Path) -> bool:
@@ -2022,9 +2104,7 @@ def train_multiple_trials(
 
 	trial_dirs: list[Path] = []
 	for trial_num in trial_list:
-		trial_dir = bird_dir / f"Trial{int(trial_num)}"
-		if not trial_dir.exists():
-			raise FileNotFoundError(f"Trial folder not found: {trial_dir}")
+		trial_dir = _resolve_trial_dir(base, bird, int(trial_num), required=True)
 		trial_dirs.append(trial_dir)
 
 	trials_folder_name = _format_trials_label(trial_list)
@@ -2192,15 +2272,24 @@ def train_update_model(
 	import DLCsupport as dlcs
 
 	base_dir = _resolve_processingdata_base_dir(base_dir)
-	trial_dir = base_dir / bird / f"Trial{trial_num}"
-	set_name = str(update_set or "random")
-	correction_set = _get_correction_set(trial_dir, set_name)
-	use_json_set = correction_set is not None
+	trial_dir = _resolve_trial_dir(base_dir, bird, int(trial_num), required=True)
+	set_name, use_json_set = _resolve_update_set_name_from_workflow(
+		trial_dir=trial_dir,
+		update_set=update_set,
+	)
+	correction_set = _get_correction_set(trial_dir, set_name) if use_json_set else None
 
 	if use_json_set:
 		src_trial = trial_dir
 		models_root = trial_dir / "active_update_models" / set_name
 	else:
+		available_sets = _list_correction_sets(trial_dir)
+		if update_set is not None and available_sets:
+			available_display = ", ".join(available_sets)
+			raise FileNotFoundError(
+				f"Correction set '{update_set}' was not found in {WORKFLOW_STATE_FILE} for {bird} Trial{trial_num}. "
+				f"Available sets: {available_display}"
+			)
 		src_trial = _resolve_active_update_dir(
 			base_dir=base_dir,
 			bird=bird,
@@ -2526,12 +2615,22 @@ def _predict_with_updated_model(
 	import cv2 
 
 	base = _resolve_processingdata_base_dir(base_dir)
-	trial_dir = base / bird / f"Trial{trial_num}"
-	set_name = str(update_set or "random")
-	if _get_correction_set(trial_dir, set_name) is not None:
+	trial_dir = _resolve_trial_dir(base, bird, int(trial_num), required=True)
+	set_name, use_json_set = _resolve_update_set_name_from_workflow(
+		trial_dir=trial_dir,
+		update_set=update_set,
+	)
+	if use_json_set:
 		models_dir = trial_dir / "active_update_models" / set_name / "ModelsToTune"
 		src_trial_name = set_name
 	else:
+		available_sets = _list_correction_sets(trial_dir)
+		if update_set is not None and available_sets:
+			available_display = ", ".join(available_sets)
+			raise FileNotFoundError(
+				f"Correction set '{update_set}' was not found in {WORKFLOW_STATE_FILE} for {bird} Trial{trial_num}. "
+				f"Available sets: {available_display}"
+			)
 		src_trial = _resolve_active_update_dir(base_dir=base, bird=bird, trial_num=trial_num, update_set=update_set)
 		models_dir = src_trial / "ModelsToTune"
 		src_trial_name = src_trial.name
@@ -5336,6 +5435,12 @@ def make_postanalysis_overlay_popout(
 		if not trial_dir.exists():
 			print(f"Selected trial path does not exist: {trial_dir}")
 			return
+		if _looks_like_image_only_selection(trial_dir):
+			try:
+				trial_dir = _prompt_prediction_for_images_only_selection(trial_dir)
+			except Exception as exc:
+				print(f"Prediction for selected trial was cancelled or failed: {exc}")
+				return
 		_reload_trial_into_view(trial_dir)
 		current_bird = str(bird_name)
 		current_trial_num = int(trial_choice)
