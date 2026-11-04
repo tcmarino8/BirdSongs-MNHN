@@ -92,6 +92,7 @@ def _choose_model_zoo_directory(title: str = "Select Model Zoo Folder") -> Path:
 
 
 def _resolve_model_zoo_root(prompt_if_missing: bool = False) -> Path:
+	"""Return model-zoo root; optionally prompt if no usable directory is found."""
 	root = _default_model_zoo_dir()
 	if root.exists() and any(p.is_dir() for p in root.iterdir()):
 		return root
@@ -101,12 +102,14 @@ def _resolve_model_zoo_root(prompt_if_missing: bool = False) -> Path:
 
 
 def _snapshot_sort_key(path: Path) -> tuple[int, float]:
+	"""Sort snapshots by parsed snapshot number, then modified time."""
 	match = re.search(r"snapshot-(\d+)", path.name)
 	snapshot_num = int(match.group(1)) if match else -1
 	return (snapshot_num, path.stat().st_mtime)
 
 
 def _find_best_model_paths_for_bird(bird_name: str, model_zoo_root: Path | None = None) -> tuple[Path | None, Path | None]:
+	"""Return the shallowest config and newest snapshot for one bird, if available."""
 	root = Path(model_zoo_root) if model_zoo_root is not None else MODEL_ZOO
 	
 	bird_dir = root / str(bird_name)
@@ -380,6 +383,7 @@ def _default_processingdata_base_dir() -> Path:
 
 
 def _resolve_processingdata_base_dir(base_dir: str | Path | None) -> Path:
+	"""Resolve ProcessingData base dir from explicit input or platform defaults."""
 	if base_dir is None:
 		return _default_processingdata_base_dir()
 	return Path(base_dir).expanduser()
@@ -416,6 +420,7 @@ def _load_data_converter_module() -> Any:
 dc = _load_data_converter_module()
 
 def _workflow_state_path(trial_dir: str | Path) -> Path:
+	"""Return the workflow-state JSON path for a trial directory."""
 	return Path(trial_dir) / WORKFLOW_STATE_FILE
 
 
@@ -438,6 +443,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _load_workflow_state(trial_dir: str | Path) -> dict[str, Any]:
+	"""Load workflow JSON for a trial, returning {} if missing or invalid."""
 	state_path = _workflow_state_path(trial_dir)
 	if not state_path.exists():
 		return {}
@@ -449,6 +455,7 @@ def _load_workflow_state(trial_dir: str | Path) -> dict[str, Any]:
 
 
 def _save_workflow_state(trial_dir: str | Path, state: dict[str, Any]) -> None:
+	"""Persist workflow state JSON with JSON-safe values and update timestamp."""
 	state_path = _workflow_state_path(trial_dir)
 	state_path.parent.mkdir(parents=True, exist_ok=True)
 	state_clean = _json_safe(state)
@@ -457,12 +464,14 @@ def _save_workflow_state(trial_dir: str | Path, state: dict[str, Any]) -> None:
 
 
 def _correction_sets_map(state: dict[str, Any]) -> dict[str, Any]:
+	"""Return mutable correction-set mapping, creating it when absent."""
 	if "correction_sets" not in state or not isinstance(state.get("correction_sets"), dict):
 		state["correction_sets"] = {}
 	return state["correction_sets"]
 
 
 def _get_correction_set(trial_dir: str | Path, set_name: str) -> dict[str, Any] | None:
+	"""Fetch one named correction set from workflow state."""
 	state = _load_workflow_state(trial_dir)
 	sets = _correction_sets_map(state)
 	entry = sets.get(str(set_name))
@@ -470,6 +479,7 @@ def _get_correction_set(trial_dir: str | Path, set_name: str) -> dict[str, Any] 
 
 
 def _list_correction_sets(trial_dir: str | Path) -> list[str]:
+	"""List names of correction sets stored in workflow state."""
 	state = _load_workflow_state(trial_dir)
 	sets = _correction_sets_map(state)
 	return sorted(str(k) for k, v in sets.items() if isinstance(v, dict))
@@ -515,6 +525,7 @@ def _resolve_update_set_name_from_workflow(
 
 
 def _upsert_correction_set(trial_dir: str | Path, set_name: str, payload: dict[str, Any]) -> None:
+	"""Create or update a correction set entry and write workflow state to disk."""
 	state = _load_workflow_state(trial_dir)
 	sets = _correction_sets_map(state)
 	existing = sets.get(str(set_name), {})
@@ -529,6 +540,7 @@ def _upsert_correction_set(trial_dir: str | Path, set_name: str, payload: dict[s
 
 
 def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
+	"""Load normalized [start, end] frame range from workflow state if present."""
 	data = _load_workflow_state(trial_dir)
 	frame_range = data.get("frame_range", {}) if isinstance(data, dict) else {}
 	start = frame_range.get("start")
@@ -545,6 +557,7 @@ def _load_saved_frame_range(trial_dir: str | Path) -> tuple[int, int] | None:
 
 
 def _save_frame_range(trial_dir: str | Path, start_frame: int, end_frame: int, source: str = "") -> None:
+	"""Save normalized [start, end] frame range and originating source tag."""
 	start_i = int(start_frame)
 	end_i = int(end_frame)
 	if end_i < start_i:
@@ -709,6 +722,7 @@ def find_dark_blob_centroid(
 
 
 def _blobdog_camera_defaults(camera: str, animal: str = 'bird') -> dict[str, float]:
+	"""Return camera/animal-specific defaults for DoG blob detection."""
 	cam = _cam_norm(camera)
 	base = {
 		"background_sigma": 20.0,
@@ -729,6 +743,7 @@ def _blobdog_camera_defaults(camera: str, animal: str = 'bird') -> dict[str, flo
 
 
 def _to_gray_float(image: np.ndarray) -> np.ndarray:
+	"""Convert grayscale or RGB-like image data to float grayscale array."""
 	if image.ndim == 2:
 		return np.asarray(image, dtype=np.float64)
 	if image.ndim >= 3:
@@ -1426,6 +1441,7 @@ def _choose_inputs_gui() -> tuple[Path, Path | None, Path | None]:
 
 
 def _active_update_roots(base_dir: str | Path, bird: str, trial_num: int) -> list[Path]:
+	"""Return supported folder roots that may contain active update sets."""
 	base_dir = Path(base_dir)
 	trial_dir = _resolve_trial_dir(base_dir, bird, trial_num, required=False)
 	if trial_dir is not None:
@@ -1692,6 +1708,7 @@ def predict_trial_from_jpg_stacks(
 
 
 def _list_active_update_dirs(base_dir: str | Path, bird: str, trial_num: int) -> list[Path]:
+	"""List deduplicated active update-set directories for one bird/trial."""
 	active_dirs: list[Path] = []
 	seen: set[str] = set()
 
@@ -1714,6 +1731,7 @@ def _resolve_active_update_dir(
 	trial_num: int,
 	update_set: str | None = None,
 ) -> Path:
+	"""Resolve one active update-set directory, with explicit-set and ambiguity checks."""
 	active_dirs = _list_active_update_dirs(base_dir, bird, trial_num)
 
 	if len(active_dirs) == 0:
@@ -2270,7 +2288,8 @@ def train_update_model(
 ) -> dict[str, Any]:
 	"""Create/update a DLC training dataset and train from saved correction-set data."""
 	import DLCsupport as dlcs
-
+	print("Snapshot")
+	print(snapshot_path)
 	base_dir = _resolve_processingdata_base_dir(base_dir)
 	trial_dir = _resolve_trial_dir(base_dir, bird, int(trial_num), required=True)
 	set_name, use_json_set = _resolve_update_set_name_from_workflow(
@@ -2297,7 +2316,7 @@ def train_update_model(
 			update_set=update_set,
 		)
 		models_root = src_trial
-
+	
 	if snapshot_path is None:
 		snapshot_path = BIRD_SNAPSHOT_PATHS.get(str(bird))
 
@@ -2308,22 +2327,6 @@ def train_update_model(
 		raise FileNotFoundError(f"Trial folder not found:\n{src_trial}")
 
 	models_dir = models_root / "ModelsToTune"
-
-	# Check if the ModelsToTune directory exists
-	# FIXME: we need this below logic to apply before it prompts you model hyper params (num images, num epochs etc...)
-	if models_dir.exists():
-		
-		# Check if the combined config file exists
-		configs = list(models_dir.rglob("config.yaml"))
-		if len(configs) > 0:
-			return {
-				"bird": bird,
-				"trial": trial_num,
-				"update_set": src_trial.name,
-				"config": configs[0],
-				"elapsed_seconds": 0,
-			}
-
 	models_dir.mkdir(parents=True, exist_ok=True)
 
 	dummy_video = trial_dir / "Cam1.avi"
@@ -2550,6 +2553,7 @@ def train_update_model(
 	)
 
 	t0 = time.perf_counter()
+	print("snapshot path for training: ", snapshot_path)
 	if snapshot_path is not None:
 		dlcs.create_and_train(
 			config_path=combined_config,
@@ -2609,7 +2613,6 @@ def _predict_with_updated_model(
 	fps = 500,
 ) -> dict[str, Any]:
 	"""Run DLC inference with newest trained model and write corrected full-length predictions."""
-	import deeplabcut as dlc
 	import xrommtools_copy as xt
 	
 	import cv2 
@@ -2681,13 +2684,14 @@ def _predict_with_updated_model(
 	updated_dir.mkdir(exist_ok=True)
 
 	if not sorted(updated_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime):
-		dlc.analyze_videos(
-			str(config_path),
-			[str(cam1), str(cam2)],
+		used_shuffle = _analyze_videos_with_shuffle_fallback(
+			config_path=config_path,
+			videos=[str(cam1), str(cam2)],
 			save_as_csv=True,
 			destfolder=str(updated_dir),
 			batchsize=int(batchsize),
 		)
+		print(f"Updated prediction ran with shuffle={used_shuffle} for config: {config_path}")
 
 	cam1_candidates = sorted(updated_dir.glob("Cam1DLC*.csv"), key=lambda path: path.stat().st_mtime)
 	cam2_candidates = sorted(updated_dir.glob("Cam2DLC*.csv"), key=lambda path: path.stat().st_mtime)
